@@ -47,7 +47,7 @@ def get_history_context() -> str:
     text = get_recent(10)
     if not text:
         return ""
-    result = "【近期对话】\n" + text
+    result = "【近期对话】\n" + text + "\n不要复述或重复自己说过的话"
     append_log(result)
     return result
 
@@ -264,7 +264,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": f"{state_hint}\n{time_hint}"},
         {"role": "system", "content": dialogue_history},
-        {"role": "user", "content": f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，输出你此刻的想法。"}
+        {"role": "user", "content": f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法。"}
     ]
 
     reply = call_api_thinking(messages, max_tokens=8000)
