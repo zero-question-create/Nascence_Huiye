@@ -24,7 +24,7 @@ multidict==6.7.1
 numpy==1.26.4
 openai==2.44.0
 packaging==26.2
-PySide6==6.5.3
+PyQt5==5.15.11
 propcache==0.5.2
 pydantic==2.13.4
 pydantic_core==2.46.4
@@ -37,4 +37,3 @@ typing_extensions==4.15.0
 urllib3==2.7.0
 websockets==16.1
 yarl==1.24.2
-sentence-transformers
