@@ -50,11 +50,11 @@ if sys.platform == "linux":
     os.environ.setdefault("GTK_IM_MODULE", "fcitx")
     os.environ.setdefault("XMODIFIERS", "@im=fcitx")
 
-from core.llm_interface import describe_image_from_path, describe_audio_from_path, describe_video_from_path
+from core.llm_interface import describe_image_from_path, describe_audio_from_path, describe_video_from_path, decompose_input
 from utils.event_bus import BUS
 
 # 导入你现有的核心模块
-from core.cognition import process_dialogue
+from core.cognition import process_dialogue, inject_message_keywords, cognitive_loop
 from core.memory_engine import create_memory, access_memory, pathfind_activation, retrieve_similar, memories
 from core.virtual_clock import clock
 
@@ -63,15 +63,10 @@ BOT_QQ = "3852948473"  # 机器人QQ号
 CONFIG_PATH = "config/qq_manifest.json"
 HTTP_API_BASE = "http://127.0.0.1:5700"
 HTTP_ACCESS_TOKEN = "Fxr13142"
-SILENT_MARKER = "[SILENT]"
-FALLBACK_REPLY_WHEN_MENTIONED = "嗯......"
 WS_HOST = "127.0.0.1"
 WS_PORT = 6700  # NapCat 配置中填写的端口
 WS_PATH = "/ws"
 WS_ACCESS_TOKEN = "Fxr13142"
-# 最近回复缓存（用于去重）
-_reply_history = []  # 存储最近回复
-MAX_REPLY_HISTORY = 3
 
 _recent_msg_list = []      # 有序存储 (sender_id, clean_text)
 _recent_msg_set = set()    # 快速查找去重
@@ -79,26 +74,11 @@ MAX_RECENT_MESSAGES = 20
 
 IGNORE_PREFIX = "#"     # 前缀特殊字符
 
-# 主动节奏控制（秒）
-active_cooldown = 300
-MAX_ACTIVE_COOLDOWN = 15 * 60
-MIN_ACTIVE_COOLDOWN = 5 * 60
-MAX_RESEARCH = 2
-
 ACTIVE_GROUP_ID = "1057279304"  # 主动发言的目标群
 
-# 浅层意识池
-shallow_pool = deque(maxlen=20)
-
-# 主动发言状态
-active_state = {
-    "cooldown_until": 0.0,
-    "research_remaining": MAX_RESEARCH,
-}
-
 _final_save_done = False            # 全局保存标识
-_active_speak_task = None           # 当前正在运行的 try_active_speak 任务
 _napcat_websocket = None             # 当前连接的 NapCat 反向 WebSocket
+_cognitive_task = None               # 永续认知循环 task
 _action_lock = asyncio.Lock()        # 串行发送 OneBot Action，避免响应混淆
 _action_counter = 0
 _pending_actions = {}                 # echo -> Future，用于匹配 NapCat Action 响应
@@ -173,25 +153,23 @@ def extract_quote_message_id(message_segments: List[Dict]) -> Optional[str]:
     return None
 
 async def drift_loop():
-    """后台发散任务"""
+    """后台发散任务：随机激活记忆以强化半衰期，为认知循环提供热身种子"""
     logger.info("[浅层意识] 发散任务已启动")
     while True:
         if is_sleeping() and not _sleeping:
             enter_sleep()
-        now = time.time()
         nowdate = datetime.datetime.now().time()
         start = datetime.time(SLEEP_START_HOUR, 0)
         end = datetime.time(SLEEP_END_HOUR, 0)
         if start >= end and (nowdate < start and nowdate >= end) and _sleeping:
             wake_up()
-        await asyncio.sleep(max(active_state["cooldown_until"] - now, 30))
+        await asyncio.sleep(30)
         if not memories:
             continue
         mem_id = random.choice(list(memories.keys()))
         access_memory(mem_id)
         pathfind_activation([mem_id], max_stamina=1.0, top_k=3, max_steps=1)
-        shallow_pool.append((mem_id, time.time()))
-        logger.info(f"[浅层意识] 激活记忆 {mem_id[:8]}...，当前池大小: {len(shallow_pool)}")
+        logger.info(f"[浅层意识] 激活记忆 {mem_id[:8]}...")
 
 def is_sleeping() -> bool:
     """判断当前是否处于睡眠时间窗口（含启动时强制睡眠状态）"""
@@ -238,10 +216,8 @@ async def handle_group_message(data: dict):
     if is_sleeping():
         return
     """处理单条群消息"""
-    global _reply_history
     
     group_id = str(data.get("group_id"))
-    current_msg_id = data.get("message_id")
     
     # 白名单过滤
     if group_id not in manifest.whitelist:
@@ -394,76 +370,41 @@ async def handle_group_message(data: dict):
 
     logger.info(f"输入: {augmented_input} | 上下文: {extra_context}")
 
-    # 重置主动发言冷却
-    reset_active_speaker()
-
     from core.memory_engine import create_memory, add_link
     from core.virtual_clock import clock
-
-    # 调用认知层
-    result = await process_dialogue(
-        augmented_input=augmented_input,
-        extra_context=extra_context
-    )
-
-    # 兼容处理返回值
-    if isinstance(result, tuple):
-        draft_reply = result[0] if result else ""
-        mem_ids = result[1] if len(result) > 1 else []
-    else:
-        draft_reply = str(result) if result else ""
-        mem_ids = []
-
-    if isinstance(draft_reply, tuple):
-        draft_reply = draft_reply[0] if draft_reply else ""
-    elif not isinstance(draft_reply, str):
-        draft_reply = str(draft_reply) if draft_reply else ""
-
-    # ========== 关键新增：如果生成了有效回复，存入记忆并建立因果链接 ==========
-    should_send = False
-    final_reply = None
-
-    # 判断是否是兜底回复（无记忆）
-    is_empty_reply = (
-        not draft_reply or 
-        draft_reply.strip() in [ "静默", "静默。"] or
-        draft_reply.strip() == SILENT_MARKER
-    )
-
-    if is_empty_reply:
-        if is_mentioned_me:
-            final_reply = FALLBACK_REPLY_WHEN_MENTIONED
-            should_send = True
-            # 兜底回复存入记忆（格式：我告诉{对方}，{回复}）
-            bot_mem_id = create_memory(f"我告诉{sender_name}，{final_reply}", half_life=2 * 24 * 3600)
-            # 建立链接需要用户记忆ID，但用户记忆ID未存（因为没经过认知层），简单处理：不建立链接或从认知层获取
-            logger.info(f"被@时LLM无记忆，使用兜底回复并存入记忆: {final_reply}")
-        else:
-            should_send = False
-    else:
-        # 正常回复：一切已由认知层存入记忆，这里不需要额外存储
-        final_reply = draft_reply
-        should_send = True
-
-    # 加入对话记忆
     from core.llm_interface import add_to_history
-    add_to_history(sender_name, clean_text.strip(), final_reply, "QQ")
+    from utils.dialogue_state import set_state
 
-    # ========== 发送前检查重复（仅当未被@时） ==========
-    if should_send and final_reply:
-        if not is_mentioned_me:
-            is_dup = final_reply in _reply_history
-            if is_dup and False:                                    # 临时关闭重复判定
-                logger.info(f"检测到重复回复，跳过发送: {final_reply}")
-                # 注意：即使跳过发送，记忆已经存了，所以知识不会丢
-                return
+    full_input = augmented_input
+    if extra_context:
+        full_input = f"{extra_context}\n{augmented_input}"
 
-        _reply_history.append(final_reply)
-        if len(_reply_history) > MAX_REPLY_HISTORY:
-            _reply_history.pop(0)
+    # ========== 理解层：将用户输入拆解为记忆片段和关键词 ==========
+    mem_fragments, mode, new_state, keywords = decompose_input(full_input)
 
-        BUS.message.emit("辉夜", final_reply, "QQ")
-        await send_group_msg(group_id, final_reply,  reply_msg_id=current_msg_id)
+    # 更新对话状态
+    if new_state:
+        set_state(new_state)
+        save_state()
+
+    # 记忆入库
+    from core.cognition import MODE_HALF_LIFE
+    half_life = MODE_HALF_LIFE.get(mode, 2 * 24 * 3600)
+    user_mem_ids = []
+    for frag in mem_fragments:
+        from core.memory_engine import semantic_dedup
+        if not semantic_dedup(frag):
+            mid = create_memory(frag, half_life=half_life)
+            user_mem_ids.append(mid)
+
+    # 将关键词注入认知循环 (永续认知循环负责后续的检索、拼接、回复)
+    inject_message_keywords(keywords)
+
+    # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
+    add_to_history(sender_name, clean_text.strip(), None, "QQ")
+
+    logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，关键词: {keywords}")
+    BUS.message.emit("辉夜", f"[思考中...]", "QQ")
 
 async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
     """
@@ -578,163 +519,6 @@ async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Opti
             _pending_actions.pop(echo, None)
     return None
 
-async def try_active_speak(group_id: str) -> bool:
-    """进行一次主动思考（使用统一的 LLM 决策）"""
-    from core.memory_engine import _count_active_attempt, _count_active_success
-    _count_active_attempt += 1
-    if not shallow_pool:
-        logger.info("[主动发言] 浅层池为空，跳过")
-        return False
-
-    # 取最近激活的记忆作为种子，并获取上下文
-    seed_mem_id, _ = shallow_pool[-1]
-    # 临时调试日志
-    from core.memory_engine import links
-    out_links = sum(1 for (src, tgt) in links if src == seed_mem_id)
-    logger.info(f"[主动发言] 种子记忆现有出边数: {out_links}")
-    logger.info(f"[主动发言] 使用种子记忆: {seed_mem_id[:8]}...")
-    
-    activated = pathfind_activation([seed_mem_id], max_stamina=5.0, top_k=5, max_steps=1)
-
-    # 在生成带时间标记的记忆文本处
-    from core.virtual_clock import clock
-    from utils.time_phrases import get_relative_time_phrase
-
-    context_mems = []
-    for mem, _ in activated:  # 解包元组 (memory_dict, score)
-        virtual_ts = mem.get("creation_time", 0)
-        real_ts = clock.to_real_time(virtual_ts)
-        phrase = get_relative_time_phrase(real_ts)
-        context_mems.append(f"[{phrase}] {mem['content']}")
-
-    logger.info(f"[主动发言] 扩散获得 {len(context_mems)} 条上下文")
-    if not shallow_pool:
-        return False
-
-    # 获取当前对话状态
-    from utils.dialogue_state import get_state
-    state = get_state()
-
-    if asyncio.current_task() and asyncio.current_task().cancelled():
-        logger.info("[主动发言] 任务已被取消，中止思考")
-        return False
-
-    # 调用决策 LLM（在线程池中执行同步函数）
-    from core.llm_interface import active_speak_decision
-    loop = asyncio.get_event_loop()
-    decision = await loop.run_in_executor(
-        None, active_speak_decision, context_mems, state
-    )
-    if asyncio.current_task() and asyncio.current_task().cancelled():
-        logger.info("[主动发言] 任务已被取消，中止思考")
-        return False
-
-    if decision["action"] == "SEND":
-        # 直接发言
-        text = decision["content"]
-        await send_group_msg(group_id, text)
-        create_memory(f"我说：{text}", half_life=12 * 3600)
-        from core.llm_interface import add_to_history
-        add_to_history(None, None, text)
-        _count_active_success += 1
-        return True
-
-    elif decision["action"] == "SEARCH":
-        # 用给出的关键词定向检索，然后再调用一次决策（可选：也可以直接搜索后发言）
-        keywords = decision["keywords"]
-        search_results = []
-        for kw in keywords:
-            search_results.extend(retrieve_similar(kw, k=3))
-        seen = set()
-        all_mems = []
-        for score, mem in sorted(search_results, key=lambda x: x[0], reverse=True):
-            if mem["content"] not in seen:
-                seen.add(mem["content"])
-                virtual_ts = mem.get("creation_time", 0)
-                real_ts = clock.to_real_time(virtual_ts)
-                phrase = get_relative_time_phrase(real_ts)
-                all_mems.append(f"[{phrase}] {mem['content']}")
-                if len(all_mems) >= 8:
-                    break
-
-        if asyncio.current_task() and asyncio.current_task().cancelled():
-            logger.info("[主动发言] 任务已被取消，中止思考")
-            return False
-
-        # 将搜索到的记忆和原有记忆合并，再问一次是否要说话
-        combined_mems = context_mems + all_mems
-        decision2 = await loop.run_in_executor(
-            None, active_speak_decision, combined_mems, state
-        )
-        if asyncio.current_task() and asyncio.current_task().cancelled():
-            logger.info("[主动发言] 任务已被取消，中止思考")
-            return False
-
-        if decision2["action"] == "SEND":
-            text = decision2["content"]
-            await send_group_msg(group_id, text)
-            create_memory(f"我说：{text}", half_life=12 * 3600)
-            _count_active_success += 1
-            return True
-        else:
-            # 复搜后仍不想说话，返回 False 进入冷却/继续复搜
-            return False
-
-    return False  # NONE 或异常
-
-async def active_speaker_loop(group_id: str):
-    global _active_speak_task
-    logger.info("[主动发言] 发言任务已启动")
-    while True:
-        await asyncio.sleep(1)
-        if is_sleeping():
-            continue
-        now = time.time()
-
-        if now < active_state["cooldown_until"]:
-            continue
-
-        # 冷却已到期，但配额为0，说明是刚从冷却中恢复，立刻重置配额，避免再次进入冷却
-        if active_state["research_remaining"] <= 0:
-            active_state["research_remaining"] = MAX_RESEARCH
-            logger.info("[主动发言] 冷却结束，重置复搜配额，开始尝试发言")
-
-        logger.info(f"[主动发言] 执行复搜，剩余次数: {active_state['research_remaining']}")
-        active_state["research_remaining"] -= 1
-        _active_speak_task = asyncio.create_task(try_active_speak(group_id))
-        try:
-            spoken = await _active_speak_task
-        except asyncio.CancelledError:
-            logger.info("[主动发言] 思考被用户消息打断，中止本轮尝试")
-            spoken = False
-        _active_speak_task = None
-        
-        active_cooldown = random.randint(MIN_ACTIVE_COOLDOWN, MAX_ACTIVE_COOLDOWN)
-        logger.info(f"[主动发言] 本轮冷却：{active_cooldown}")
-        
-        if spoken:
-            active_state["cooldown_until"] = now + active_cooldown
-            active_state["research_remaining"] = MAX_RESEARCH
-            logger.info("[主动发言] 发言成功，进入冷却")
-        else:
-            if active_state["research_remaining"] > 0:
-                await asyncio.sleep(3)
-            else:
-                active_state["cooldown_until"] = now + active_cooldown
-                logger.info("[主动发言] 配额用尽，进入冷却")
-
-def reset_active_speaker():
-    global _active_speak_task
-    # 如果有正在进行的主动发言任务，取消它
-    if _active_speak_task and not _active_speak_task.done():
-        _active_speak_task.cancel()
-        logger.info("[主动发言] 用户消息打断，取消当前思考")
-    # 不再清空 shallow_pool，让它自然积累
-    buchang = random.randint(active_cooldown-30,active_cooldown-15)
-    active_state["cooldown_until"] = time.time() + active_cooldown - buchang
-    logger.info(f"[主动发言] 发言后补偿后冷却：{active_cooldown-buchang}")
-    active_state["research_remaining"] = MAX_RESEARCH
-
 # ---------- WebSocket 服务器 ----------
 async def ws_handler(websocket):
     """处理 NapCat 发来的 WebSocket 连接"""
@@ -755,9 +539,19 @@ async def ws_handler(websocket):
         logger.warning("拒绝未通过 token 校验的 WebSocket 连接")
         await websocket.close(code=1008, reason="invalid token")
         return
-    global _napcat_websocket
+    global _napcat_websocket, _cognitive_task
     _napcat_websocket = websocket
     logger.info("NapCat 已连接，已启用 WebSocket Action 发送")
+
+    # NapCat 连接后启动永续认知循环
+    if _cognitive_task is None or _cognitive_task.done():
+        from core.cognition import request_graceful_stop
+        request_graceful_stop()  # 确保旧实例已清理
+        _cognitive_task = asyncio.create_task(
+            cognitive_loop(send_func=send_group_msg, target_group_id=ACTIVE_GROUP_ID)
+        )
+        logger.info("[认知循环] 已随 NapCat 连接启动")
+
     message_tasks = set()
     try:
         async for message in websocket:
@@ -773,7 +567,6 @@ async def ws_handler(websocket):
                     task = asyncio.create_task(handle_group_message(data))
                     message_tasks.add(task)
                     task.add_done_callback(message_tasks.discard)
-                # 忽略其他事件
             except json.JSONDecodeError:
                 logger.warning("收到非JSON消息")
             except Exception as e:
@@ -785,6 +578,24 @@ async def ws_handler(websocket):
     finally:
         if _napcat_websocket is websocket:
             _napcat_websocket = None
+
+        # NapCat 断开：认知循环完成当前轮（输出回复，不复搜）再释放
+        if _cognitive_task and not _cognitive_task.done():
+            from core.cognition import request_graceful_stop
+            request_graceful_stop()
+            logger.info("[认知循环] NapCat 断开，等待当前轮完成…")
+            try:
+                await asyncio.wait_for(_cognitive_task, timeout=60)
+            except asyncio.TimeoutError:
+                _cognitive_task.cancel()
+                try:
+                    await _cognitive_task
+                except asyncio.CancelledError:
+                    pass
+                logger.warning("[认知循环] 超时强制取消")
+            _cognitive_task = None
+            logger.info("[认知循环] 已释放")
+
         for future in list(_pending_actions.values()):
             if not future.done():
                 future.set_exception(ConnectionError("NapCat WebSocket 已断开"))
@@ -819,8 +630,8 @@ async def start_server():
     
     save_task = asyncio.create_task(auto_save())
 
+    # 浅层意识发散任务（记忆热身，认知循环随 NapCat 连接启动）
     drift_task = asyncio.create_task(drift_loop())
-    speaker_task = asyncio.create_task(active_speaker_loop(ACTIVE_GROUP_ID))
     
     try:
         async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
@@ -828,14 +639,18 @@ async def start_server():
             await asyncio.Future()  # 永久运行
     finally:
         global _final_save_done
-        global _napcat_websocket
+        global _napcat_websocket, _cognitive_task
         _napcat_websocket = None
-        logger.info("NapCat WebSocket 已释放")
         _final_save_done = False
         save_task.cancel()
         drift_task.cancel()
-        speaker_task.cancel()
-        await asyncio.gather(save_task, drift_task, speaker_task, return_exceptions=True)
+        if _cognitive_task and not _cognitive_task.done():
+            _cognitive_task.cancel()
+            try:
+                await _cognitive_task
+            except:
+                pass
+        await asyncio.gather(save_task, drift_task, return_exceptions=True)
         if not _final_save_done:
             _final_save_done = True
             from utils.persistence import save_all_data, save_state

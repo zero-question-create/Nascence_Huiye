@@ -205,10 +205,20 @@ def decompose_input(user_input: str) -> tuple:
 
     return memories, mode, new_state, keywords
 
-def verbalize(memories: list, keywords: list = [], new_state: dict = None, user_input: str = None) -> str:
-    """根据关键词过滤并拼接记忆"""
+def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, dialogue_history: str = None) -> dict:
+    """
+    根据记忆生成内心独白和发言决策。
+    返回: {"say": bool, "text": str}
+    - say: True=应该说出口, False=仅内心思考
+    - text: 内心独白或要说的话
+    """
     if not memories:
-        return "我好像还什么都不记得。"
+        return {"say": False, "text": ""}
+
+    if keywords is None:
+        keywords = []
+    if user_input:
+        keywords.append(user_input)
 
     # 如果有关键词，优先保留包含任意关键词的记忆
     if keywords:
@@ -222,42 +232,112 @@ def verbalize(memories: list, keywords: list = [], new_state: dict = None, user_
             memories = memories[:10]
     else:
         memories = memories[:10]
-        keywords.append(user_input)
 
-    memories.reverse()  # 相关性高的在后，LLM 会更重视后面的话
+    memories.reverse()
     points = "\n".join([f"- {m}" for m in memories])
 
-    # 打印日志
     append_log("="*30+"LLM特供记忆"+"="*30)
     append_log(points)
 
     now = datetime.datetime.now()
+    state_hint = f"当前状态：{new_state}" if new_state else ""
+    time_hint = f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
 
-    keyword_hint = f"请注意，当前对话状态是：{new_state}。你可以使用状态中知道的信息；\n现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
+    if dialogue_history is None:
+        dialogue_history = get_history_context()
 
     system_prompt = (
-        "你是辉夜，正在和某人对话。请理解“我”的第一人称记忆片段的内容，并回复一句口语。"
-        "如果记忆不足以回答问题，可以进行反问，如果没有内容需要反问，就说‘静默’，不要加任何其他内容。"
-        "严格根据记忆，不知道得事情就不要提及或反问，不允许增加任何其他不知道得信息。"
-        "如果不是在对自己说话，你可以选择不回答，不回答就说‘静默’，不要加任何其他内容。"
-        "回答时，不要包含“xx说”，也不要包含任何动作或是神态的表示，可以增加语气词，直接回复即可。"
-        "只根据提供的信息输出，不得添加未给出的内容。"
+        "你是辉夜，正在思考。请根据当前浮现的记忆和情况，输出你此刻最真实的想法或独白，"
+        "以及是否应该把这句话说出来。\n\n"
+        "输出格式（严格JSON）：\n"
+        '{"say": true/false, "text": "..."}\n\n'
+        "规则：\n"
+        "- 如果当前有人在对你说什么，且你想回应，'say'为true\n"
+        "- 如果只是内心自然浮现的念头、碎碎念、联想，'say'为false\n"
+        "- 'say'为false时，'text'可以是更碎片化、自由联想的内心独白\n"
+        "- 严格根据记忆，不知道的事情不要提及\n"
+        "- 不要添加动作或神态描述\n"
+        "- 不要包含'xx说'，直接输出想法本身"
     )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"{keyword_hint}"},
-        {"role": "system", "content": get_history_context()},
-        {"role": "user", "content": f"记忆片段：\n{points}\n\n对方说：{user_input}。请对此进行回应。\n禁止添加任何新信息"}
+        {"role": "system", "content": f"{state_hint}\n{time_hint}"},
+        {"role": "system", "content": dialogue_history},
+        {"role": "user", "content": f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，输出你此刻的想法。"}
     ]
 
     reply = call_api_thinking(messages, max_tokens=8000)
 
-    # 打印日志
     append_log("="*30+"理解回复"+"="*30)
     append_log(reply)
 
-    return reply if reply else "静默"
+    if not reply:
+        return {"say": False, "text": ""}
+
+    try:
+        cleaned = reply.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
+        data = json.loads(cleaned)
+        return {
+            "say": bool(data.get("say", False)),
+            "text": str(data.get("text", "")),
+        }
+    except (json.JSONDecodeError, Exception):
+        append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
+        return {"say": True, "text": reply}
+
+
+def extract_curiosity_keywords(memories_context: list, max_keywords: int = 3) -> list:
+    """
+    复搜层：基于当前记忆和想法，提取进一步联想的关键词（仅用于检索，不入库）。
+    返回: list of keywords (1-max_keywords个)
+    """
+    if not memories_context:
+        return []
+
+    context_str = "\n".join(f"- {m}" for m in memories_context[:5])
+
+    append_log("="*30+"复搜层输入"+"="*30)
+    append_log(context_str)
+
+    system_prompt = (
+        "根据以下你刚才在想的事情，你想进一步了解或联想的方面有哪些？\n"
+        f"输出最多{max_keywords}个关键词用于搜索你的记忆，每个词不超过20字。\n\n"
+        "输出格式（严格JSON，不要其他内容）：\n"
+        '{"keywords": ["关键词1", "关键词2"]}\n\n'
+        "如果没有什么想进一步联想的，返回空数组。"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"我刚才在想：\n{context_str}\n\n请提取联想关键词。"}
+    ]
+
+    reply = _call_api(messages, max_tokens=2000)
+
+    append_log("="*30+"复搜关键词"+"="*30)
+    append_log(reply)
+
+    if not reply:
+        return []
+
+    try:
+        cleaned = reply.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
+        data = json.loads(cleaned)
+        keywords = data.get("keywords", [])
+        if isinstance(keywords, list):
+            return [str(kw).strip() for kw in keywords if kw and str(kw).strip()][:max_keywords]
+    except (json.JSONDecodeError, Exception):
+        append_log("复搜JSON解析失败，尝试逗号分割")
+        # 降级：尝试按逗号分割
+        parts = reply.replace("，", ",").split(",")
+        return [p.strip() for p in parts if p.strip()][:max_keywords]
+
+    return []
 
 def active_speak_decision(memories_context: list, state_context: dict) -> dict:
     """
