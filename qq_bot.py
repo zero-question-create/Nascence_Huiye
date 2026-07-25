@@ -374,6 +374,7 @@ async def handle_group_message(data: dict):
     from core.virtual_clock import clock
     from core.llm_interface import add_to_history
     from utils.dialogue_state import set_state
+    from utils.persistence import save_state
 
     full_input = augmented_input
     if extra_context:
