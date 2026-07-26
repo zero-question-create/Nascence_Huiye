@@ -1,117 +1,118 @@
+#!/bin/bash
 # ============================================================
-# Nascence Huiye Environment Setup (Windows)
+# Nascence Huiye Environment Setup (Linux/macOS)
 # ============================================================
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+set -e
 
-$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ProjectDir
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
 
-Write-Host "=========================================="
-Write-Host "  Nascence Huiye - Environment Setup"
-Write-Host "=========================================="
+echo "=========================================="
+echo "  Nascence Huiye - Environment Setup"
+echo "=========================================="
 
 # ---------- 1. Create venv ----------
-Write-Host "[*] Creating Python virtual environment..."
-if (-not (Test-Path "venv\Scripts\python.exe")) {
-    python -m venv venv
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[!] Failed to create venv. Please ensure Python is installed and in PATH."
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-    Write-Host "[OK] Virtual environment created"
-} else {
-    Write-Host "[OK] Virtual environment already exists"
-}
+echo "[*] Creating Python virtual environment..."
+if [ ! -f "venv/bin/python" ]; then
+    python3 -m venv venv
+    echo "[OK] Virtual environment created"
+else
+    echo "[OK] Virtual environment already exists"
+fi
 
-$Pip = "$ProjectDir\venv\Scripts\pip.exe"
+PIP="$PROJECT_DIR/venv/bin/pip"
 
 # ---------- 2. Install dependencies ----------
-Write-Host "[*] Installing Python dependencies..."
-& $Pip install -r requirements.txt -q
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[!] Dependency installation failed. Check requirements.txt."
-    Read-Host "Press Enter to exit"
+echo "[*] Installing Python dependencies..."
+$PIP install -r requirements.txt -q
+if [ $? -ne 0 ]; then
+    echo "[!] Dependency installation failed. Check requirements.txt."
+    read -p "Press Enter to exit"
     exit 1
-}
-Write-Host "[OK] Python dependencies installed"
+fi
+echo "[OK] Python dependencies installed"
 
-# ---------- 3. Download Ollama (Windows) ----------
-if (-not (Test-Path "ollama\bin\ollama.exe")) {
-    Write-Host "[*] Downloading Ollama (Windows)..."
-    try {
-        $ReleaseApi = "https://api.github.com/repos/ollama/ollama/releases/latest"
-        $ReleaseData = Invoke-RestMethod -Uri $ReleaseApi -ErrorAction Stop
-        $Tag = $ReleaseData.tag_name
-        Write-Host "    Version: $Tag"
-        $ZipUrl = "https://github.com/ollama/ollama/releases/download/${Tag}/ollama-windows-amd64.zip"
-        $ZipPath = "$ProjectDir\ollama\ollama.zip"
-        New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama" | Out-Null
-        Write-Host "[*] Downloading..."
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
-        Write-Host "[*] Extracting..."
-        $TempDir = "$ProjectDir\ollama\temp"
-        Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force -ErrorAction Stop
-        $ExeFile = Get-ChildItem -Path $TempDir -Recurse -Filter "ollama.exe" | Select-Object -First 1
-        if ($ExeFile) {
-            New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama\bin" | Out-Null
-            Copy-Item -Path $ExeFile.FullName -Destination "$ProjectDir\ollama\bin\ollama.exe" -Force
-            Write-Host "[OK] Ollama installed to ollama\bin\"
-        } else {
-            Write-Host "[!] ollama.exe not found in extracted files."
-        }
-        Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Host "[!] Failed to download Ollama. Error: $_"
-        Write-Host "[!] You can manually download ollama-windows-amd64.zip and place ollama.exe in ollama\bin\"
-    }
-} else {
-    Write-Host "[OK] Ollama already exists"
-}
+# ---------- 3. Download Ollama (Linux/macOS) ----------
+OLLAMA_DIR="$PROJECT_DIR/ollama"
+OLLAMA_BIN="$OLLAMA_DIR/bin/ollama"
+if [ ! -f "$OLLAMA_BIN" ]; then
+    echo "[*] Detecting OS..."
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+    case "$OS" in
+        Linux)  OLLAMA_URL="https://ollama.com/download/ollama-linux-${ARCH}.tgz" ;;
+        Darwin) OLLAMA_URL="https://ollama.com/download/Ollama-darwin.zip" ;;
+        *)      echo "[!] Unsupported OS: $OS"; exit 1 ;;
+    esac
+    echo "[*] Downloading Ollama for $OS ($ARCH)..."
+    mkdir -p "$OLLAMA_DIR/bin" "$OLLAMA_DIR/temp"
+
+    if [ "$OS" = "Linux" ]; then
+        curl -fsSL "$OLLAMA_URL" -o "$OLLAMA_DIR/ollama.tgz"
+        echo "[*] Extracting..."
+        tar -xzf "$OLLAMA_DIR/ollama.tgz" -C "$OLLAMA_DIR/temp"
+        find "$OLLAMA_DIR/temp" -name "ollama" -type f -exec cp {} "$OLLAMA_BIN" \;
+        rm -rf "$OLLAMA_DIR/temp" "$OLLAMA_DIR/ollama.tgz"
+    elif [ "$OS" = "Darwin" ]; then
+        curl -fsSL "$OLLAMA_URL" -o "$OLLAMA_DIR/ollama.zip"
+        echo "[*] Extracting..."
+        unzip -q "$OLLAMA_DIR/ollama.zip" -d "$OLLAMA_DIR/temp"
+        find "$OLLAMA_DIR/temp" -name "ollama" -type f -exec cp {} "$OLLAMA_BIN" \; 2>/dev/null || \
+        find "$OLLAMA_DIR/temp" -name "Ollama.app" -type d -exec cp -R {} "$OLLAMA_DIR/Ollama.app" \;
+        rm -rf "$OLLAMA_DIR/temp" "$OLLAMA_DIR/ollama.zip"
+    fi
+
+    chmod +x "$OLLAMA_BIN" 2>/dev/null || true
+    if [ -f "$OLLAMA_BIN" ]; then
+        echo "[OK] Ollama installed to ollama/bin/"
+    else
+        echo "[!] ollama binary not found in downloaded archive."
+        echo "[!] You can manually download from https://ollama.com"
+    fi
+else
+    echo "[OK] Ollama already exists"
+fi
 
 # ---------- 4. Create data directories ----------
-New-Item -ItemType Directory -Force -Path "data\test" | Out-Null
-New-Item -ItemType Directory -Force -Path "data\models" | Out-Null
-Write-Host "[OK] Data directories created"
+mkdir -p data/test data/models
+echo "[OK] Data directories created"
 
 # ---------- 5. (Optional) Pull embedding model ----------
-$OllamaBin = "$ProjectDir\ollama\bin\ollama.exe"
-if (Test-Path $OllamaBin) {
-    Write-Host "[*] Starting Ollama and pulling embedding model..."
-    $env:OLLAMA_HOME = "$ProjectDir\ollama\home"
-    $env:OLLAMA_MODELS = "$ProjectDir\ollama\home\models"
-    New-Item -ItemType Directory -Force -Path $env:OLLAMA_HOME | Out-Null
+if [ -f "$OLLAMA_BIN" ]; then
+    echo "[*] Starting Ollama and pulling embedding model..."
+    export OLLAMA_HOME="$PROJECT_DIR/ollama/home"
+    mkdir -p "$OLLAMA_HOME"
 
-    $OllamaProc = Start-Process -FilePath $OllamaBin -ArgumentList "serve" -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 3
+    # 后台启动 Ollama
+    "$OLLAMA_BIN" serve &
+    OLLAMA_PID=$!
+    sleep 3
 
-    $Model = "shaw/dmeta-embedding-zh"
-    try {
-        $TagList = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -ErrorAction Stop
-        $Exists = $TagList.models | Where-Object { $_.name -like "*dmeta-embedding-zh*" }
-    } catch {
-        $Exists = $null
-    }
-    if (-not $Exists) {
-        Write-Host "[*] Pulling model $Model (about 400MB, first time may be slow)..."
-        $PullBody = @{ model = $Model } | ConvertTo-Json
-        Invoke-RestMethod -Uri "http://localhost:11434/api/pull" -Method Post -Body $PullBody -ContentType "application/json" | Out-Null
-        Write-Host "[OK] Embedding model pulled"
-    } else {
-        Write-Host "[OK] Embedding model already exists"
-    }
+    MODEL="shaw/dmeta-embedding-zh"
+    # 检查模型是否已存在
+    if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+        EXISTS=$(curl -sf http://localhost:11434/api/tags | python3 -c "import sys,json; data=json.load(sys.stdin); print(any('dmeta-embedding-zh' in m.get('name','') for m in data.get('models',[])))" 2>/dev/null)
+        if [ "$EXISTS" != "True" ]; then
+            echo "[*] Pulling model $MODEL (about 400MB, first time may be slow)..."
+            curl -sf http://localhost:11434/api/pull -d "{\"model\": \"$MODEL\"}" > /dev/null 2>&1
+            echo "[OK] Embedding model pulled"
+        else
+            echo "[OK] Embedding model already exists"
+        fi
+    else
+        echo "[!] Ollama not responding, skipping model pull."
+    fi
 
-    Stop-Process -Id $OllamaProc.Id -Force -ErrorAction SilentlyContinue
-    Write-Host "[OK] Ollama service stopped"
-} else {
-    Write-Host "[*] Ollama not installed, skipping model pull."
-}
+    kill "$OLLAMA_PID" 2>/dev/null || true
+    wait "$OLLAMA_PID" 2>/dev/null || true
+    echo "[OK] Ollama service stopped"
+else
+    echo "[*] Ollama not installed, skipping model pull."
+fi
 
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "  Setup complete! You can now run"
-Write-Host "  '启动控制面板.bat' to start the project."
-Write-Host "=========================================="
-Read-Host "Press Enter to exit"
+echo ""
+echo "=========================================="
+echo "  Setup complete! You can now run"
+echo "  'bash start.sh' to start the project."
+echo "=========================================="
