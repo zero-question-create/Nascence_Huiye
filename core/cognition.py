@@ -501,6 +501,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             if should_speak and thought_text and send_func and target_group_id:
                 await send_func(target_group_id, thought_text)
                 add_to_history(None, None, thought_text)
+                from utils.event_bus import BUS
+                BUS.message.emit("辉夜", thought_text, "QQ")
 
             # ============================
             # Step 7: 优雅停止检查（不复搜）
