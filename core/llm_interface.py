@@ -2,6 +2,7 @@
 import json
 import base64
 import os
+import re
 import aiofiles
 import asyncio
 import subprocess
@@ -114,8 +115,8 @@ def decompose_input(user_input: str) -> tuple:
 3. 不要凭空添加对方未说的信息，也不要修改任何细节，没有记忆需要存储则返回“无”。
 4. 关键词：从输入中提取 1-3 个原词，不做联想。
 5. 状态维护：更新“participants”、“topic”，info 数组最多保留 20 条最关键信息，请对该数组加以修改整合，选择最重要的记忆存放在数组中,每条最多30字。
-    6. 纯指令或重复的输入不需要转为记忆片段，直接跳过。
-    7. 只根据以上提供的信息输出，不得添加未给出的内容。
+6. 纯指令或重复的输入不需要转为记忆片段，直接跳过。
+7. 只根据以上提供的信息输出，不得添加未给出的内容。
 
 输出严格只包含 JSON，info 数组长度不得超过20，字段如下：
 {{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["辉夜","彩叶"],"topic":"话题","info":["已知1","已知2"]}}}}
@@ -205,6 +206,49 @@ def decompose_input(user_input: str) -> tuple:
 
     return memories, mode, new_state, keywords
 
+def _safe_json_parse(text: str) -> dict:
+    """
+    容错解析 LLM 返回的简单 JSON 片段。
+    处理 code block 包裹、text 字段中未转义半角引号等问题。
+    返回提取到的字段 dict（不保证包含所有字段）。
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
+
+    # 优先标准 JSON 解析
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    result = {}
+
+    # say → bool
+    m = re.search(r'"say"\s*:\s*(true|false)', cleaned, re.IGNORECASE)
+    if m:
+        result["say"] = m.group(1).lower() == "true"
+
+    # text → string（值中可能含未转义引号，使用贪婪匹配到最后的 " 前）
+    m = re.search(r'"text"\s*:\s*"(.+)"\s*\}', cleaned, re.DOTALL)
+    if m:
+        raw = m.group(1)
+        raw = raw.replace('\\"', "\u201c").replace('"', "\u201d").replace("'", "\u2018").replace("'", "\u2019")
+        result["text"] = raw
+
+    # keywords → list
+    m = re.search(r'"keywords"\s*:\s*(\[[\s\S]*?\])\s*\}', cleaned, re.DOTALL)
+    if m:
+        try:
+            result["keywords"] = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            items = re.findall(r'"([^"]*)"', m.group(1))
+            if items:
+                result["keywords"] = list(items)
+
+    return result
+
+
 def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, dialogue_history: str = None) -> dict:
     """
     根据记忆生成内心独白和发言决策。
@@ -249,8 +293,6 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     system_prompt = (
         "你是辉夜，正在思考。请根据当前浮现的记忆和情况，输出你此刻最真实的想法或独白，"
         "以及是否应该把这句话说出来。\n\n"
-        "输出格式（严格JSON）：\n"
-        '{"say": true/false, "text": "..."}\n\n'
         "规则：\n"
         "- 如果当前有人在对你说什么，且你想回应，'say'为true\n"
         "- 如果只是内心自然浮现的念头、碎碎念、联想，'say'为false\n"
@@ -259,6 +301,8 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         "- 严格根据记忆，不知道的事情不要提及\n"
         "- 不要添加动作或神态描述\n"
         "- 不要包含'xx说'，直接输出想法本身"
+        "输出严格只包含 JSON：\n"
+        '{"say": true/false, "text": "..."}\n\n'
     )
 
     messages = [
@@ -276,18 +320,16 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     if not reply:
         return {"say": False, "text": ""}
 
-    try:
-        cleaned = reply.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
-        data = json.loads(cleaned)
+    data = _safe_json_parse(reply)
+    if "say" in data or "text" in data:
         return {
             "say": bool(data.get("say", False)),
             "text": str(data.get("text", "")),
         }
-    except (json.JSONDecodeError, Exception):
-        append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
-        return {"say": True, "text": reply}
+
+    # 完全无法解析时降级
+    append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
+    return {"say": True, "text": reply}
 
 
 def extract_curiosity_keywords(memories_context: list, max_keywords: int = 3) -> list:
@@ -324,21 +366,15 @@ def extract_curiosity_keywords(memories_context: list, max_keywords: int = 3) ->
     if not reply:
         return []
 
-    try:
-        cleaned = reply.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
-        data = json.loads(cleaned)
-        keywords = data.get("keywords", [])
-        if isinstance(keywords, list):
-            return [str(kw).strip() for kw in keywords if kw and str(kw).strip()][:max_keywords]
-    except (json.JSONDecodeError, Exception):
-        append_log("复搜JSON解析失败，尝试逗号分割")
-        # 降级：尝试按逗号分割
-        parts = reply.replace("，", ",").split(",")
-        return [p.strip() for p in parts if p.strip()][:max_keywords]
+    data = _safe_json_parse(reply)
+    keywords = data.get("keywords", None)
+    if isinstance(keywords, list):
+        return [str(kw).strip() for kw in keywords if kw and str(kw).strip()][:max_keywords]
 
-    return []
+    # 降级：尝试按逗号分割
+    append_log("复搜JSON解析失败，尝试逗号分割")
+    parts = reply.replace("，", ",").split(",")
+    return [p.strip() for p in parts if p.strip()][:max_keywords]
 
 def active_speak_decision(memories_context: list, state_context: dict) -> dict:
     """
