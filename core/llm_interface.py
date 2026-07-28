@@ -48,7 +48,7 @@ def get_history_context() -> str:
     text = get_recent(10)
     if not text:
         return ""
-    result = "【近期对话】\n" + text + "\n不要复述或重复自己说过的话"
+    result = "【近期对话】\n" + text
     append_log(result)
     return result
 
@@ -358,7 +358,7 @@ def extract_curiosity_keywords(memories_context: list, max_keywords: int = 3) ->
         {"role": "user", "content": f"我刚才在想：\n{context_str}\n\n请提取联想关键词。"}
     ]
 
-    reply = _call_api(messages, max_tokens=2000)
+    reply = _call_api(messages, max_tokens=8000)
 
     append_log("="*30+"复搜关键词"+"="*30)
     append_log(reply)
