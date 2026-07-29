@@ -42,19 +42,19 @@ from utils.monitor import monitor_start
 # 批量注入函数
 def cold_start_batch_injection():
     """批量注入冷启动记忆，用于初始化记忆库"""
-    from data.cold_start_prompts import COLD_START_DIALOGS
+    try:
+        from data.cold_start_prompts import COLD_START_DIALOGS
+    except (ImportError, ModuleNotFoundError):
+        print("[冷启动] 未找到 data/cold_start_prompts.py，跳过冷启动")
+        return
     from core.memory_engine import create_memory, add_link
     from utils.dialogue_state import set_state, get_state
     
     for user_text, bot_text in COLD_START_DIALOGS:
-        # user_text 已经是辉夜视角的第一人称记忆片段
         user_mem_id = create_memory(user_text, half_life=7*24*3600)
-        # 辉夜的回复记忆
         bot_mem_id = create_memory(f"我说：{bot_text}", half_life=7*24*3600)
-        # 建立因果链接
         add_link(user_mem_id, bot_mem_id, 0.8, "causal")
 
-    # 更新对话状态，去掉“彩叶”，只用泛称
     state = get_state()
     state["参与者"] = ["辉夜", "群友们"]
     state["我的已知信息"] = [
