@@ -16,6 +16,7 @@ except ImportError:
     fcntl = None
 from datetime import datetime
 from pathlib import Path
+from config.api_config import DEFAULT_CONFIG
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DIR = PROJECT_DIR / "run"
@@ -889,6 +890,10 @@ class ControlPanel(QMainWindow):
 
     def _load_config(self):
         path = PROJECT_DIR / "config" / "api_config.json"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
         with path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
         self.ds_url.setText(cfg.get("primary_base_url", ""))
@@ -900,8 +905,11 @@ class ControlPanel(QMainWindow):
 
     def save_config(self):
         path = PROJECT_DIR / "config" / "api_config.json"
-        with path.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        if not path.exists():
+            cfg = dict(DEFAULT_CONFIG)
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
         cfg.update({
             "primary_base_url": self.ds_url.text().strip(),
             "primary_model": self.ds_model.text().strip(),

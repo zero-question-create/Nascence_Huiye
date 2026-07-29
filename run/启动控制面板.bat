@@ -4,6 +4,9 @@ setlocal enabledelayedexpansion
 set "PROJECT_DIR=%~dp0.."
 cd /d "%PROJECT_DIR%"
 
+rem --- Qt plugin path (fix "could not find platform plugin" error) ---
+set "QT_PLUGIN_PATH=%PROJECT_DIR%\venv\Lib\site-packages\PyQt5\Qt5\plugins"
+
 echo ==========================================
 echo  Nascence Huiye Control Panel
 echo ==========================================
