@@ -1,29 +1,27 @@
-@echo off
-setlocal enabledelayedexpansion
-
-title Nascence 辉夜控制面板
-
-set "PROJECT_DIR=%~dp0.."
-cd /d "%PROJECT_DIR%"
-set "QT_PLUGIN_PATH=%PROJECT_DIR%\run\qt-plugins"
-
-echo ==========================================
-echo  Nascence 辉夜控制面板
-echo  项目目录: %PROJECT_DIR%
-echo  关闭此终端即停止全部项目服务
-echo ==========================================
-
-if not exist "%PROJECT_DIR%\venv\Scripts\python.exe" (
-    echo 未找到项目虚拟环境, 正在执行 setup.ps1...
-    powershell -ExecutionPolicy Bypass -File "%PROJECT_DIR%\setup.ps1"
-)
-
-echo 正在启动控制面板...
-set "PYSIDE_DIR=%PROJECT_DIR%\venv\lib\site-packages\PySide6"
-if exist "%PYSIDE_DIR%" (
-    set "PATH=%PYSIDE_DIR%;%PATH%"
-)
-"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\control_panel.py"
-
-echo 控制面板已退出。
-pause
+@echo off
+setlocal enabledelayedexpansion
+
+set "PROJECT_DIR=%~dp0.."
+cd /d "%PROJECT_DIR%"
+
+echo ==========================================
+echo  Nascence Huiye Control Panel
+echo ==========================================
+
+if not exist "%PROJECT_DIR%\venv\Scripts\python.exe" (
+    powershell -Command "Write-Host '未找到虚拟环境，正在执行 setup.ps1...' -ForegroundColor Cyan"
+    powershell -ExecutionPolicy Bypass -File "%PROJECT_DIR%\setup.ps1"
+    if not exist "%PROJECT_DIR%\venv\Scripts\python.exe" (
+        powershell -Command "Write-Host '[ERROR] 虚拟环境安装失败，请手动运行 setup.ps1' -ForegroundColor Red"
+        pause
+        exit /b 1
+    )
+)
+
+"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\control_panel.py"
+if %errorlevel% neq 0 (
+    powershell -Command "Write-Host '[ERROR] 控制面板异常退出，错误码: %errorlevel%' -ForegroundColor Red"
+)
+
+powershell -Command "Write-Host '控制面板已退出。' -ForegroundColor Green"
+pause
