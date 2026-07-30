@@ -636,17 +636,23 @@ def retrieve_by_exact_keywords(keywords: list, k: int = 5) -> list:
     results.sort(key=lambda x: x[0], reverse=True)
     return results[:k]
 
-def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8, max_steps: int = 2) -> list:
+def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8, max_steps: int = 2, inhibited_edges: set = None, output_visited_edges: list = None) -> list:
     """
     受限 BFS 激活扩散（双图合并版）
     - 同时使用有向链接（causal/temporal/semantic）和 faiss 弱语义链接（semantic_fast）
     - 边类型感知体力消耗
     - 每条边最多访问一次（全局 visited 边集合）
     - 每个节点最多扩展 MAX_OUT_EDGES 条最强出边（仅对 links 边剪枝，faiss 边不受限）
+    - inhibited_edges: 可选的被抑制边集合 (src_id, tgt_id)，扩散时跳过
+    - output_visited_edges: 若提供 list，每条遍历过的边 (src, tgt) 会追加至此
     """
+    if inhibited_edges is None:
+        inhibited_edges = set()
     with _data_lock:
         adj = {}
         for (src, tgt), link_data in list(links.items()):
+            if (src, tgt) in inhibited_edges:
+                continue
             if src not in adj:
                 adj[src] = []
             w = decay_link(src, tgt)
@@ -703,6 +709,8 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                     if edge_key in visited_edges:
                         continue
                     visited_edges.add(edge_key)
+                    if output_visited_edges is not None:
+                        output_visited_edges.append(edge_key)
                     factor = COST_FACTOR.get(edge_type, 1.0)
                     cost = (1.0 / current_weight) * factor
                     new_stamina = stamina - cost

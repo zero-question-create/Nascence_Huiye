@@ -299,6 +299,8 @@ async def handle_group_message(data: dict):
                 tmp_path = str(file_url)
 
             if seg_type == "image":
+                if file_format == "gif":
+                    seg_type = "gif"  # 标记为表情包，仅影响增强输入措辞
                 desc = await describe_image_from_path(tmp_path)
             elif seg_type == "record":
                 desc = await describe_audio_from_path(tmp_path)
@@ -320,7 +322,9 @@ async def handle_group_message(data: dict):
         # 生成媒体部分的自然描述
         media_parts = []
         for m_type, d in media_list:
-            if m_type == "image":
+            if m_type == "gif":
+                media_parts.append(f"一个表情包，内容是“{d}”")
+            elif m_type == "image":
                 media_parts.append(f"一张图片，内容是“{d}”")
             elif m_type == "record":
                 media_parts.append(f"一段录音，内容是“{d}”")
