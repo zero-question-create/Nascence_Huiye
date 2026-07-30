@@ -34,11 +34,27 @@ UNDO_FILE = "data/test/undo_snapshot.json"
 
 current_speaker: str = None
 
+# ========== 反刍抑制常量 ==========
+RUMINATION_THRESHOLD = 2                            # 关键词连续出现 >= 此值，触发抑制
+SEED_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3      # 种子抑制轮数
+EDGE_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3      # 路径抑制轮数
+KEYWORD_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3   # 关键词抑制轮数，触发的关键词在此轮数内跳过检索
+
 # ========== 永续认知循环全局 ==========
-_new_message_keywords_deque = deque(maxlen=100)   # 新消息关键词队列
-_shallow_pool = deque(maxlen=20)                  # 浅层意识池
-_cognitive_running = False                        # 循环运行状态
-_graceful_stop = False                            # 优雅停止标志（完成当前轮，不复搜）
+_new_message_keywords_deque = deque(maxlen=100)     # 新消息关键词队列
+_shallow_pool = deque(maxlen=20)                    # 浅层意识池
+_cognitive_running = False                          # 循环运行状态
+_graceful_stop = False                              # 优雅停止标志（完成当前轮，不复搜）
+
+# ========== 反刍抑制状态 ==========
+_keyword_continuity: dict = {}                      # {关键词: 连续出现次数}
+_inhibited_seeds: dict = {}                         # {种子节点ID: 剩余抑制轮数}
+_inhibited_edges: dict = {}                         # {(src_id, tgt_id): 剩余抑制轮数}
+_inhibited_keywords: dict = {}                      # {关键词: 剩余抑制轮数}
+
+# 每轮扩散记录（注入抑制时记录当前轮使用的种子和边）
+_current_round_seeds: list = []
+_current_round_edges: list = []
 
 def inject_message_keywords(keywords: list):
     """由消息处理层调用，将新消息的关键词注入认知循环"""
@@ -68,13 +84,24 @@ def _get_drowsy_memory() -> str:
     else:
         return None
 
-def retrieve_and_diffuse(keywords: list, max_memories: int = 10) -> list:
+def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
+                         inhibited_seeds: set = None,
+                         inhibited_edges: set = None) -> list:
     """
     关键词检索 + 受限BFS扩散，返回带时间标记的记忆片段列表。
     供 cognitive_loop 和 generate_response 共用。
+    inhibited_seeds: 被抑制的种子ID集合，检索后从候选种子中移除
+    inhibited_edges: 被抑制的边集合 (src_id, tgt_id)，扩散时跳过
     """
     if not keywords:
         return []
+
+    if inhibited_seeds is None:
+        inhibited_seeds = set()
+    if inhibited_edges is None:
+        inhibited_edges = set()
+
+    global _current_round_seeds, _current_round_edges
 
     # 语义检索（faiss）
     seed_ids = []
@@ -92,11 +119,20 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10) -> list:
         if mem["id"] not in seed_ids:
             seed_ids.append(mem["id"])
 
-    # BFS扩散
+    # 应用种子抑制过滤
+    seed_ids = [sid for sid in seed_ids if sid not in inhibited_seeds]
+
+    # BFS扩散（同时记录本轮遍历的边）
+    _current_round_edges = []
     activated_memories = []
     if seed_ids:
-        activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8)
+        activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8,
+                                        inhibited_edges=inhibited_edges,
+                                        output_visited_edges=_current_round_edges)
         activated_memories = [(mem, score) for mem, score in activated]
+
+    # 记录本轮实际使用的种子
+    _current_round_seeds = list(seed_ids)
 
     # 合并扩散结果 + 检索结果
     combined = {}
@@ -385,13 +421,18 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
       当前轮继续执行到回复输出，跳过复搜后退出。
     """
     global _new_message_keywords_deque, _shallow_pool, _cognitive_running, _graceful_stop
+    global _keyword_continuity, _inhibited_seeds, _inhibited_edges, _inhibited_keywords
 
     from .llm_interface import extract_curiosity_keywords, add_to_history, get_history_context
     from .memory_engine import memories, access_memory
 
-    # 重置停止标志，允许新会话启动
+    # 重置停止标志和抑制状态，允许新会话启动
     _graceful_stop = False
     _cognitive_running = True
+    _keyword_continuity.clear()
+    _inhibited_seeds.clear()
+    _inhibited_edges.clear()
+    _inhibited_keywords.clear()
     current_keywords = []
     loop_count = 0
 
@@ -445,9 +486,98 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                     continue
 
             # ============================
-            # Step 3: 检索与扩散
+            # 阶段0：过滤被抑制的关键词
             # ============================
-            related_memories = retrieve_and_diffuse(current_keywords, max_memories=10)
+            if current_keywords and _inhibited_keywords:
+                old_len = len(current_keywords)
+                current_keywords = [kw for kw in current_keywords if kw not in _inhibited_keywords]
+                if len(current_keywords) < old_len:
+                    append_log(f"[反刍抑制] 过滤 {old_len - len(current_keywords)} 个被抑制关键词，剩余: {current_keywords}")
+
+            # ============================
+            # 阶段1：更新关键词计数器，检测反刍
+            # ============================
+            if current_keywords:
+                # 添加上轮不存在的关键词
+                for kw in current_keywords:
+                    _keyword_continuity[kw] = _keyword_continuity.get(kw, 0) + 1
+                # 删除本轮不存在的旧关键词
+                for kw in list(_keyword_continuity):
+                    if kw not in current_keywords:
+                        del _keyword_continuity[kw]
+
+                # 检测反刍
+                is_ruminating = any(
+                    count >= RUMINATION_THRESHOLD
+                    for kw, count in _keyword_continuity.items()
+                )
+            else:
+                is_ruminating = False
+
+            # ============================
+            # 阶段2：抑制触发（强制转向）
+            # ============================
+            if is_ruminating:
+                triggered_kws = [kw for kw, count in _keyword_continuity.items()
+                                 if count >= RUMINATION_THRESHOLD]
+                for kw in triggered_kws:
+                    append_log(f"[反刍抑制] 检测到关键词重复: '{kw}' 连续 {_keyword_continuity[kw]} 次")
+
+                # 抑制本轮使用的种子和边
+                seed_count = 0
+                for sid in _current_round_seeds:
+                    if sid not in _inhibited_seeds:
+                        _inhibited_seeds[sid] = SEED_INHIBIT_ROUNDS
+                        seed_count += 1
+                edge_count = 0
+                for edge in _current_round_edges:
+                    if edge not in _inhibited_edges:
+                        _inhibited_edges[edge] = EDGE_INHIBIT_ROUNDS
+                        edge_count += 1
+
+                # 抑制触发了反刍的关键词本身
+                kw_inhibit_count = 0
+                for kw in triggered_kws:
+                    if kw not in _inhibited_keywords:
+                        _inhibited_keywords[kw] = KEYWORD_INHIBIT_ROUNDS
+                        kw_inhibit_count += 1
+
+                append_log(f"[反刍抑制] 触发：抑制 {seed_count} 个种子节点（{SEED_INHIBIT_ROUNDS}轮），{edge_count} 条边（{EDGE_INHIBIT_ROUNDS}轮），{kw_inhibit_count} 个关键词（{KEYWORD_INHIBIT_ROUNDS}轮）")
+
+                # 强制转向：从浅层意识池随机抽取新种子
+                forced_seed_id = None
+                if _shallow_pool:
+                    forced_seed_id = random.choice(list(_shallow_pool))
+                    forced_mem = memories.get(forced_seed_id)
+                    if forced_mem:
+                        current_keywords = [forced_mem["content"][:50]]
+                        append_log(f"[反刍抑制] 强制转向：从浅层池抽取新种子 {forced_seed_id[:8]}...")
+                    else:
+                        forced_seed_id = None
+
+                if not forced_seed_id:
+                    # 浅层池不可用，清空关键词触发重选
+                    current_keywords = []
+                    append_log("[反刍抑制] 强制转向：浅层池为空，清空关键词")
+
+                # 清空触发了反刍的关键词计数器
+                for kw in triggered_kws:
+                    if kw in _keyword_continuity:
+                        del _keyword_continuity[kw]
+
+            # ============================
+            # Step 3: 检索与扩散（应用抑制过滤）
+            # ============================
+            if not current_keywords:
+                append_log("[认知循环] 当前无关键词，跳过本轮")
+                await asyncio.sleep(3)
+                continue
+
+            related_memories = retrieve_and_diffuse(
+                current_keywords, max_memories=10,
+                inhibited_seeds=set(_inhibited_seeds.keys()),
+                inhibited_edges=set(_inhibited_edges.keys())
+            )
             if not related_memories:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
                 current_keywords = []
@@ -514,7 +644,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # ============================
             # Step 7b: 复搜层 —— 提取新关键词
             # ============================
-            kw_context = related_memories + [thought_text]
+            kw_context = [memory_text]
             new_keywords = await loop.run_in_executor(
                 None, extract_curiosity_keywords, kw_context
             )
@@ -532,6 +662,32 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # Step 8: 休眠
             # ============================
             await asyncio.sleep(2)
+
+            # ============================
+            # 阶段5：抑制计数器衰减与清理
+            # ============================
+            expired_seeds = 0
+            for sid in list(_inhibited_seeds):
+                _inhibited_seeds[sid] -= 1
+                if _inhibited_seeds[sid] <= 0:
+                    del _inhibited_seeds[sid]
+                    expired_seeds += 1
+            expired_edges = 0
+            for edge in list(_inhibited_edges):
+                _inhibited_edges[edge] -= 1
+                if _inhibited_edges[edge] <= 0:
+                    del _inhibited_edges[edge]
+                    expired_edges += 1
+            expired_keywords = 0
+            for kw in list(_inhibited_keywords):
+                _inhibited_keywords[kw] -= 1
+                if _inhibited_keywords[kw] <= 0:
+                    del _inhibited_keywords[kw]
+                    expired_keywords += 1
+            if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
+                append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
+
+            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             append_log("[认知循环] 已停止")
