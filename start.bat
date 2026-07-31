@@ -21,7 +21,6 @@ echo [OK] Virtual env found
 
 :: ---------- 2. Ensure data dirs ----------
 if not exist "%PROJECT_DIR%data\test" mkdir "%PROJECT_DIR%data\test"
-if not exist "%PROJECT_DIR%data\models" mkdir "%PROJECT_DIR%data\models"
 
 :: ---------- 3. Start Ollama ----------
 set "OLLAMA_BIN=%PROJECT_DIR%ollama\bin\ollama.exe"

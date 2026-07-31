@@ -75,7 +75,7 @@ else
 fi
 
 # ---------- 4. Create data directories ----------
-mkdir -p data/test data/models
+mkdir -p data/test
 echo "[OK] Data directories created"
 
 # ---------- 5. (Optional) Pull embedding model ----------

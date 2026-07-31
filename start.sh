@@ -28,7 +28,7 @@ fi
 source venv/bin/activate
 
 # ---------- 2. 确保数据目录 ----------
-mkdir -p data/test data/models
+mkdir -p data/test
 
 # ---------- 3. 启动 Ollama ----------
 OLLAMA_BIN="$PROJECT_DIR/ollama/bin/ollama"
