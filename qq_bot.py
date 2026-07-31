@@ -79,6 +79,7 @@ ACTIVE_GROUP_ID = "1057279304"  # 主动发言的目标群
 _final_save_done = False            # 全局保存标识
 _napcat_websocket = None             # 当前连接的 NapCat 反向 WebSocket
 _cognitive_task = None               # 永续认知循环 task
+_shutdown_event = None               # 服务停止信号（在事件循环线程内 set）
 _action_lock = asyncio.Lock()        # 串行发送 OneBot Action，避免响应混淆
 _action_counter = 0
 _pending_actions = {}                 # echo -> Future，用于匹配 NapCat Action 响应
@@ -630,13 +631,25 @@ async def ws_handler(websocket):
             await asyncio.gather(*message_tasks, return_exceptions=True)
         logger.info("NapCat WebSocket 已释放")
 
+def request_shutdown():
+    """请求 QQ 服务优雅停止（由控制面板在 GUI 线程内 call_soon_threadsafe 触发）。
+
+    仅置位停止信号；start_server 检测到后先等认知循环完成当前轮，再断开 NapCat。
+    在事件循环线程中调用，Event.set() 线程安全。
+    """
+    if _shutdown_event is not None:
+        _shutdown_event.set()
+
 async def start_server():
     """启动 WebSocket 服务器，附带定时保存"""
     logger.info(f"当前记忆数: {len(memories)}")
     if not memories:
         logger.warning("[主动发言] 记忆库为空，发散任务将空闲等待")
     logger.info(f"启动 WebSocket 服务器: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
-    
+
+    global _shutdown_event, _napcat_websocket, _cognitive_task
+    _shutdown_event = asyncio.Event()
+
     # ========== 后台定时保存任务 ==========
     async def auto_save():
         """每10分钟自动保存一次记忆和状态"""
@@ -662,10 +675,37 @@ async def start_server():
     try:
         async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
             logger.info(f"WebSocket 服务器已启动，等待 NapCat 连接: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
-            await asyncio.Future()  # 永久运行
+            await _shutdown_event.wait()
+
+            # ========== 服务停止：优雅关停 ==========
+            # 顺序：请求认知循环完成当前轮 → 等待其退出 → 再断开 NapCat
+            logger.info("[服务停止] 请求认知循环完成当前轮…")
+            from core.cognition import request_graceful_stop
+            request_graceful_stop()
+            if _cognitive_task and not _cognitive_task.done():
+                try:
+                    await asyncio.wait_for(_cognitive_task, timeout=60)
+                except asyncio.TimeoutError:
+                    _cognitive_task.cancel()
+                    try:
+                        await _cognitive_task
+                    except asyncio.CancelledError:
+                        pass
+                    logger.warning("[服务停止] 认知循环超时强制取消")
+                _cognitive_task = None
+                logger.info("[服务停止] 认知循环已结束")
+            else:
+                logger.info("[服务停止] 认知循环未运行")
+
+            # 认知循环结束后再断开 NapCat（触发 ws_handler 的 finally 释放）
+            if _napcat_websocket is not None:
+                try:
+                    await _napcat_websocket.close(code=1000, reason="service stopping")
+                    logger.info("[服务停止] NapCat 已断开")
+                except Exception:
+                    logger.warning("[服务停止] NapCat 断开失败（可能已断开）")
     finally:
         global _final_save_done
-        global _napcat_websocket, _cognitive_task
         _napcat_websocket = None
         _final_save_done = False
         save_task.cancel()

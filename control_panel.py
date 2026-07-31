@@ -297,9 +297,26 @@ class Runtime:
     def stop_qq(self):
         if not self.qq_loop or not self.qq_task:
             return
-        self.qq_loop.call_soon_threadsafe(self.qq_task.cancel)
+        # 优雅停止：置位停止信号 → start_server 先等认知循环完成当前轮，再断开 NapCat
+        try:
+            import qq_bot
+
+            def _trigger():
+                if qq_bot._shutdown_event is None:
+                    # 服务尚未初始化停止信号，退化为直接取消
+                    if not self.qq_task.done():
+                        self.qq_task.cancel()
+                else:
+                    qq_bot.request_shutdown()
+
+            self.qq_loop.call_soon_threadsafe(_trigger)
+        except Exception:
+            try:
+                self.qq_loop.call_soon_threadsafe(self.qq_task.cancel)
+            except Exception:
+                pass
         if self.qq_thread:
-            self.qq_thread.join(timeout=10)
+            self.qq_thread.join(timeout=90)
 
     def chat(self, sender, text, group_id, mentioned):
         self.initialize()

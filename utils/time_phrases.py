@@ -6,8 +6,12 @@ def get_relative_time_phrase(real_timestamp: float) -> str:
     dt = datetime.datetime.fromtimestamp(real_timestamp)
     delta = (now - dt).total_seconds()
 
-    if delta < 3600:
+    if delta < 60:
         return "刚刚"
+    elif delta < 600:
+        return "几分钟前"
+    elif delta < 3600:
+        return "几十分钟前"
 
     if dt.date() == now.date():
         hour = dt.hour

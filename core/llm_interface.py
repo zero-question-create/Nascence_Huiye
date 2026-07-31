@@ -298,7 +298,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         "- 如果只是内心自然浮现的念头、碎碎念、联想，'say'为false\n"
         "- 'say'为false时，'text'可以是更碎片化、自由联想的内心独白\n"
         "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内\n"
-        "- 严格根据记忆，不知道的事情不要提及\n"
+        "- 严格根据记忆，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
         "- 不要添加动作或神态描述\n"
         "- 不要包含'xx说'，直接输出想法本身"
         "输出严格只包含 JSON：\n"
