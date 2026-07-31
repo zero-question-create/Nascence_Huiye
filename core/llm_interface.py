@@ -119,7 +119,7 @@ def decompose_input(user_input: str) -> tuple:
 7. 只根据以上提供的信息输出，不得添加未给出的内容。
 
 输出严格只包含 JSON，info 数组长度不得超过20，字段如下：
-{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["辉夜","彩叶"],"topic":"话题","info":["已知1","已知2"]}}}}
+{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["辉夜"],"topic":"话题","info":["已知1","已知2"]}}}}
 """
 
     messages = [
@@ -490,6 +490,7 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
                 }
             ],
             stream=False,
+            max_tokens=10000,
         )
         content = response.choices[0].message.content
         reply = content.strip() if content else ""
@@ -540,6 +541,7 @@ async def _describe_media_from_path(file_path: str, media_type: str, prompt: str
             model=MODEL_,
             messages=[{"role": "user", "content": content}],
             stream=False,
+            max_tokens=10000,
         )
         response_content = response.choices[0].message.content
         reply = response_content.strip() if response_content else ""
