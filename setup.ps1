@@ -73,7 +73,6 @@ if (-not (Test-Path "ollama\bin\ollama.exe")) {
 
 # ---------- 4. Create data directories ----------
 New-Item -ItemType Directory -Force -Path "data\test" | Out-Null
-New-Item -ItemType Directory -Force -Path "data\models" | Out-Null
 Write-Host "[OK] Data directories created"
 
 # ---------- 5. (Optional) Pull embedding model ----------

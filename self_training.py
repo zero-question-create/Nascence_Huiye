@@ -8,7 +8,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DIR = PROJECT_DIR / "run"
 LOG_DIR = RUN_DIR / "logs"
-for d in [LOG_DIR, PROJECT_DIR / "data" / "test", PROJECT_DIR / "data" / "models"]:
+for d in [LOG_DIR, PROJECT_DIR / "data" / "test"]:
     d.mkdir(parents=True, exist_ok=True)
 
 _log_file = LOG_DIR / "self_training.log"
