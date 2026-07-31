@@ -56,11 +56,9 @@ def cold_start_batch_injection():
         add_link(user_mem_id, bot_mem_id, 0.8, "causal")
 
     state = get_state()
-    state["参与者"] = ["辉夜", "群友们"]
+    state["参与者"] = ["辉夜"]
     state["我的已知信息"] = [
-        "我的名字是辉夜",
-        "我是群里的成员，和大家都认识",
-        "大家是我的朋友，我们关系很好"
+        "我的名字是辉夜"
     ]
     set_state(state)
     print(f"[冷启动] 已注入 {len(COLD_START_DIALOGS)} 条基础记忆")

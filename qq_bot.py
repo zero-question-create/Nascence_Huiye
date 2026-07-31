@@ -126,6 +126,7 @@ def parse_cq_code(text: str) -> Tuple[str, List[str]]:
     clean_text = re.sub(r'\[CQ:[^\]]+\]', '', text).strip()
     return clean_text, mentions
 
+
 def build_augmented_input(sender_name: str, raw_text: str, mentions: List[str], group_id: str, is_mentioned_me: bool) -> str:
     """
     构建标准化增强输入（自然语言格式）
@@ -253,10 +254,17 @@ async def handle_group_message(data: dict):
     media_list = []  # 收集 (type, description)
     for seg in data.get("message", []):
         seg_type = seg.get("type")
-        if seg_type not in ("image", "record", "video"):
+        if seg_type not in ("image", "record", "video", "mface"):
             continue
         seg_data = seg.get("data", {})
-        file_url = seg_data.get("url") or seg_data.get("file")
+
+        if seg_type == "mface":
+            # 商城表情包（NapCat 直报 mface）：无可下载媒体，直接用摘要描述
+            summary = seg_data.get("summary") or seg_data.get("key") or "商城表情包"
+            media_list.append(("sticker", summary))
+            continue
+
+        file_url = seg_data.get("url") or seg_data.get("path") or seg_data.get("file")
         if seg_type == "record" and file_url and not str(file_url).startswith(("http://", "https://")):
             # NapCat 有时只回传文件名或本地路径，通过 get_record 获取可下载文件。
             try:
@@ -299,15 +307,28 @@ async def handle_group_message(data: dict):
                 tmp_path = str(file_url)
 
             if seg_type == "image":
-                if file_format == "gif":
-                    seg_type = "gif"  # 标记为表情包，仅影响增强输入措辞
+                # 表情包判定（多路并列）：
+                # 1. GIF 动画图
+                # 2. NapCat 将商城表情以 image 上报时附带 emoji_id/emoji_package_id/key 字段
+                # 3. summary 含"表情"字样（如 "[动画表情]"）
+                # 4. sub_type == 1（OneBot 图片子类型 1 = 表情包）
+                chk_gif = file_format == "gif"
+                chk_mface = bool(seg_data.get("emoji_id") or seg_data.get("emoji_package_id") or seg_data.get("key"))
+                chk_summary = "表情" in str(seg_data.get("summary") or "")
+                chk_subtype = str(seg_data.get("sub_type")) == "1"
+                is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
+                media_type = "sticker" if is_sticker else "image"
                 desc = await describe_image_from_path(tmp_path)
+                if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
+                    desc = seg_data.get("summary") or "表情包"
             elif seg_type == "record":
+                media_type = "record"
                 desc = await describe_audio_from_path(tmp_path)
             else:
+                media_type = "video"
                 desc = await describe_video_from_path(tmp_path)
             if desc:
-                media_list.append((seg_type, desc))
+                media_list.append((media_type, desc))
         except Exception as e:
             logger.warning(f"处理媒体失败: {e}")
         finally:
@@ -322,7 +343,7 @@ async def handle_group_message(data: dict):
         # 生成媒体部分的自然描述
         media_parts = []
         for m_type, d in media_list:
-            if m_type == "gif":
+            if m_type == "sticker":
                 media_parts.append(f"一个表情包，内容是“{d}”")
             elif m_type == "image":
                 media_parts.append(f"一张图片，内容是“{d}”")
@@ -358,7 +379,7 @@ async def handle_group_message(data: dict):
         _recent_msg_set.discard(old_key)
 
     # 纯@无文本 → 简单回复，不存入记忆（因为是无效交互）
-    if not clean_text and not mentions:
+    if not augmented_input and not mentions:
         # “纯@机器人”（只@了机器人且无文字）
         await send_group_msg(group_id, "嗯？我在呢~")
         return
