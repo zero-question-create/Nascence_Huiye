@@ -12,9 +12,9 @@ from openai import OpenAI
 import datetime
 from utils.monitor import append_log
 from utils.dialogue_state import get_state, set_state
-from collections import deque
 
 from config.api_config import config
+from config.constants import BOT_NAME
 
 client = OpenAI(
     api_key=config["primary_api_key"],
@@ -35,7 +35,7 @@ def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ"
     if user_text:
         add_message(sender_name, user_text, source)
     if bot_reply:
-        add_message("辉夜", bot_reply, source)
+        add_message(BOT_NAME, bot_reply, source)
 
 
 def load_dialogue_history():
@@ -51,25 +51,6 @@ def get_history_context() -> str:
     result = "【近期对话】\n" + text
     append_log(result)
     return result
-
-def _call_api(messages, max_tokens=8000):
-    """
-    llm_interface内部调用接口，严谨对外使用!!!
-    """
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.1,
-            stream=False,
-            extra_body={"thinking": {"type": "disabled"}}
-        )
-        content = response.choices[0].message.content
-        return content.strip() if content else None
-    except Exception as e:
-        print(f"[API Error] {e}")
-        return None
 
 def call_api_thinking(messages, max_tokens=8000):
     """
@@ -108,7 +89,7 @@ def decompose_input(user_input: str) -> tuple:
     state_str = json.dumps(normalized_state, ensure_ascii=False)
     now = datetime.datetime.now()
 
-    system_prompt = f"""你是辉夜，请理解输入的话，将其转换为“我”的第一人称记忆片段，并提取检索关键词。
+    system_prompt = f"""你是{BOT_NAME}，请理解输入的话，将其转换为“我”的第一人称记忆片段，并提取检索关键词。
 拆解规则：
 1. 将句子中的代词替换为根据状态推断的确定名称，同时适当将人称进行转换（如将“我”改为“你”，将“你”改为“我”）。
 2. 每条记忆片段都是是一个完整清晰的第一人称陈述句，不限数量，但是每一条尽量简短。所有记忆片段必须明确谁说了什么、对谁说的，内容不要做任何删减。
@@ -119,7 +100,7 @@ def decompose_input(user_input: str) -> tuple:
 7. 只根据以上提供的信息输出，不得添加未给出的内容。
 
 输出严格只包含 JSON，info 数组长度不得超过20，字段如下：
-{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["辉夜"],"topic":"话题","info":["已知1","已知2"]}}}}
+{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题","info":["已知1","已知2"]}}}}
 """
 
     messages = [
@@ -249,14 +230,17 @@ def _safe_json_parse(text: str) -> dict:
     return result
 
 
-def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, dialogue_history: str = None) -> dict:
+def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, pinned: list = None, timestamps: list = None, pinned_timestamps: list = None) -> dict:
     """
     根据记忆生成内心独白和发言决策。
     返回: {"say": bool, "text": str}
     - say: True=应该说出口, False=仅内心思考
     - text: 内心独白或要说的话
+    - pinned: 必须保留并传给 LLM 的记忆条目（如历史对话、上一轮回复），不被关键词过滤丢弃
+    - timestamps: 与 memories 对齐的真实时间戳列表；提供时按时间升序排序（越早越靠前），否则保持原顺序（最新在前）
+    - pinned_timestamps: 与 pinned 对齐的时间戳列表
     """
-    if not memories:
+    if not memories and not pinned:
         return {"say": False, "text": ""}
 
     if keywords is None:
@@ -264,20 +248,70 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     if user_input:
         keywords.append(user_input)
 
-    # 如果有关键词，优先保留包含任意关键词的记忆
-    if keywords:
-        keyword_memories = []
-        for mem in memories:
-            if any(kw in mem for kw in keywords):
-                keyword_memories.append(mem)
-        if keyword_memories:
-            memories = keyword_memories[:10]
-        else:
-            memories = memories[:10]
-    else:
-        memories = memories[:10]
+    ts = list(timestamps) if timestamps is not None else [None] * len(memories)
 
-    memories.reverse()
+    pinned = list(pinned or [])
+    pinned_set = set(pinned)
+    if pinned_timestamps is None:
+        pinned_ts_list = [None] * len(pinned)
+    else:
+        pinned_ts_list = list(pinned_timestamps) + [None] * max(0, len(pinned) - len(pinned_timestamps))
+
+    # 普通记忆：剔除 pinned 条目（pinned 后续无条件保留）
+    normal = []
+    normal_ts = []
+    for mem, t in zip(memories, ts):
+        if mem not in pinned_set:
+            normal.append(mem)
+            normal_ts.append(t)
+
+    # 关键词过滤：只作用于普通记忆
+    if keywords:
+        kw_hits = []
+        kw_hits_ts = []
+        for mem, t in zip(normal, normal_ts):
+            if any(kw in mem for kw in keywords):
+                kw_hits.append(mem)
+                kw_hits_ts.append(t)
+        if kw_hits:
+            normal = kw_hits
+            normal_ts = kw_hits_ts
+    normal = normal[:10]
+    normal_ts = normal_ts[:10]
+
+    # 合并：pinned（历史对话、上一轮回复）无条件保留，后接普通记忆
+    memories = [m for m in pinned] + normal
+    ts = [t for t in pinned_ts_list] + normal_ts
+
+    # 排序：越早越靠前（升序）；无时间戳（None）的条目排最后
+    if timestamps is not None:
+        indexed = sorted(
+            range(len(memories)),
+            key=lambda i: (ts[i] is None, ts[i] if ts[i] is not None else 0)
+        )
+        memories = [memories[i] for i in indexed]
+    else:
+        memories.reverse()
+
+    # 全局内容查重：pinned 条目优先保留；重复内容只保留一条
+    def _content_key(m):
+        return re.sub(r"^\[[^\]]*\]\s*", "", m)
+
+    seen_content = set()
+    deduped_memories = []
+    for m in memories:
+        key = _content_key(m)
+        if key in seen_content:
+            if m in pinned_set:
+                for i, existing in enumerate(deduped_memories):
+                    if _content_key(existing) == key:
+                        deduped_memories[i] = m
+                        break
+            continue
+        seen_content.add(key)
+        deduped_memories.append(m)
+    memories = deduped_memories
+
     points = "\n".join([f"- {m}" for m in memories])
 
     append_log("="*30+"LLM特供记忆"+"="*30)
@@ -287,11 +321,8 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     state_hint = f"当前状态：{new_state}" if new_state else ""
     time_hint = f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
 
-    if dialogue_history is None:
-        dialogue_history = get_history_context()
-
     system_prompt = (
-        "你是辉夜，正在思考。请根据当前浮现的记忆和情况，输出你此刻最真实的想法或独白，"
+        f"你是{BOT_NAME}，正在思考。请根据当前浮现的记忆和情况，输出你此刻最真实的想法或独白，禁止同时输出想法和独白"
         "以及是否应该把这句话说出来。\n\n"
         "规则：\n"
         "- 如果当前有人在对你说什么，且你想回应，'say'为true\n"
@@ -299,17 +330,18 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         "- 'say'为false时，'text'可以是更碎片化、自由联想的内心独白\n"
         "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内\n"
         "- 严格根据记忆，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
-        "- 不要添加动作或神态描述\n"
+        "- 不要添加动作或神态描述，禁止使用括号补充内容\n"
         "- 不要包含'xx说'，直接输出想法本身"
         "输出严格只包含 JSON：\n"
         '{"say": true/false, "text": "..."}\n\n'
     )
 
+    user_content = f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法。"
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": f"{state_hint}\n{time_hint}"},
-        {"role": "system", "content": dialogue_history},
-        {"role": "user", "content": f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法。"}
+        {"role": "user", "content": user_content}
     ]
 
     reply = call_api_thinking(messages, max_tokens=8000)
@@ -331,120 +363,6 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
     return {"say": True, "text": reply}
 
-
-def extract_curiosity_keywords(memories_context: list, max_keywords: int = 3) -> list:
-    """
-    复搜层：基于当前记忆和想法，提取进一步联想的关键词（仅用于检索，不入库）。
-    返回: list of keywords (1-max_keywords个)
-    """
-    if not memories_context:
-        return []
-
-    context_str = "\n".join(f"- {m}" for m in memories_context[:5])
-
-    append_log("="*30+"复搜层输入"+"="*30)
-    append_log(context_str)
-
-    system_prompt = (
-        "根据以下你刚才在想的事情，你想进一步了解或联想的方面有哪些？\n"
-        f"输出最多{max_keywords}个关键词用于搜索你的记忆，每个词不超过20字。\n\n"
-        "输出格式（严格JSON，不要其他内容）：\n"
-        '{"keywords": ["关键词1", "关键词2"]}\n\n'
-        "如果没有什么想进一步联想的，返回空数组。"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"我刚才在想：\n{context_str}\n\n请提取联想关键词。"}
-    ]
-
-    reply = _call_api(messages, max_tokens=8000)
-
-    append_log("="*30+"复搜关键词"+"="*30)
-    append_log(reply)
-
-    if not reply:
-        return []
-
-    data = _safe_json_parse(reply)
-    keywords = data.get("keywords", None)
-    if isinstance(keywords, list):
-        return [str(kw).strip() for kw in keywords if kw and str(kw).strip()][:max_keywords]
-
-    # 降级：尝试按逗号分割
-    append_log("复搜JSON解析失败，尝试逗号分割")
-    parts = reply.replace("，", ",").split(",")
-    return [p.strip() for p in parts if p.strip()][:max_keywords]
-
-def active_speak_decision(memories_context: list, state_context: dict) -> dict:
-    """
-    辉夜的主动发言决策（同步函数，供 qq_bot 异步调用）。
-    参数:
-        memories_context: 当前浮现的记忆片段列表 (list of str)
-        state_context: 当前对话状态字典
-    返回:
-        {"action": "SEND", "content": "消息文本"} 
-        {"action": "SEARCH", "keywords": ["词1","词2","词3"]}
-        {"action": "NONE"}
-    """
-    state_str = json.dumps(state_context, ensure_ascii=False)
-    memories_str = "\n".join(f"- {m}" for m in memories_context)
-    
-    append_log("="*30+"LLM特供记忆"+"="*30)
-    append_log(memories_str)
-
-    now = datetime.datetime.now()
-
-    system_prompt = """你是辉夜，正在一个群聊里。
-根据你现在脑中的记忆和当前群聊的状态，你可以选择一种：
-1. 对记忆感到不解，想进一步回想（提供最多3个关键词用于搜索自己的记忆）。
-2. 直接说出一句话（分享想法、感叹、提问、补充前面自己说过的话等），但不要自言自语或重复自己说过的话，不确定的事或记不清的事就回想。
-3. 觉得没什么值得说的，保持沉默。
-
-请严格按照以下格式回复，不要包含其他内容，也不要重复自己说过的话：
-- 如果要回想： SEARCH|关键词1, 关键词2, 关键词3
-- 如果要说话： SEND|你要说的那句话
-- 如果沉默：   NONE
-
-只根据提供的信息输出，不得添加未给出的内容。"""
-
-    user_prompt = f"""当前群聊状态：
-{state_str}
-你可以使用这之中的信息
-现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分
-
-你刚才浮现的记忆：
-{memories_str}
-请结合这些记忆和上下文进行思考，不要重复自己说过的话，也不要输出与之相同意思的内容
-
-请决定："""
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"{get_history_context()}"},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    raw = call_api_thinking(messages)
-
-    append_log("="*30+"空闲主动发散"+"="*30)
-    append_log(f"回复：{raw}")
-
-    if not raw:
-        return {"action": "NONE"}
-
-    raw = raw.strip()
-    if raw.startswith("SEND|"):
-        text = raw[5:].strip()
-        if text:
-            return {"action": "SEND", "content": text}
-    elif raw.startswith("SEARCH|"):
-        kw_str = raw[7:].strip()
-        keywords = [kw.strip() for kw in kw_str.replace("，", ",").split(",") if kw.strip()][:3]
-        if keywords:
-            return {"action": "SEARCH", "keywords": keywords}
-
-    return {"action": "NONE"}
 
 async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁") -> str:
     """

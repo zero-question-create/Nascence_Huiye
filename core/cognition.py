@@ -1,9 +1,12 @@
 # core/cognition.py
 import json
 import os
+import re
 import datetime
 import random
 from collections import deque
+
+import jieba
 
 from .memory_engine import (
     create_memory, retrieve_similar, add_link, semantic_dedup, pathfind_activation, retrieve_by_exact_keywords, _load_memory_from_db, 
@@ -11,9 +14,10 @@ from .memory_engine import (
 )
 from .llm_interface import decompose_input, verbalize
 from .virtual_clock import clock
+from config.constants import BOT_NAME
 from utils.dialogue_state import set_state, reset_state, get_state
 from utils.persistence import save_state
-from utils.monitor import append_log, clear_log # 清空外部监视器，测试时不用
+from utils.monitor import append_log
 
 # 不同模式的半衰期配置
 MODE_HALF_LIFE = {
@@ -41,10 +45,47 @@ EDGE_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3      # 路径抑制轮数
 KEYWORD_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3   # 关键词抑制轮数，触发的关键词在此轮数内跳过检索
 
 # ========== 永续认知循环全局 ==========
-_new_message_keywords_deque = deque(maxlen=100)     # 新消息关键词队列
-_shallow_pool = deque(maxlen=20)                    # 浅层意识池
-_cognitive_running = False                          # 循环运行状态
-_graceful_stop = False                              # 优雅停止标志（完成当前轮，不复搜）
+_keyword_queue = deque(maxlen=100)           # 关键词消费队列（每轮取空处理）
+_shallow_pool = deque(maxlen=20)             # 浅层意识池
+_cognitive_running = False                   # 循环运行状态
+_graceful_stop = False                       # 优雅停止标志（完成当前轮，不复搜）
+
+# ========== 关键词抽取（jieba 搜索引擎模式）==========
+_KEYWORD_STOPWORDS = {
+    "的", "了", "是", "在", "我", "你", "他", "她", "它", "我们", "你们", "他们",
+    "这", "那", "这个", "那个", "这样", "那样", "什么", "怎么", "为什么", "没有",
+    "可以", "知道", "觉得", "然后", "一个", "一种", "有点", "有些", "就是", "不是",
+    "不会", "不要", "都会", "真的", "但是", "因为", "所以", "如果", "虽然", "而且",
+    "其实", "还是", "已经", "现在", "刚才", "之后", "以前", "时候", "一次", "一下",
+    "哈哈", "哈哈哈", "嘿嘿", "嘻嘻", "啊啊", "嗯嗯", "哦哦", "好的", "知道", "好吗",
+}
+
+def extract_keywords_jieba(text: str, max_keywords: int = 8) -> list:
+    """用 jieba 搜索引擎模式分词，过滤停用词/单字/纯标点，返回检索关键词。
+
+    关键词来源：上一轮的回复（心理活动或发送消息）与接收到的消息。
+    """
+    if not text:
+        return []
+    result = []
+    seen = set()
+    for w in jieba.cut_for_search(str(text)):
+        w = w.strip()
+        if len(w) < 2 or w in _KEYWORD_STOPWORDS:
+            continue
+        if not re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", w):
+            continue
+        if w not in seen:
+            seen.add(w)
+            result.append(w)
+        if len(result) >= max_keywords:
+            break
+    return result
+
+def inject_message_keywords(keywords: list):
+    """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列"""
+    if keywords:
+        _keyword_queue.append(keywords)
 
 # ========== 反刍抑制状态 ==========
 _keyword_continuity: dict = {}                      # {关键词: 连续出现次数}
@@ -55,11 +96,6 @@ _inhibited_keywords: dict = {}                      # {关键词: 剩余抑制�
 # 每轮扩散记录（注入抑制时记录当前轮使用的种子和边）
 _current_round_seeds: list = []
 _current_round_edges: list = []
-
-def inject_message_keywords(keywords: list):
-    """由消息处理层调用，将新消息的关键词注入认知循环"""
-    if keywords:
-        _new_message_keywords_deque.append(keywords)
 
 # ========== 睡眠配置 ==========
 SLEEP_START_HOUR = 23           # 开始困倦/准备睡觉的小时
@@ -89,7 +125,8 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
                          inhibited_edges: set = None) -> list:
     """
     关键词检索 + 受限BFS扩散，返回带时间标记的记忆片段列表。
-    供 cognitive_loop 和 generate_response 共用。
+    每个元素为 (real_timestamp, "[时间短语] 内容")。
+    供 cognitive_loop 调用。
     inhibited_seeds: 被抑制的种子ID集合，检索后从候选种子中移除
     inhibited_edges: 被抑制的边集合 (src_id, tgt_id)，扩散时跳过
     """
@@ -167,7 +204,7 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
         virtual_ts = mem.get("creation_time", 0)
         real_ts = clock.to_real_time(virtual_ts)
         phrase = get_relative_time_phrase(real_ts)
-        timed_memories.append(f"[{phrase}] {mem['content']}")
+        timed_memories.append((real_ts, f"[{phrase}] {mem['content']}"))
 
     return timed_memories
 
@@ -240,7 +277,6 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     user_input = mask_brackets(user_input)      # 对输入进行预处理，防止污染，必要时可以注释这一行
     # 撤销操作快照
     from core.memory_engine import memories, links
-    from core.llm_interface import get_state
     snapshot = {
         "memories": memories,
         "links": {f"{s}||{t}": v for (s, t), v in links.items()},
@@ -330,18 +366,21 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     from utils.time_phrases import get_relative_time_phrase
 
     timed_memories = []
+    timestamps = []
     for mem in final_mem_objects:
         virtual_ts = mem.get("creation_time", 0)
         real_ts = clock.to_real_time(virtual_ts)
         phrase = get_relative_time_phrase(real_ts)
         timed_memories.append(f"[{phrase}] {mem['content']}")
+        timestamps.append(real_ts)
 
     drowsy = _get_drowsy_memory()
     if drowsy:
-        memories.insert(0, drowsy)
+        timed_memories.insert(0, drowsy)
+        timestamps.insert(0, None)
 
     # 阶段D：LLM 拼接回复（传入关键词作为指引）
-    result = verbalize(timed_memories, keywords, new_state, user_input)
+    result = verbalize(timed_memories, keywords, new_state, user_input, timestamps=timestamps)
     reply = ""
     if isinstance(result, dict):
         reply = result.get("text", "")
@@ -375,7 +414,6 @@ def reset_dialogue():
 
 import asyncio
 from typing import Tuple, List
-import re
 
 async def process_dialogue(augmented_input: str, extra_context: str = "") -> Tuple[str, List[str]]:
     full_input = augmented_input
@@ -414,16 +452,19 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     """
     永续认知循环 —— 辉夜的"默认模式网络"永远在线。
     无论是否有用户输入，循环始终运行：
-      合并关键词 → 检索扩散 → 拼接层(生成内心独白+发言决策)
-      → 存入记忆 → 复搜层(提取新关键词) → 检查新消息 → 循环
+      消费队列关键词 → 检索扩散 → 拼接层(生成内心独白+发言决策)
+      → 存入记忆 → 回复jieba分词入队 → 检查新消息 → 循环
+
+    关键词来源：上一轮的回复（心理活动或发送消息）与接收到的消息，
+    均以 jieba 搜索引擎模式分词后进入消费队列，每轮取空队列处理全部关键词。
 
     在 NapCat 连接后启动，断开时 request_graceful_stop 触发：
       当前轮继续执行到回复输出，跳过复搜后退出。
     """
-    global _new_message_keywords_deque, _shallow_pool, _cognitive_running, _graceful_stop
+    global _keyword_queue, _shallow_pool, _cognitive_running, _graceful_stop
     global _keyword_continuity, _inhibited_seeds, _inhibited_edges, _inhibited_keywords
 
-    from .llm_interface import extract_curiosity_keywords, add_to_history, get_history_context
+    from .llm_interface import add_to_history
     from .memory_engine import memories, access_memory
 
     # 重置停止标志和抑制状态，允许新会话启动
@@ -433,8 +474,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     _inhibited_seeds.clear()
     _inhibited_edges.clear()
     _inhibited_keywords.clear()
+    _keyword_queue.clear()
     current_keywords = []
-    loop_count = 0
+    prev_thought_text = None
+    prev_should_speak = False
 
     append_log("="*40)
     append_log("[认知循环] 永续认知循环启动")
@@ -443,19 +486,18 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     while not _graceful_stop:
         try:
             loop = asyncio.get_event_loop()
-            loop_count += 1
 
             # ============================
-            # Step 1: 收集本轮输入
+            # Step 1: 消费队列中的全部关键词（取空即清空队列）
             # ============================
             new_kws_batch = []
-            while _new_message_keywords_deque:
-                kws = _new_message_keywords_deque.popleft()
+            while _keyword_queue:
+                kws = _keyword_queue.popleft()
                 new_kws_batch.extend(kws)
 
             if new_kws_batch:
-                current_keywords = list(set(current_keywords + new_kws_batch))
-                append_log(f"[认知循环] 合并新消息关键词: {new_kws_batch}")
+                current_keywords = list(dict.fromkeys(new_kws_batch))
+                append_log(f"[认知循环] 消费队列关键词: {current_keywords}")
 
             # ============================
             # Step 2: 若无关键词，从记忆库取种子
@@ -573,27 +615,81 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 await asyncio.sleep(3)
                 continue
 
-            related_memories = retrieve_and_diffuse(
+            related_pairs = retrieve_and_diffuse(
                 current_keywords, max_memories=10,
                 inhibited_seeds=set(_inhibited_seeds.keys()),
                 inhibited_edges=set(_inhibited_edges.keys())
             )
-            if not related_memories:
+            if not related_pairs:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
                 current_keywords = []
                 await asyncio.sleep(3)
                 continue
 
+            related_memories = [text for _, text in related_pairs]
+            related_ts = [ts for ts, _ in related_pairs]
+
+            # ============================
+            # Step 3b: 历史对话作为记忆并入（滑动窗口 4~6，保留最近 10 条取最后 4~6 条）
+            # ============================
+            from utils.message_history import get_all
+            from utils.time_phrases import get_relative_time_phrase
+
+            dialogue_count = random.randint(4, 6)
+            recent_msgs = get_all()[-10:]
+            selected_msgs = recent_msgs[-dialogue_count:]
+            dialogue_memories = []
+            dialogue_ts = []
+            for msg in selected_msgs:
+                if msg["sender"] == BOT_NAME:
+                    d_content = f"我说：{msg['content']}"
+                else:
+                    d_content = f"{msg['sender']}说：{msg['content']}"
+                d_msg_time = msg.get("time")
+                if d_msg_time is None:
+                    d_msg_time = clock.now()
+                d_mem_id = semantic_dedup(d_content, now=d_msg_time) or create_memory(d_content)
+                d_mem = memories.get(d_mem_id)
+                if d_mem:
+                    d_mem["creation_time"] = d_msg_time
+                    d_real_ts = clock.to_real_time(d_msg_time)
+                    d_phrase = get_relative_time_phrase(d_real_ts)
+                    dialogue_memories.append(f"[{d_phrase}] {d_content}")
+                    dialogue_ts.append(d_real_ts)
+
+            if dialogue_memories:
+                related_memories = related_memories + dialogue_memories
+                related_ts = related_ts + dialogue_ts
+                append_log(f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条（窗口={dialogue_count}）: {dialogue_memories}")
+
+            # ============================
+            # Step 3c: 上一轮回复并入（无论是否发出消息），带时间标签
+            # ============================
+            prev_mem = None
+            prev_ts = None
+            if prev_thought_text:
+                prev_real_ts = clock.to_real_time(clock.now())
+                prev_phrase = get_relative_time_phrase(prev_real_ts)
+                prev_mem = f"[{prev_phrase}] {'我说' if prev_should_speak else '我想'}：{prev_thought_text}"
+                prev_ts = prev_real_ts
+                related_memories.append(prev_mem)
+                related_ts.append(prev_ts)
+                append_log(f"[认知循环] 上一轮回复并入: {prev_mem}")
+
             # ============================
             # Step 4: 拼接层处理
             # ============================
             state = get_state()
-            dialogue_history = get_history_context()
+
+            pinned_memories = dialogue_memories + ([prev_mem] if prev_mem else [])
+            pinned_ts = dialogue_ts + ([prev_ts] if prev_ts is not None else [])
 
             result = await loop.run_in_executor(
                 None, lambda: verbalize(
                     related_memories, current_keywords, state,
-                    dialogue_history=dialogue_history
+                    pinned=pinned_memories,
+                    timestamps=related_ts,
+                    pinned_timestamps=pinned_ts
                 )
             )
 
@@ -609,6 +705,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 append_log("[认知循环] verbalize 返回空，跳过")
                 await asyncio.sleep(3)
                 continue
+
+            prev_thought_text = thought_text
+            prev_should_speak = should_speak
 
             # ============================
             # Step 5: 存入记忆库
@@ -632,7 +731,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 await send_func(target_group_id, thought_text)
                 add_to_history(None, None, thought_text)
                 from utils.event_bus import BUS
-                BUS.message.emit("辉夜", thought_text, "QQ")
+                BUS.message.emit(BOT_NAME, thought_text, "QQ")
 
             # ============================
             # Step 7: 优雅停止检查（不复搜）
@@ -642,21 +741,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 break
 
             # ============================
-            # Step 7b: 复搜层 —— 提取新关键词
+            # Step 7b: 关键词队列 —— 将本轮回复 jieba 分词后入队（下一轮消费）
             # ============================
-            kw_context = [memory_text]
-            new_keywords = await loop.run_in_executor(
-                None, extract_curiosity_keywords, kw_context
-            )
+            reply_keywords = extract_keywords_jieba(thought_text)
+            if reply_keywords:
+                _keyword_queue.append(reply_keywords)
+                append_log(f"[认知循环] 回复分词入队: {reply_keywords}")
 
-            if new_keywords:
-                current_keywords = new_keywords
-                append_log(f"[认知循环] 复搜关键词: {new_keywords}")
-            else:
-                if loop_count % 5 == 0:
-                    current_keywords = []
-                else:
-                    current_keywords = current_keywords[:2]
+            # 本轮队列关键词已消费完毕，清空本轮的 current_keywords
+            current_keywords = []
 
             # ============================
             # Step 8: 休眠

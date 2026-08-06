@@ -17,6 +17,7 @@ except ImportError:
 from datetime import datetime
 from pathlib import Path
 from config.api_config import DEFAULT_CONFIG
+from config.constants import BOT_NAME
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DIR = PROJECT_DIR / "run"
@@ -325,11 +326,11 @@ class Runtime:
         from utils.persistence import append_dialogue, save_all_data, save_state
 
         augmented = (
-            f'{sender}对辉夜说：“{text}”'
+            f'{sender}对{BOT_NAME}说：“{text}”'
             if mentioned
             else f'{sender}说：“{text}”'
         )
-        logging.info("[对话测试] 群=%s 发送者=%s @辉夜=%s 输入=%s", group_id, sender, mentioned, augmented)
+        logging.info("[对话测试] 群=%s 发送者=%s @%s=%s 输入=%s", group_id, sender, BOT_NAME, mentioned, augmented)
         reply, _ = asyncio.run(process_dialogue(augmented_input=augmented))
         reply = str(reply or "静默")
         if mentioned and reply.strip() in ("", "静默", "静默。", "[SILENT]"):
@@ -338,7 +339,7 @@ class Runtime:
         append_dialogue(augmented, reply)
         save_all_data()
         save_state()
-        logging.info("[对话测试] 辉夜回复=%s", reply)
+        logging.info("[对话测试] %s回复=%s", BOT_NAME, reply)
         return sender, reply
 
     def set_speed(self, speed):
@@ -351,6 +352,27 @@ class Runtime:
         clock.save_state()
         logging.info("虚拟时间倍速已调整为 %s", value)
         return value
+    def fake_send(self, text):
+        self.initialize()
+        if not self.qq_loop or not self.qq_task or self.qq_task.done():
+            raise RuntimeError("QQ 服务未运行，无法通过 NapCat 发送消息")
+        import qq_bot
+        if qq_bot._napcat_websocket is None:
+            raise RuntimeError("NapCat 尚未连接，无法发送消息")
+        from core.memory_engine import create_memory
+        from utils.message_history import add_message
+        from utils.persistence import save_all_data
+
+        group_id = qq_bot.ACTIVE_GROUP_ID
+        fut = asyncio.run_coroutine_threadsafe(
+            qq_bot.send_group_msg(group_id, text), self.qq_loop
+        )
+        fut.result(timeout=10)
+        add_message(BOT_NAME, text, "伪造")
+        memory_id = create_memory(f"我说：{text}")
+        save_all_data()
+        logging.info("伪造发送成功：群=%s 内容=%s 记忆ID=%s", group_id, text, memory_id)
+        return memory_id
 
     def inject_memory(self, content):
         self.initialize()
@@ -453,7 +475,7 @@ class ControlPanel(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self.active_workers = set()
         self.busy_chat = False
-        self.setWindowTitle("Nascence 辉夜 · 控制面板")
+        self.setWindowTitle(f"Nascence {BOT_NAME} · 控制面板")
         self.resize(1180, 760)
         self.setMinimumSize(900, 620)
         self.log_views = {}
@@ -481,7 +503,7 @@ class ControlPanel(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("NASCENCE · 辉夜")
+        title = QLabel(f"NASCENCE · {BOT_NAME}")
         title.setObjectName("title")
         subtitle = QLabel("记忆认知系统 · 本地运行控制台")
         subtitle.setObjectName("muted")
@@ -625,7 +647,7 @@ class ControlPanel(QMainWindow):
         self.sender_input.setMaximumWidth(180)
         self.group_input = QLineEdit("1057279304")
         self.group_input.setMaximumWidth(180)
-        self.mention_check = QCheckBox("@辉夜")
+        self.mention_check = QCheckBox(f"@{BOT_NAME}")
         self.mention_check.setChecked(True)
         options.addWidget(QLabel("发送者"))
         options.addWidget(self.sender_input)
@@ -715,6 +737,19 @@ class ControlPanel(QMainWindow):
     def _maintenance_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+
+        fake_panel = QFrame(objectName="panel")
+        fake_layout = QVBoxLayout(fake_panel)
+        fake_layout.addWidget(QLabel("伪造发送", objectName="sectionTitle"))
+        fake_layout.addWidget(QLabel("以 bot 身份向当前群发送消息，并写入历史对话与记忆库。", objectName="muted"))
+        self.fake_input = QPlainTextEdit()
+        self.fake_input.setPlaceholderText("输入要以 bot 身份发送的内容")
+        self.fake_input.setMaximumHeight(100)
+        fake_layout.addWidget(self.fake_input)
+        fake_btn = QPushButton("伪造发送")
+        fake_btn.clicked.connect(self.fake_send)
+        fake_layout.addWidget(fake_btn, alignment=Qt.AlignLeft)
+        layout.addWidget(fake_panel)
 
         panel = QFrame(objectName="panel")
         panel_layout = QVBoxLayout(panel)
@@ -845,7 +880,7 @@ class ControlPanel(QMainWindow):
         self.send_btn.setText("思考中")
         worker = Worker(RUNTIME.chat, sender, text, group_id, mentioned)
         self.active_workers.add(worker)
-        worker.signals.result.connect(lambda result: self._append_bubble("辉夜", result[1], source="测试"))
+        worker.signals.result.connect(lambda result: self._append_bubble(BOT_NAME, result[1], source="测试"))
         worker.signals.error.connect(self.show_error)
         worker.signals.finished.connect(self._chat_finished)
         worker.signals.finished.connect(lambda: self.active_workers.discard(worker))
@@ -859,7 +894,7 @@ class ControlPanel(QMainWindow):
         self._refresh_running_status()
 
     def _append_bubble(self, name, text, source=""):
-        if name == "辉夜":
+        if name == BOT_NAME:
             bubble_color = "#2d6cdf"
         elif name == "彩叶":
             bubble_color = "#2a5a3a"
@@ -1051,6 +1086,17 @@ class ControlPanel(QMainWindow):
                 self._add_warning(conflict_map[key])
             return False
         return True
+
+    def fake_send(self):
+        text = self.fake_input.toPlainText().strip()
+        if not text:
+            return
+        self.fake_input.clear()
+        self.run_worker(
+            RUNTIME.fake_send,
+            text,
+            on_result=lambda memory_id: self._append_bubble(BOT_NAME, text, source="伪造"),
+        )
 
     def inject_memory(self):
         content = self.memory_input.toPlainText().strip()

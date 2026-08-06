@@ -16,7 +16,8 @@ config/qq_manifest.json
 config/__pycache__/
 
 # 运行数据（记忆、向量索引、日志等）
-data/
+data/__pycache__
+data/test
 
 # 本地 Ollama 部署（大模型二进制）
 ollama/
