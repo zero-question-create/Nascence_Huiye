@@ -731,20 +731,30 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
             result.append((memories[node_id], score))
         return result
 
-def semantic_dedup(content: str) -> str | None:
+def semantic_dedup(content: str, time_tolerance: float = 1.0, now: float = None) -> str | None:
     """
     检查 content 是否与已有记忆高度重复。
-    如果重复，返回已有记忆的 ID 并强化该记忆；否则返回 None。
+    若已有记忆的创建时间与基准时间 now 相差超过 time_tolerance 秒（默认1秒），
+    视为不同时间的记忆，不去重。只有内容相似且时间相近才返回已有记忆ID并强化。
+    now: 比较基准（虚拟时间）。默认取当前时钟；传入消息发送时间时，可按消息实际时间去重。
+    返回重复记忆的 ID；否则返回 None。
     """
     vec = text_to_vector(content)
+    if now is None:
+        now = clock.now()
     best_id = None
     best_sim = 0.0
     for mem_id, mem in memories.items():
         sim = cosine_similarity(vec, mem["vector"])
+        if sim < DEDUP_THRESHOLD:
+            continue
+        time_diff = abs(now - mem.get("creation_time", 0))
+        if time_diff > time_tolerance:
+            continue
         if sim > best_sim:
             best_sim = sim
             best_id = mem_id
-    if best_id and best_sim >= DEDUP_THRESHOLD:
+    if best_id:
         access_memory(best_id)  # 强化半衰期
         return best_id
     return None

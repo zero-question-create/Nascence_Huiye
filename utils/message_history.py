@@ -9,8 +9,9 @@ _STATE_FILE = "data/test/message_state.json"
 
 
 def add_message(sender, content, source):
+    from core.virtual_clock import clock
     with _lock:
-        _message_history.append({"sender": sender, "content": content, "source": source})
+        _message_history.append({"sender": sender, "content": content, "source": source, "time": clock.now()})
         if len(_message_history) > _max_history:
             del _message_history[:len(_message_history) - _max_history]
     save_state()

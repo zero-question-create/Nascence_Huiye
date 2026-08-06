@@ -36,6 +36,7 @@ if sys.platform == "linux":
 from core.virtual_clock import clock
 from core.memory_engine import memories, create_memory, add_link, pathfind_activation, retrieve_similar
 from core.llm_interface import call_api_thinking, verbalize
+from config.constants import BOT_NAME
 from utils.world_layer import WORLD, HOME_ZONES
 from utils.caiye import CAIYE
 from utils.time_phrases import get_relative_time_phrase
@@ -49,7 +50,7 @@ world_logger = logging.getLogger("WorldGen")
 
 BASE_SYSTEM = "你是一个角色扮演AI。根据用户指令扮演指定角色并输出对应内容。只输出要求的内容，不要多余解释。"
 
-ACTION_PROMPT = """你是一个动作选择器。根据辉夜当前的冲动和外部环境，输出一个标准化的动作指令。
+ACTION_PROMPT = """你是一个动作选择器。根据{bot_name}当前的冲动和外部环境，输出一个标准化的动作指令。
 
 可选动作指令：
 - 移动到[位置]  例：移动到厨房
@@ -232,15 +233,15 @@ class SelfTraining:
             keywords=decision_kws,
             new_state=get_ds(),
             user_input=intention_text,
-            system_prompt="你是辉夜，根据当前的回忆和处境，自然地说出一句话。不要添加任何动作或神态描述，不要用括号补充说明，不要包含任何非语言的标注。只根据以上提供的信息输出，不得添加未给出的内容。"
+            system_prompt=f"你是{BOT_NAME}，根据当前的回忆和处境，自然地说出一句话。不要添加任何动作或神态描述，不要用括号补充说明，不要包含任何非语言的标注。只根据以上提供的信息输出，不得添加未给出的内容。"
         )
         merged_context_str = "\n".join(merged_lines)
         action_cmd = self._respond_action(snapshot, intention_text, merged_context_str)
         logger.info("[语言] %s", lang_result)
         logger.info("[动作] %s", action_cmd or "无")
         if lang_result:
-            BUS.message.emit("辉夜", lang_result, "自训练")
-            add_message("辉夜", lang_result, "自训练")
+            BUS.message.emit(BOT_NAME, lang_result, "自训练")
+            add_message(BOT_NAME, lang_result, "自训练")
 
         caiye_reply = CAIYE.respond(lang_result, snapshot) if lang_result else None
         logger.info("[彩叶] %s", caiye_reply or "（沉默）")
@@ -282,7 +283,7 @@ class SelfTraining:
 时段：{snapshot['time_of_day']}
 天气：{snapshot['weather']}
 {prev}
-【指令】你扮演辉夜的视觉感知通道。输出两句：
+【指令】你扮演{BOT_NAME}的视觉感知通道。输出两句：
 第一行：一句以"我看到"开头的第一人称视觉陈述，只写客观可见的内容。
 第二行：[关键词：<最多2个关键词，用逗号分隔>]
 只根据以上提供的信息输出，不得添加未给出的内容。"""
@@ -306,7 +307,7 @@ class SelfTraining:
 {prev}"""
         if snapshot["prev_caiye"]:
             prompt += f"\n刚才听到的话：{snapshot['prev_caiye']}"
-        prompt += '\n【指令】你扮演辉夜的听觉感知通道。输出两句：\n第一行：一句以"我听到"开头的第一人称听觉陈述（如果没有特殊声音则写"无"）。\n第二行：[关键词：<最多2个关键词，用逗号分隔>]\n只根据以上提供的信息输出，不得添加未给出的内容。'
+        prompt += '\n【指令】你扮演{BOT_NAME}的听觉感知通道。输出两句：\n第一行：一句以"我听到"开头的第一人称听觉陈述（如果没有特殊声音则写"无"）。\n第二行：[关键词：<最多2个关键词，用逗号分隔>]\n只根据以上提供的信息输出，不得添加未给出的内容。'
         msg = [{"role": "system", "content": BASE_SYSTEM},
                {"role": "user", "content": prompt}]
         raw = call_api_thinking(msg, max_tokens=8000) or "无\n[关键词：安静]"
@@ -324,7 +325,7 @@ class SelfTraining:
         prompt = f"""饥饿值：{snapshot['hunger']}/{snapshot['max_hunger']}（越高越饿）
 疲劳值：{snapshot['fatigue']}/{snapshot['max_fatigue']}（越高越累）
 {prev}
-【指令】你扮演辉夜的身体感觉通道。输出两句：
+【指令】你扮演{BOT_NAME}的身体感觉通道。输出两句：
 第一行：一句以"我感觉"开头的第一人称身体感受陈述（饥饿值>50描述饥饿感，疲劳值>50描述疲劳感，都低则写"我感觉身体状态正常"）。
 第二行：[关键词：<最多2个关键词，用逗号分隔>]
 只根据以上提供的信息输出，不得添加未给出的内容。"""
@@ -354,15 +355,15 @@ class SelfTraining:
 
 你想起的回忆：
 {memory_context}
-【指令】你扮演辉夜的内部决策机制。输出四行：
+【指令】你扮演{BOT_NAME}的内部决策机制。输出四行：
 第一行：一句以"我想"开头的意图自述。
 第二行：一句以"我感到"开头的状态自述。
 第三行：[关键词：<2个关键词，用逗号分隔>]
-第四行：状态更新 JSON — {{"participants":["辉夜",...],"topic":"...","info":["..."]}}
+第四行：状态更新 JSON — {{"participants":["{BOT_NAME}",...],"topic":"...","info":["..."]}}
 只根据以上提供的信息输出，不得添加未给出的内容。"""
         msg = [{"role": "system", "content": BASE_SYSTEM},
                {"role": "user", "content": prompt}]
-        raw = call_api_thinking(msg, max_tokens=8000) or "我想四处看看\n我感到身体状态正常\n[关键词：环境，探索]\n{\"participants\":[\"辉夜\"],\"topic\":\"\",\"info\":[]}"
+        raw = call_api_thinking(msg, max_tokens=8000) or "我想四处看看\n我感到身体状态正常\n[关键词：环境，探索]\n{\"participants\":[\"{BOT_NAME}\"],\"topic\":\"\",\"info\":[]}"
         lines = [l.strip() for l in raw.split("\n") if l.strip()]
         intention = "我想四处看看"
         state = "我感到身体状态正常"
@@ -398,14 +399,15 @@ class SelfTraining:
                     current = HOME_ZONES.get(WORLD.location, HOME_ZONES["客厅"])
                     if zone_name in current["connected"]:
                         WORLD.location = zone_name
-                        return f"辉夜移动到了{zone_name}"
-                    return f"辉夜试图移动到{zone_name}但无法通行"
+                        return f"{BOT_NAME}移动到了{zone_name}"
+                    return f"{BOT_NAME}试图移动到{zone_name}但无法通行"
         return None
 
     def _respond_action(self, snapshot, intention, memory_context):
         current_zone = HOME_ZONES.get(WORLD.location, HOME_ZONES["客厅"])
         connected = "、".join(current_zone["connected"])
         prompt = ACTION_PROMPT.format(
+            bot_name=BOT_NAME,
             intention=intention,
             injury_hint="无",
             location=snapshot["location"],

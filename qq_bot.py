@@ -54,9 +54,10 @@ from core.llm_interface import describe_image_from_path, describe_audio_from_pat
 from utils.event_bus import BUS
 
 # 导入你现有的核心模块
-from core.cognition import process_dialogue, inject_message_keywords, cognitive_loop
+from core.cognition import inject_message_keywords, cognitive_loop, extract_keywords_jieba
 from core.memory_engine import create_memory, access_memory, pathfind_activation, retrieve_similar, memories
 from core.virtual_clock import clock
+from config.constants import BOT_NAME
 
 # ---------- 配置常量 ----------
 BOT_QQ = "3852948473"  # 机器人QQ号
@@ -136,7 +137,7 @@ def build_augmented_input(sender_name: str, raw_text: str, mentions: List[str], 
     text_content = raw_text if raw_text else "（没有说话）"
     
     if is_mentioned_me:
-        return f'{sender_name}对辉夜说：“{text_content}”'
+        return f'{sender_name}对{BOT_NAME}说：“{text_content}”'
     elif mentions:
         mapped_names = []
         for qq in mentions:
@@ -191,7 +192,7 @@ def enter_sleep():
     """强制进入睡眠状态，并安排自动唤醒"""
     global _sleeping
     _sleeping = True
-    logger.info("辉夜进入了睡眠状态")
+    logger.info(f"{BOT_NAME}进入了睡眠状态")
     try:
         from utils.persistence import sleep_cleanup
         sleep_cleanup()
@@ -203,7 +204,7 @@ def wake_up():
     """从睡眠中唤醒（由定时器触发）"""
     global _sleeping
     _sleeping = False
-    logger.info("辉夜醒来了！")
+    logger.info(f"{BOT_NAME}醒来了！")
 
 def init_sleep_state():
     """启动时调用，如果当前处于睡眠窗口则立即进入睡眠"""
@@ -211,7 +212,7 @@ def init_sleep_state():
         enter_sleep()
     else:
         # 如果不在睡眠窗口，但曾因重启丢失了唤醒定时器，则无需操作
-        logger.info("当前不在睡眠窗口，辉夜保持清醒。")
+        logger.info(f"当前不在睡眠窗口，{BOT_NAME}保持清醒。")
 
 # ---------- 消息处理核心 ----------
 async def handle_group_message(data: dict):
@@ -227,14 +228,21 @@ async def handle_group_message(data: dict):
         return
 
     sender_id = str(data.get("user_id"))
-    sender_name = (
-        data.get("sender", {}).get("card") or 
-        data.get("sender", {}).get("nickname") or 
-        sender_id
-    )
-    mapped_name = manifest.name_map.get(group_id, {}).get(sender_id)
-    if mapped_name:
-        sender_name = mapped_name
+    # 发送人判定：优先配置映射名 → 群昵称(card) → QQ昵称(nickname)
+    sender_name = manifest.name_map.get(group_id, {}).get(sender_id)
+    if sender_name:
+        logger.debug(f"发送人命中配置映射: {sender_id} -> {sender_name}")
+    else:
+        card = data.get("sender", {}).get("card")
+        nickname = data.get("sender", {}).get("nickname")
+        if card:
+            sender_name = card
+        elif nickname:
+            sender_name = nickname
+        else:
+            # 群昵称和QQ昵称均缺失（NapCat 应始终提供 nickname），忽略该消息
+            logger.warning(f"发送人 {sender_id} 无昵称信息，忽略该消息")
+            return
 
     raw_str = data.get("raw_message", "")
     clean_text, mentions = parse_cq_code(raw_str)
@@ -243,7 +251,7 @@ async def handle_group_message(data: dict):
     if clean_text.lstrip().startswith(IGNORE_PREFIX):
         logger.info(f"消息以忽略前缀 '{IGNORE_PREFIX}' 开头，忽略")
         return
-    clean_text = clean_text.replace("@辉夜","")
+    clean_text = clean_text.replace(f"@{BOT_NAME}","")
     if clean_text.strip():
         BUS.message.emit(sender_name, clean_text.strip(), "QQ")
 
@@ -406,8 +414,8 @@ async def handle_group_message(data: dict):
     if extra_context:
         full_input = f"{extra_context}\n{augmented_input}"
 
-    # ========== 理解层：将用户输入拆解为记忆片段和关键词 ==========
-    mem_fragments, mode, new_state, keywords = decompose_input(full_input)
+    # ========== 理解层：将用户输入拆解为记忆片段（关键词改用 jieba）==========
+    mem_fragments, mode, new_state, _keywords = decompose_input(full_input)
 
     # 更新对话状态
     if new_state:
@@ -424,14 +432,16 @@ async def handle_group_message(data: dict):
             mid = create_memory(frag, half_life=half_life)
             user_mem_ids.append(mid)
 
-    # 将关键词注入认知循环 (永续认知循环负责后续的检索、拼接、回复)
-    inject_message_keywords(keywords)
+    # 将关键词注入认知循环：直接对收到的消息 jieba 分词（搜索引擎模式）
+    msg_keywords = extract_keywords_jieba(clean_text)
+    if msg_keywords:
+        inject_message_keywords(msg_keywords)
 
     # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
     add_to_history(sender_name, clean_text.strip(), None, "QQ")
 
-    logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，关键词: {keywords}")
-    BUS.message.emit("辉夜", f"[思考中...]", "QQ")
+    logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，jieba关键词: {msg_keywords}")
+    BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
 
 async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
     """
@@ -520,7 +530,7 @@ async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Opti
         )
         quoted_group_id = str(message_data.get("group_id") or fallback_group_id)
         if quoted_sender_id == BOT_QQ:
-            quoted_sender = "辉夜"
+            quoted_sender = BOT_NAME
         else:
             quoted_sender = (
                 manifest.name_map.get(quoted_group_id, {}).get(quoted_sender_id)

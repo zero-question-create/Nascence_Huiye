@@ -33,6 +33,7 @@ if sys.platform == "linux":
 
 from core.memory_engine import memories
 from core.memory_engine import get_model
+from config.constants import BOT_NAME
 from utils.persistence import load_all_data, save_all_data, load_state, save_state, append_dialogue
 from core.cognition import generate_response
 from core.cognition import UNDO_FILE
@@ -56,9 +57,9 @@ def cold_start_batch_injection():
         add_link(user_mem_id, bot_mem_id, 0.8, "causal")
 
     state = get_state()
-    state["参与者"] = ["辉夜"]
+    state["参与者"] = [BOT_NAME]
     state["我的已知信息"] = [
-        "我的名字是辉夜"
+        f"我的名字是{BOT_NAME}"
     ]
     set_state(state)
     print(f"[冷启动] 已注入 {len(COLD_START_DIALOGS)} 条基础记忆")
@@ -74,7 +75,7 @@ def main():
         cold_start_batch_injection()
         save_all_data()
         save_state()
-    print("Nascence辉夜 v0.5.3")
+    print(f"Nascence{BOT_NAME} v0.5.3")
     print("输入 'exit' 退出")
     
     try:
@@ -123,7 +124,7 @@ def main():
             clock.on_user_input()
             reply, user_input = generate_response(user_input)
             append_dialogue(user_input, reply)
-            print(f"辉夜: {reply}")
+            print(f"{BOT_NAME}: {reply}")
     except (EOFError, KeyboardInterrupt):
         print("发生错误！")
     finally:

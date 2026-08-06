@@ -1,6 +1,7 @@
 import os, json, random
 import time as time_mod
 from core.virtual_clock import clock
+from config.constants import BOT_NAME
 
 SCENE_FILE = "data/test/scene_state.json"
 
@@ -91,19 +92,19 @@ class WorldState:
                     current = HOME_ZONES.get(self.location, HOME_ZONES["客厅"])
                     if zone_name in current["connected"]:
                         self.location = zone_name
-                        return f"辉夜移动到了{zone_name}"
+                        return f"{BOT_NAME}移动到了{zone_name}"
             return f"无法移动到目标位置"
         if "进食" in action_cmd or "吃" in action_cmd:
             if self.hunger >= 15:
                 self.hunger = max(0, self.hunger - random.uniform(15, 30))
-                return "辉夜吃了一些东西"
-            return "辉夜不觉得饿"
+                return f"{BOT_NAME}吃了一些东西"
+            return f"{BOT_NAME}不觉得饿"
         if "休息" in action_cmd or "睡" in action_cmd or "坐" in action_cmd:
-            return "辉夜开始休息"
+            return f"{BOT_NAME}开始休息"
         if "查看" in action_cmd or "环顾" in action_cmd:
             snap = self.get_snapshot()
-            return f"辉夜环顾四周：{snap['location_desc']}"
-        return f"辉夜{action_cmd}"
+            return f"{BOT_NAME}环顾四周：{snap['location_desc']}"
+        return f"{BOT_NAME}{action_cmd}"
 
 
     def save_scene(self):

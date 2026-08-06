@@ -5,6 +5,7 @@ import time
 import random
 from openai import OpenAI
 from utils.monitor import append_log
+from config.constants import BOT_NAME
 
 NOVEL_FILE = "data/超时空辉夜姬！.txt"
 test = {"lines": [1, 141, 373, 471, 567, 819, 885, 1001, 1151, 1373, 1415, 1635, 1855, 2063, 2267, 2397, 2895, 3031], "offsets": [0.0, 7200.0, 86400.0, 172800.0, 259200.0, 345600.0, 432000.0, 518400.0, 604800.0, 691200.0, 777600.0, 864000.0, 950400.0, 1036800.0, 1123200.0, 1209600.0, 1296000.0, 1382400.0]}
@@ -133,16 +134,16 @@ def _world_deciding(scene_text: str) -> list:
 【转换规则】
 1. 剥离彩叶的内心独白和主观评价（如“真是的”、“火大”、“这家伙”等）。
 2. 只提取客观事实：谁做了什么、谁说了什么、发生了什么。
-3. 那个少女/婴儿指的是”辉夜“，请使用”辉夜“作为名字，不要用代称。
+3. 那个少女/婴儿指的是”{BOT_NAME}“，请使用”{BOT_NAME}“作为名字，不要用代称。
 4. 禁止添加情感解读（如“她很开心”），只写客观行为（如“她笑了”）。
-5. 如果小说中出现了辉夜已经学会的内容，不需要重复生成“学习”类事件，但可以生成“实践”类事件。
+5. 如果小说中出现了{BOT_NAME}已经学会的内容，不需要重复生成“学习”类事件，但可以生成“实践”类事件。
 6. 为每个事件分配一个时间偏移量（秒），从0.0开始，精度0.1秒，按事件先后顺序递增。
 7. 时间间隔约束：即使是紧密连续的动作，每个事件之间也必须间隔至少1秒。对于吃饭、外出、睡觉等有明显时间跨度的活动，间隔应拉长到 600-3600 秒。禁止多个事件的偏移量完全相同或相差不足1秒。
 8. 为每个事件提取新出现的知识点、新经历的场景、新认识的人（如无则留空数组）。
 
 【输出格式】
 严格输出JSON数组，无任何解释：
-[{{"offset": 0.0, "outline": "辉夜做了什么/看到什么/听到什么", "new_knowledge": ["知识点"], "new_experiences": ["场景"], "new_people": ["人名"]}}]
+[{{"offset": 0.0, "outline": "{BOT_NAME}做了什么/看到什么/听到什么", "new_knowledge": ["知识点"], "new_experiences": ["场景"], "new_people": ["人名"]}}]
 """
     return [
         {"role": "system", "content": prompt},
@@ -151,23 +152,23 @@ def _world_deciding(scene_text: str) -> list:
 
 
 # ==================== 填充器 ====================
-FILLER_PROMPT_TEMPLATE = """你是日常事件生成器。辉夜是一个来自月球的少女，目前和彩叶一起生活。她正在度过一段没有特殊事件的日常时光。
+FILLER_PROMPT_TEMPLATE = """你是日常事件生成器。{bot_name}是一个来自月球的少女，目前和彩叶一起生活。她正在度过一段没有特殊事件的日常时光。
 
 {knowledge_context}
 
 【任务】
-请为辉夜生成 {event_count} 个日常事件大纲，均匀分布在从 {start_offset} 到 {end_offset} 的时间范围内。
+请为{bot_name}生成 {event_count} 个日常事件大纲，均匀分布在从 {start_offset} 到 {end_offset} 的时间范围内。
 
 【约束】
-1. 事件必须基于辉夜**已经学会或经历过**的事情。禁止引入任何新知识、新技能或新人物。
-2. 每个事件是一个客观陈述，以“辉夜”开头，如“辉夜独自整理了自己的床铺”。
+1. 事件必须基于{bot_name}**已经学会或经历过**的事情。禁止引入任何新知识、新技能或新人物。
+2. 每个事件是一个客观陈述，以“{bot_name}”开头，如“{bot_name}独自整理了自己的床铺”。
 3. 时间偏移量（offset）单位为秒，精度0.1秒。
 4. 所有事件的 new_knowledge、new_experiences、new_people 字段全部为空数组。
 
 【输出格式】
 严格输出JSON数组，无任何解释：
 [
-  {{"offset": 3600.0, "outline": "辉夜做了什么事", "new_knowledge": [], "new_experiences": [], "new_people": []}}
+  {{"offset": 3600.0, "outline": "{bot_name}做了什么事", "new_knowledge": [], "new_experiences": [], "new_people": []}}
 ]
 """
 
@@ -190,6 +191,7 @@ def _disperse_and_fill(outlines: list, tracker: KnowledgeTracker, scene_start_ti
             filler_messages = [
                 {"role": "system", "content": "你是日常事件生成器，只输出JSON数组。"},
                 {"role": "user", "content": FILLER_PROMPT_TEMPLATE.format(
+                    bot_name=BOT_NAME,
                     knowledge_context=tracker.get_state_context(),
                     event_count=fill_count,
                     start_offset=prev_end_time - scene_start_time,
@@ -226,11 +228,11 @@ def _world_happening(outline_text: str) -> list:
 
 
 def _world_environment(event_detail: str) -> list:
-    prompt = """你是环境推断器。根据以下事件描述，推断辉夜(那个少女/婴儿)此刻所处的环境。
+    prompt = f"""你是环境推断器。根据以下事件描述，推断{BOT_NAME}(那个少女/婴儿)此刻所处的环境。
 
 【规则】
 1. 用一句话描述她周围能感知到的东西：地点、光线、温度、声音、气味等。
-2. 只写辉夜能直接感受到的环境信息。
+2. 只写{BOT_NAME}能直接感受到的环境信息。
 3. 禁止添加情感氛围描写（如“温馨的房间”），只写客观物理环境。
 """
     return [
@@ -240,13 +242,13 @@ def _world_environment(event_detail: str) -> list:
 
 
 def _world_actions(event_detail: str) -> list:
-    prompt = """你是动作提取器。从以下事件描述中，提取辉夜(那个少女/婴儿)本人的具体动作。
+    prompt = f"""你是动作提取器。从以下事件描述中，提取{BOT_NAME}(那个少女/婴儿)本人的具体动作。
 
 【规则】
-1. 只写辉夜做了什么（包括说了什么、看了什么、去了哪里）。
+1. 只写{BOT_NAME}做了什么（包括说了什么、看了什么、去了哪里）。
 2. 用简短句子列举，每句一个动作。
 3. 禁止添加其他人的动作或内心想法。
-4. 如果事件中没有辉夜的动作，返回“无”。
+4. 如果事件中没有{BOT_NAME}的动作，返回“无”。
 """
     return [
         {"role": "system", "content": prompt},
@@ -255,7 +257,7 @@ def _world_actions(event_detail: str) -> list:
 
 
 def _recepter(environment: str, actions: str) -> list:
-    prompt = """你是感官记录器。根据以下环境信息和辉夜(那个少女/婴儿)的动作，描述她此刻的客观身体感受。
+    prompt = f"""你是感官记录器。根据以下环境信息和{BOT_NAME}(那个少女/婴儿)的动作，描述她此刻的客观身体感受。
 
 【规则】
 1. 只写感官输入：看到、听到、闻到、触到、身体感觉（冷/热/痛/痒等）。
@@ -265,12 +267,12 @@ def _recepter(environment: str, actions: str) -> list:
 """
     return [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": f"【环境】\n{environment}\n\n【辉夜的动作】\n{actions}"}
+        {"role": "user", "content": f"【环境】\n{environment}\n\n【{BOT_NAME}的动作】\n{actions}"}
     ]
 
 
 def _saying(environment: str, actions: str, feeling: str, event_detail: str) -> list:
-    prompt = """你是辉夜，也就是小说中提到的那个少女/婴儿。请根据以下信息，生成尽可能多的第一人称记忆片段。
+    prompt = f"""你是{BOT_NAME}，也就是小说中提到的那个少女/婴儿。请根据以下信息，生成尽可能多的第一人称记忆片段。
 
 【规则】
 1. 每条记忆以“我”开头，是一个完整清晰的陈述句。
@@ -303,8 +305,8 @@ def _inject_memory(content: str, mem_type: str, absolute_time: float):
     from core.memory_engine import create_memory, semantic_dedup, _get_db
     from core.virtual_clock import clock
 
-    # 先去重（只检查内存，基本够用）
-    if semantic_dedup(content):
+    # 先去重（只检查内存，基本够用）；事件记忆时间戳是历史时间，不限制时间容差
+    if semantic_dedup(content, time_tolerance=float("inf")):
         append_log(f"[WorldCreator] 记忆重复，跳过: {content[:30]}...")
         return
 
