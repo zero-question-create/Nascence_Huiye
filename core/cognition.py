@@ -108,17 +108,23 @@ def _get_drowsy_memory() -> str:
     若不在迷糊时段，返回 None。
     """
     now = datetime.datetime.now()
-    hour = now.hour
-    minute = now.minute
+    current_min = now.hour * 60 + now.minute
+    start_min = SLEEP_START_HOUR * 60
+    end_min = SLEEP_END_HOUR * 60
 
-    # 睡前困倦：SLEEP_START_HOUR 前一小时的最后 DROWSY_MARGIN 分钟内
-    if hour == SLEEP_START_HOUR - 1 and minute >= 60 - DROWSY_MARGIN:
+    # 距离最近一次睡眠开始的分种数（恰在睡眠开始时视为已入睡，不触发困倦）
+    minutes_to_sleep = (start_min - current_min) % (24 * 60)
+    if minutes_to_sleep == 0:
+        minutes_to_sleep = 24 * 60
+
+    # 距上次睡眠结束的分种数（醒来后经过多久）
+    minutes_since_wake = (current_min - end_min) % (24 * 60)
+
+    if minutes_to_sleep <= DROWSY_MARGIN:
         return "[现在] 我现在有点困，想睡觉了"
-    # 刚醒迷糊
-    elif hour == SLEEP_END_HOUR and minute < DROWSY_MARGIN:
+    if minutes_since_wake <= DROWSY_MARGIN:
         return "[现在] 我刚睡醒，还有点迷糊"
-    else:
-        return None
+    return None
 
 def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
                          inhibited_seeds: set = None,
@@ -677,12 +683,25 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 append_log(f"[认知循环] 上一轮回复并入: {prev_mem}")
 
             # ============================
+            # Step 3d: 困倦/刚醒记忆附加（即将睡觉 / 刚睡醒）
+            # ============================
+            drowsy_mem = None
+            drowsy_ts = None
+            drowsy = _get_drowsy_memory()
+            if drowsy:
+                drowsy_ts = clock.to_real_time(clock.now())
+                drowsy_mem = drowsy
+                related_memories.append(drowsy)
+                related_ts.append(drowsy_ts)
+                append_log(f"[认知循环] 附加困倦/刚醒记忆: {drowsy}")
+
+            # ============================
             # Step 4: 拼接层处理
             # ============================
             state = get_state()
 
-            pinned_memories = dialogue_memories + ([prev_mem] if prev_mem else [])
-            pinned_ts = dialogue_ts + ([prev_ts] if prev_ts is not None else [])
+            pinned_memories = dialogue_memories + ([prev_mem] if prev_mem else []) + ([drowsy_mem] if drowsy_mem else [])
+            pinned_ts = dialogue_ts + ([prev_ts] if prev_ts is not None else []) + ([drowsy_ts] if drowsy_ts is not None else [])
 
             result = await loop.run_in_executor(
                 None, lambda: verbalize(
