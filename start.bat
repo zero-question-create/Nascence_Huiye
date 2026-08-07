@@ -1,5 +1,4 @@
 @echo off
-chcp 936 >nul
 setlocal enabledelayedexpansion
 
 title Nascence Huiye - Starting...
@@ -21,16 +20,16 @@ if not defined PYTHON_OK (
 )
 if not defined PYTHON_OK (
     echo.
-    echo [ERROR] 未检测到 Python 运行环境！
+    echo [ERROR] Python was not found!
     echo.
-    echo 请到 https://www.python.org/downloads/ 下载并安装 Python，
-    echo 安装时务必勾选 "Add Python to PATH" 选项，
-    echo 安装完成后请重新打开终端再运行本脚本。
+    echo Please install Python from https://www.python.org/downloads/
+    echo and make sure to check "Add Python to PATH" during installation.
+    echo Then reopen the terminal and run this script again.
     echo.
     pause
     exit /b 1
 )
-echo [OK] Python 运行环境已就绪
+echo [OK] Python found
 
 :: ---------- 1. Check venv ----------
 if not exist "%PROJECT_DIR%venv\Scripts\python.exe" (
