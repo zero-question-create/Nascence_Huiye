@@ -19,8 +19,8 @@ if [ ! -f "venv/bin/python3" ]; then
     python3 -m venv venv --without-pip
     source venv/bin/activate
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3 > /dev/null 2>&1
-    pip install -r requirements.txt -q -i https://mirrors.aliyun.com/pypi/simple/ \
-        || { echo "[!] 阿里源安装失败，尝试切换清华源..."; pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    pip install -r requirements.txt -q -i https://mirrors.huaweicloud.com/repository/pypi/simple/ \
+        || { echo "[!] 华为源安装失败，尝试切换清华源..."; pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple \
              || { echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."; pip install -r requirements.txt -q -i https://pypi.org/simple/; }; }
     echo "[√] 虚拟环境已创建，依赖已安装"
 else
