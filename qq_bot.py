@@ -86,7 +86,7 @@ _action_counter = 0
 _pending_actions = {}                 # echo -> Future，用于匹配 NapCat Action 响应
 
 # ========== 睡眠配置 ==========
-from core.cognition import SLEEP_START_HOUR, SLEEP_END_HOUR, DROWSY_MARGIN
+# 睡眠窗口统一由 core.virtual_clock 管理（clock.in_sleep_window()）
 _sleeping = False               # 是否处于强制睡眠状态
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -161,10 +161,7 @@ async def drift_loop():
     while True:
         if is_sleeping() and not _sleeping:
             enter_sleep()
-        nowdate = datetime.datetime.now().time()
-        start = datetime.time(SLEEP_START_HOUR, 0)
-        end = datetime.time(SLEEP_END_HOUR, 0)
-        if start >= end and (nowdate < start and nowdate >= end) and _sleeping:
+        if _sleeping and not clock.in_sleep_window():
             wake_up()
         await asyncio.sleep(30)
         if not memories:
@@ -179,14 +176,7 @@ def is_sleeping() -> bool:
     global _sleeping
     if _sleeping:
         return True
-    now = datetime.datetime.now().time()
-    start = datetime.time(SLEEP_START_HOUR, 0)
-    end = datetime.time(SLEEP_END_HOUR, 0)
-    if start < end:
-        return start <= now < end
-    else:
-        # 跨天窗口，例如 23:00 - 06:00
-        return now >= start or now < end
+    return clock.in_sleep_window()
 
 def enter_sleep():
     """强制进入睡眠状态，并安排自动唤醒"""
