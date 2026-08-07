@@ -30,14 +30,14 @@ $Pip = "$ProjectDir\venv\Scripts\pip.exe"
 # ---------- 2. Install dependencies ----------
 Write-Host "[*] Installing Python dependencies..."
 
-$AliyunSource = "https://mirrors.aliyun.com/pypi/simple/"
+$HuaweiSource = "https://mirrors.huaweicloud.com/repository/pypi/simple/"
 $TsinghuaSource = "https://pypi.tuna.tsinghua.edu.cn/simple"
 $OfficialSource = "https://pypi.org/simple/"
 
-# 优先使用阿里云 PyPI 镜像源
-& $Pip install -r requirements.txt -q -i $AliyunSource
+# 优先使用华为云 PyPI 镜像源
+& $Pip install -r requirements.txt -q -i $HuaweiSource
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[!] 使用阿里源安装失败（可能超时或包不存在）"
+    Write-Host "[!] 使用华为源安装失败（可能超时或包不存在）"
     Write-Host "[!] 尝试切换清华源..."
     & $Pip install -r requirements.txt -q -i $TsinghuaSource
     if ($LASTEXITCODE -ne 0) {
