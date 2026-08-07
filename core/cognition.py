@@ -98,9 +98,9 @@ _current_round_seeds: list = []
 _current_round_edges: list = []
 
 # ========== 睡眠配置 ==========
-SLEEP_START_HOUR = 23           # 开始困倦/准备睡觉的小时
-SLEEP_END_HOUR = 6              # 完全醒来的小时
+# 睡眠窗口由 core.virtual_clock 统一管理（sleep_start_hour / sleep_duration）
 DROWSY_MARGIN = 15              # 睡前/醒后迷糊的分钟数
+
 
 def _get_drowsy_memory() -> str:
     """
@@ -109,8 +109,8 @@ def _get_drowsy_memory() -> str:
     """
     now = datetime.datetime.now()
     current_min = now.hour * 60 + now.minute
-    start_min = SLEEP_START_HOUR * 60
-    end_min = SLEEP_END_HOUR * 60
+    start_min = clock.sleep_start_hour * 60
+    end_min = clock.sleep_end_hour * 60
 
     # 距离最近一次睡眠开始的分种数（恰在睡眠开始时视为已入睡，不触发困倦）
     minutes_to_sleep = (start_min - current_min) % (24 * 60)
@@ -490,6 +490,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     append_log("="*40)
 
     while not _graceful_stop:
+        # 睡眠暂停：到达睡眠窗口后，当前轮（若正在执行）会自然跑完，
+        # 从下一轮开始暂停认知循环，直到起床时间再恢复。
+        if clock.in_sleep_window():
+            append_log("[认知循环] 进入睡眠窗口，本轮结束后暂停，等待起床")
+            while not _graceful_stop and clock.in_sleep_window():
+                await asyncio.sleep(5)
+            append_log("[认知循环] 已到起床时间（或收到停止信号），认知循环恢复")
+            continue
+
         try:
             loop = asyncio.get_event_loop()
 

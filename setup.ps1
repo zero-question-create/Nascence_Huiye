@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # Nascence Huiye Environment Setup (Windows)
 # ============================================================
 
@@ -29,11 +29,27 @@ $Pip = "$ProjectDir\venv\Scripts\pip.exe"
 
 # ---------- 2. Install dependencies ----------
 Write-Host "[*] Installing Python dependencies..."
-& $Pip install -r requirements.txt -q
+
+$AliyunSource = "https://mirrors.aliyun.com/pypi/simple/"
+$TsinghuaSource = "https://pypi.tuna.tsinghua.edu.cn/simple"
+$OfficialSource = "https://pypi.org/simple/"
+
+# 优先使用阿里云 PyPI 镜像源
+& $Pip install -r requirements.txt -q -i $AliyunSource
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[!] Dependency installation failed. Check requirements.txt."
-    Read-Host "Press Enter to exit"
-    exit 1
+    Write-Host "[!] 使用阿里源安装失败（可能超时或包不存在）"
+    Write-Host "[!] 尝试切换清华源..."
+    & $Pip install -r requirements.txt -q -i $TsinghuaSource
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[!] 使用清华源安装失败"
+        Write-Host "[!] 尝试使用默认源（Python 官方源）..."
+        & $Pip install -r requirements.txt -q -i $OfficialSource
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[!] Dependency installation failed. Check requirements.txt."
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
+    }
 }
 Write-Host "[OK] Python dependencies installed"
 

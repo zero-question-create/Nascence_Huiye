@@ -3,6 +3,7 @@ import time         # 主要运用：获取当前时间戳
 import os           # 主要运用：确保文件存在及操作安全
 import threading    # 主要运用：发散线程
 import random
+import datetime
 
 STATE_FILE = "data/test/clock_state.txt"     # 持久化保存路径
 
@@ -37,8 +38,8 @@ class VirtualClock:
 
         self.session_start = time.time()
         self.drift_threshold = 15 * 60
-        self.sleep_start_hour = 3
-        self.sleep_duration = 8 * 3600
+        self.sleep_start_hour = 23
+        self.sleep_duration = 7 * 3600
         self._drift_thread = None
         self._stop_drift = threading.Event()
 
@@ -87,6 +88,25 @@ class VirtualClock:
         """返回从首次启动开始累计的真实运行时间（秒）"""
         # 累计时间 = 历史已结算时间 + 本段未结算时间
         return self.total_runtime + (time.time() - self.session_start)
+
+    @property
+    def sleep_end_hour(self) -> int:
+        """睡眠结束小时（由开始小时与持续时长推导）"""
+        return (self.sleep_start_hour + int(self.sleep_duration // 3600)) % 24
+
+    def in_sleep_window(self, when: datetime.datetime = None) -> bool:
+        """
+        判断给定真实时刻（默认当前）是否处于睡眠窗口。
+        窗口由 sleep_start_hour 与 sleep_duration 定义。
+        """
+        if when is None:
+            when = datetime.datetime.now()
+        now_time = when.time()
+        start = datetime.time(self.sleep_start_hour, 0)
+        end = datetime.time(self.sleep_end_hour, 0)
+        if start < end:
+            return start <= now_time < end
+        return now_time >= start or now_time < end
 
     def save_state(self):
         self.total_runtime = self.get_real_runtime()
@@ -169,7 +189,7 @@ class VirtualClock:
             self._sleep_done_today = False
 
         # 判断当前是否处于睡眠时间窗口
-        sleep_end_hour = (self.sleep_start_hour + 8) % 24
+        sleep_end_hour = self.sleep_end_hour
         if self.sleep_start_hour < sleep_end_hour:
             in_sleep_window = self.sleep_start_hour <= current_hour < sleep_end_hour
         else:
