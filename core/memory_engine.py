@@ -284,9 +284,36 @@ def _build_word_to_memories():
 
 
 # ========== 模型加载 ==========
+def _ensure_embedding_model():
+    """确保 embedding 模型已拉取；缺失则通过 Ollama API 自动拉取。"""
+    import requests
+    base_name = OLLAMA_EMBED_MODEL.split(":")[0]
+    try:
+        tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10).json()
+        models = [m.get("name", "") for m in tags.get("models", [])]
+        if any(m == OLLAMA_EMBED_MODEL or m.startswith(base_name) for m in models):
+            return
+    except Exception:
+        # 列表请求失败（Ollama 未就绪等）则跳过自动拉取，交给后续错误提示
+        return
+
+    print(f"[Ollama] 未检测到模型 {OLLAMA_EMBED_MODEL}，正在自动拉取（约400MB，首次可能较慢）...")
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/pull",
+            json={"model": OLLAMA_EMBED_MODEL},
+            timeout=1800,
+        )
+        resp.raise_for_status()
+        print("[Ollama] 模型拉取完成")
+    except Exception as e:
+        print(f"[Ollama] 模型拉取失败: {e}")
+
+
 def get_model():
     print("正在启动语义模型")
     try:
+        _ensure_embedding_model()
         text_to_vector("启动")
     except Exception as e:
         print(f"[Ollama] 模型预热失败: {e}")
@@ -324,7 +351,10 @@ def text_to_vector(text: str) -> list:
         print("[Ollama] 请求超时，请检查网络或 Ollama 服务响应")
         raise
     except requests.exceptions.HTTPError as e:
-        print(f"[Ollama] HTTP 错误: {e}")
+        if e.response is not None and e.response.status_code == 404:
+            print(f"[Ollama] 模型不存在或未拉取，请运行: ollama pull {OLLAMA_EMBED_MODEL}")
+        else:
+            print(f"[Ollama] HTTP 错误: {e}")
         raise
     except (KeyError, ValueError) as e:
         print(f"[Ollama] 解析响应失败: {e}")
