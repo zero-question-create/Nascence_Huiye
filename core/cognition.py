@@ -9,7 +9,7 @@ from collections import deque
 import jieba
 
 from .memory_engine import (
-    create_memory, retrieve_similar, add_link, semantic_dedup, pathfind_activation, retrieve_by_exact_keywords, _load_memory_from_db, 
+    create_memory, retrieve_similar, add_link, pathfind_activation, retrieve_by_exact_keywords, _load_memory_from_db, 
     DEFAULT_HALF_LIFE
 )
 from .llm_interface import decompose_input, verbalize
@@ -300,13 +300,12 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
         set_state(new_state)
         save_state()
 
-    # 存储记忆（按模式设置半衰期）
+    # 存储记忆（按模式设置半衰期），不去重
     half_life = MODE_HALF_LIFE.get(mode, DEFAULT_HALF_LIFE)
     user_mem_ids = []
     for frag in mem_fragments:
-        if not semantic_dedup(frag):
-            mid = create_memory(frag, half_life=half_life)
-            user_mem_ids.append(mid)
+        mid = create_memory(frag, half_life=half_life)
+        user_mem_ids.append(mid)
 
     # 阶段B：关键词驱动的语义检索（faiss）
     seed_ids = []
@@ -402,15 +401,10 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
         else:
             reply_memory = f"我说，{reply}"
 
-        # 存储回复
-        dedup_id = semantic_dedup(reply_memory)
-        if dedup_id:
-            if user_mem_ids:
-                add_link(user_mem_ids[0], dedup_id, 0.8, "causal")
-        else:
-            bot_mem_id = create_memory(reply_memory)
-            if user_mem_ids:
-                add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
+        # 存储回复（不去重）
+        bot_mem_id = create_memory(reply_memory)
+        if user_mem_ids:
+            add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
     return reply, user_input
 
 def reset_dialogue():
@@ -663,7 +657,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 d_msg_time = msg.get("time")
                 if d_msg_time is None:
                     d_msg_time = clock.now()
-                d_mem_id = semantic_dedup(d_content, now=d_msg_time) or create_memory(d_content)
+                d_mem_id = create_memory(d_content)
                 d_mem = memories.get(d_mem_id)
                 if d_mem:
                     d_mem["creation_time"] = d_msg_time
@@ -745,10 +739,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             else:
                 memory_text = f"我想：{thought_text}"
 
-            dedup_id = semantic_dedup(memory_text)
-            if not dedup_id:
-                mem_id = create_memory(memory_text)
-                _shallow_pool.append(mem_id)
+            mem_id = create_memory(memory_text)
+            _shallow_pool.append(mem_id)
 
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
 

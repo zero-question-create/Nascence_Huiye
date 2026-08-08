@@ -54,7 +54,14 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[OK] Python dependencies installed"
 
 # ---------- 3. Download Ollama (Windows) ----------
-if (-not (Test-Path "ollama\bin\ollama.exe")) {
+$ollamaComplete = $false
+if (Test-Path "ollama\bin\ollama.exe") {
+    $serverFound = Get-ChildItem -Path "ollama\bin" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "llama-server.exe" } |
+        Select-Object -First 1
+    if ($null -ne $serverFound) { $ollamaComplete = $true }
+}
+if (-not $ollamaComplete) {
     Write-Host "[*] Downloading Ollama (Windows)..."
     try {
         $ReleaseApi = "https://api.github.com/repos/ollama/ollama/releases/latest"
@@ -72,8 +79,9 @@ if (-not (Test-Path "ollama\bin\ollama.exe")) {
         $ExeFile = Get-ChildItem -Path $TempDir -Recurse -Filter "ollama.exe" | Select-Object -First 1
         if ($ExeFile) {
             New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama\bin" | Out-Null
-            Copy-Item -Path $ExeFile.FullName -Destination "$ProjectDir\ollama\bin\ollama.exe" -Force
-            Write-Host "[OK] Ollama installed to ollama\bin\"
+            # 复制完整发行包（ollama.exe / llama-server.exe / lib 运行时库），只复制单个 exe 会导致推理服务不可用
+            Copy-Item -Path "$($ExeFile.Directory)\*" -Destination "$ProjectDir\ollama\bin" -Recurse -Force
+            Write-Host "[OK] Ollama installed to ollama\bin\ (full package incl. llama-server)"
         } else {
             Write-Host "[!] ollama.exe not found in extracted files."
         }

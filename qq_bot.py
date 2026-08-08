@@ -412,15 +412,13 @@ async def handle_group_message(data: dict):
         set_state(new_state)
         save_state()
 
-    # 记忆入库
+    # 记忆入库（不去重）
     from core.cognition import MODE_HALF_LIFE
     half_life = MODE_HALF_LIFE.get(mode, 2 * 24 * 3600)
     user_mem_ids = []
     for frag in mem_fragments:
-        from core.memory_engine import semantic_dedup
-        if not semantic_dedup(frag):
-            mid = create_memory(frag, half_life=half_life)
-            user_mem_ids.append(mid)
+        mid = create_memory(frag, half_life=half_life)
+        user_mem_ids.append(mid)
 
     # 将关键词注入认知循环：直接对收到的消息 jieba 分词（搜索引擎模式）
     msg_keywords = extract_keywords_jieba(clean_text)
