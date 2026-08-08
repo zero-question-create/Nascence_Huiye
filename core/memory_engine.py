@@ -286,30 +286,33 @@ def _build_word_to_memories():
 # ========== 模型加载 ==========
 def get_model():
     print("正在启动语义模型")
-    import requests
-    url = f"{OLLAMA_BASE_URL}/api/embeddings"
-    payload = {
-        "model": OLLAMA_EMBED_MODEL,
-        "prompt": "启动"
-    }
-    requests.post(url, json=payload, timeout=120)
+    try:
+        text_to_vector("启动")
+    except Exception as e:
+        print(f"[Ollama] 模型预热失败: {e}")
     print("语义模型启动完成！")
 
 def text_to_vector(text: str) -> list:
     """
     使用 Ollama 的 API 将文本转换为向量。
+    兼容新旧端点：新版 Ollama 用 /api/embed（旧 /api/embeddings 已移除），
+    先尝试新版，404 时回退旧版。
     前提：Ollama 已在本地运行，且已通过 `ollama pull shaw/dmeta-embedding-zh` 拉取模型。
     """
-    url = f"{OLLAMA_BASE_URL}/api/embeddings"
-    payload = {
-        "model": OLLAMA_EMBED_MODEL,
-        "prompt": text
-    }
+    url_new = f"{OLLAMA_BASE_URL}/api/embed"
+    url_old = f"{OLLAMA_BASE_URL}/api/embeddings"
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()  # 若状态码不是 2xx 则抛出异常
-        data = response.json()
-        # 根据 Ollama API 文档，返回的 embedding 位于 "embedding" 字段
+        # 新版端点 /api/embed
+        resp = requests.post(url_new, json={"model": OLLAMA_EMBED_MODEL, "input": text}, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            embeddings = data.get("embeddings")
+            if embeddings:
+                return embeddings[0]
+        # 旧版端点 /api/embeddings（新版不可用时回退）
+        resp = requests.post(url_old, json={"model": OLLAMA_EMBED_MODEL, "prompt": text}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
         embedding = data.get("embedding")
         if embedding is None:
             raise ValueError("Ollama 返回的数据中未找到 'embedding' 字段")
