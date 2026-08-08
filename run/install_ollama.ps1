@@ -21,7 +21,7 @@ if (Test-Path "ollama\bin\ollama.exe") {
 
 Write-Host @"
 
-  [$([char]0x26A0)] 正在从 GitHub 下载 Ollama（约 700MB）
+  [$([char]0x26A0)] 正在从 GitHub 下载 Ollama（约 1391MB）
   |  国内访问 GitHub 可能较慢，请耐心等待。
   |  如需取消请按 Ctrl+C，然后手动下载 ollama-windows-amd64.zip
   |  解压后将 ollama.exe 放到 ollama\bin\ 下即可。
