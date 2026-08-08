@@ -4,9 +4,19 @@ $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ProjectDir
 Set-Location $ProjectDir
 
+$ollamaComplete = $false
 if (Test-Path "ollama\bin\ollama.exe") {
-    Write-Host "[OK] Ollama already exists" -ForegroundColor Green
+    $serverFound = Get-ChildItem -Path "ollama\bin" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "llama-server.exe" } |
+        Select-Object -First 1
+    if ($null -ne $serverFound) { $ollamaComplete = $true }
+}
+if ($ollamaComplete) {
+    Write-Host "[OK] Ollama already exists (complete)" -ForegroundColor Green
     exit 0
+}
+if (Test-Path "ollama\bin\ollama.exe") {
+    Write-Host "[!] 检测到旧版不完整安装（缺少 llama-server.exe），正在重新下载完整包..." -ForegroundColor Yellow
 }
 
 Write-Host @"
@@ -38,8 +48,9 @@ try {
     $ExeFile = Get-ChildItem -Path $TempDir -Recurse -Filter "ollama.exe" | Select-Object -First 1
     if ($ExeFile) {
         New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama\bin" | Out-Null
-        Copy-Item -Path $ExeFile.FullName -Destination "$ProjectDir\ollama\bin\ollama.exe" -Force
-        Write-Host "[OK] Ollama 已安装到 ollama\bin\" -ForegroundColor Green
+        # 复制完整发行包（ollama.exe / llama-server.exe / lib 运行时库），只复制单个 exe 会导致推理服务不可用
+        Copy-Item -Path "$($ExeFile.Directory)\*" -Destination "$ProjectDir\ollama\bin" -Recurse -Force
+        Write-Host "[OK] Ollama 已安装到 ollama\bin\（含 llama-server 完整组件）" -ForegroundColor Green
     } else {
         Write-Host "[!] 解压后未找到 ollama.exe" -ForegroundColor Red
     }

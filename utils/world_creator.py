@@ -302,13 +302,8 @@ def _inject_memory(content: str, mem_type: str, absolute_time: float):
     """
     使用 create_memory 创建记忆，然后手动修正时间戳以匹配事件发生的绝对虚拟时间。
     """
-    from core.memory_engine import create_memory, semantic_dedup, _get_db
+    from core.memory_engine import create_memory, _get_db
     from core.virtual_clock import clock
-
-    # 先去重（只检查内存，基本够用）；事件记忆时间戳是历史时间，不限制时间容差
-    if semantic_dedup(content, time_tolerance=float("inf")):
-        append_log(f"[WorldCreator] 记忆重复，跳过: {content[:30]}...")
-        return
 
     half_life = HALF_LIFE_RULES.get(mem_type, HALF_LIFE_RULES["default"])
     mem_id = create_memory(content, half_life=half_life)
