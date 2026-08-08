@@ -3,7 +3,7 @@ import os
 
 
 def normalize_proxy_environment():
-    """让 httpx/OpenAI 能识别常见代理工具导出的 socks scheme。"""
+    """让 httpx/OpenAI 能识别常见代理工具导出的 socks scheme，并保护本地服务不走代理。"""
     for name in (
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
         "http_proxy", "https_proxy", "all_proxy",
@@ -11,6 +11,15 @@ def normalize_proxy_environment():
         value = os.environ.get(name)
         if value and value.lower().startswith("socks://"):
             os.environ[name] = "socks5://" + value[len("socks://"):]
+
+    # 保护本地服务（Ollama、NapCat 等）不经过代理
+    local_entries = {"localhost", "127.0.0.1", "::1"}
+    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    current = {e.strip() for e in no_proxy.replace(",", " ").replace(";", " ").split() if e.strip()}
+    if not local_entries.issubset(current):
+        merged = ", ".join(sorted(current | local_entries))
+        os.environ["NO_PROXY"] = merged
+        os.environ["no_proxy"] = merged
 
 
 normalize_proxy_environment()
