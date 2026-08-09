@@ -59,22 +59,32 @@ def _ensure_openpyxl():
 
 
 def _load_records():
-    """读取 metrics_daily.jsonl，返回记录列表。"""
+    """读取 metrics_daily.jsonl，按日期合并同日记录（数值字段求和），返回记录列表。"""
     if not os.path.exists(DATA_FILE):
         print(f"[错误] 未找到计数器日志文件: {DATA_FILE}")
         return None
-    records = []
+    merged = {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError:
                 print(f"[警告] 跳过无法解析的行: {line[:60]}")
                 continue
-    return records
+            date = str(rec.get("date", "")).strip()
+            if not date:
+                print("[警告] 跳过缺少日期的记录")
+                continue
+            if date not in merged:
+                merged[date] = dict(rec)
+            else:
+                # 同日多条记录：数值字段求和（_write_daily_metrics 每次写的是自上次基线以来的增量）
+                for key, _ in FIELD_TITLES:
+                    merged[date][key] = merged[date].get(key, 0) + rec.get(key, 0)
+    return [merged[d] for d in sorted(merged.keys())]
 
 
 def main():

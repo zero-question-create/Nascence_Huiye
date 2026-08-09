@@ -113,6 +113,10 @@ def load_all_data():
             from core.memory_engine import _import_metrics_counters
             _import_metrics_counters(metrics)
 
+        # 限制热记忆数量到硬上限（MAX_HOT_SIZE），把最久未访问的记忆移出内存
+        from core.memory_engine import _evict_cold_memories
+        _evict_cold_memories()
+
 # ========== 对话状态持久化 ==========
 
 def save_state():
@@ -200,6 +204,10 @@ def sleep_cleanup():
     if expired:
         _rebuild_faiss_index()          # faiss 全量重建（从 SQLite 剩余记忆重新构建）
         print(f"[睡眠维护] 物理删除 {len(expired)} 条衰变记忆，faiss 索引已重建")
+
+    # 3.5 冷记忆淘汰：将超出热记忆上限的最久未访问记忆移出内存（写入 SQLite）
+    from core.memory_engine import _evict_cold_memories
+    _evict_cold_memories()
 
     # 4. 全量持久化（含热数据写入 JSON、faiss 索引、时钟状态）
     save_all_data()
