@@ -463,10 +463,10 @@ async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
             }
             await websocket.send(json.dumps(payload, ensure_ascii=False))
         logger.info(f"已通过 NapCat WebSocket 发送消息（echo={echo}，引用={reply_msg_id}）: {text}")
-        from core.memory_engine import _count_message_sent, _count_self_ref
-        _count_message_sent += 1
+        from core.memory_engine import _bump_message_sent, _bump_self_ref
+        _bump_message_sent()
         if "我" in text:
-            _count_self_ref += 1
+            _bump_self_ref()
     except Exception as e:
         logger.error(f"通过 NapCat WebSocket 发送消息异常: {e}")
 

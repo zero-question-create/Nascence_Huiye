@@ -36,6 +36,7 @@ WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与
 EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
+MAX_HOT_SIZE = 1000                 # 热记忆节点硬上限，防止爆炸
 
 # ========== 体力消耗系数 ==========
 COST_FACTOR = {
@@ -70,6 +71,21 @@ _count_message_sent = 0
 _count_self_ref = 0
 _count_active_attempt = 0
 _count_active_success = 0
+
+def _bump_message_sent():
+    """发送消息计数器 +1（跨模块递增必须用函数，直接 import 变量 += 不会写回）"""
+    global _count_message_sent
+    _count_message_sent += 1
+
+def _bump_self_ref():
+    """消息含"我"的自指计数器 +1"""
+    global _count_self_ref
+    _count_self_ref += 1
+
+def _bump_link_deleted():
+    """链接删除计数器 +1"""
+    global _count_link_deleted
+    _count_link_deleted += 1
 
 # 日志文件路径
 METRICS_LOG_FILE = "data/test/metrics_daily.jsonl"
@@ -251,7 +267,7 @@ def _batch_load_memories(mem_ids: list):
         memories[mem_id] = mem
         hot_ids.add(mem_id)
 
-def _evict_cold_memories(max_hot=10000):
+def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
     """将最久未访问的热数据移出内存，保留 SQLite 和 faiss"""
     with _data_lock:
         if len(hot_ids) <= max_hot:

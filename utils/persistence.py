@@ -180,8 +180,8 @@ def sleep_cleanup():
     for key in dead_links:
         del links[key]
         removed_links += 1
-        from core.memory_engine import _count_link_deleted
-        _count_link_deleted += 1
+        from core.memory_engine import _bump_link_deleted
+        _bump_link_deleted()
 
     # 2. 字词网络整理
     dead_words = []

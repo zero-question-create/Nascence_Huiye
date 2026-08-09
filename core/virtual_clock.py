@@ -39,7 +39,7 @@ class VirtualClock:
         self.session_start = time.time()
         self.drift_threshold = 15 * 60
         self.sleep_start_hour = 23
-        self.sleep_duration = 7 * 3600
+        self.sleep_duration = 8 * 3600      # 8小时高质睡眠
         self._drift_thread = None
         self._stop_drift = threading.Event()
 
