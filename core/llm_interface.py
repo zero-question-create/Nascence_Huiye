@@ -331,12 +331,12 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内，只能使用给出记忆中的词语、信息\n"
         "- 严格根据记忆，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
         "- 不要添加动作或神态描述，禁止使用括号补充内容\n"
-        "- 不要包含'xx说'，直接输出想法本身"
+        "- 不要包含'xx说'，直接输出想法本身，你可以补充之前说的内容、提出观点或疑问，但是不可以重复自己说过的话"
         "输出严格只包含 JSON：\n"
         '{"say": true/false, "text": "..."}\n\n'
     )
 
-    user_content = f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法。"
+    user_content = f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法或独白。"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -364,7 +364,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     return {"say": True, "text": reply}
 
 
-async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁") -> str:
+async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁，禁止猜测或识别人物等信息，只要客观陈述") -> str:
     """
     从本地路径读取图片
     """
