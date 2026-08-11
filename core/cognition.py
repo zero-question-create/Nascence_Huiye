@@ -657,19 +657,14 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 d_msg_time = msg.get("time")
                 if d_msg_time is None:
                     d_msg_time = clock.now()
-                d_mem_id = create_memory(d_content)
-                d_mem = memories.get(d_mem_id)
-                if d_mem:
-                    d_mem["creation_time"] = d_msg_time
-                    d_real_ts = clock.to_real_time(d_msg_time)
-                    d_phrase = get_relative_time_phrase(d_real_ts)
-                    dialogue_memories.append(f"[{d_phrase}] {d_content}")
-                    dialogue_ts.append(d_real_ts)
+                d_real_ts = clock.to_real_time(d_msg_time)
+                d_phrase = get_relative_time_phrase(d_real_ts)
+                dialogue_memories.append(f"[{d_phrase}] {d_content}")
+                dialogue_ts.append(d_real_ts)
 
-            if dialogue_memories:
-                related_memories = related_memories + dialogue_memories
-                related_ts = related_ts + dialogue_ts
-                append_log(f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条（窗口={dialogue_count}）: {dialogue_memories}")
+            related_memories = related_memories + dialogue_memories
+            related_ts = related_ts + dialogue_ts
+            append_log(f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条（窗口={dialogue_count}）: {dialogue_memories}")
 
             # ============================
             # Step 3c: 上一轮回复并入（无论是否发出消息），带时间标签
@@ -717,7 +712,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
 
             if not result or not isinstance(result, dict):
                 current_keywords = []
-                await asyncio.sleep(3)
+                #await asyncio.sleep(3)
                 continue
 
             thought_text = result.get("text", "").strip()
@@ -725,7 +720,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
 
             if not thought_text:
                 append_log("[认知循环] verbalize 返回空，跳过")
-                await asyncio.sleep(3)
+                #await asyncio.sleep(3)
                 continue
 
             prev_thought_text = thought_text
@@ -774,7 +769,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # ============================
             # Step 8: 休眠
             # ============================
-            await asyncio.sleep(2)
+            #await asyncio.sleep(2)
 
             # ============================
             # 阶段5：抑制计数器衰减与清理
@@ -800,7 +795,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
                 append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
 
-            await asyncio.sleep(1)
+            #await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             append_log("[认知循环] 已停止")

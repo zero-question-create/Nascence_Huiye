@@ -241,6 +241,9 @@ async def handle_group_message(data: dict):
     if clean_text.lstrip().startswith(IGNORE_PREFIX):
         logger.info(f"消息以忽略前缀 '{IGNORE_PREFIX}' 开头，忽略")
         return
+    elif IGNORE_PREFIX in clean_text:           # 包含即忽略
+        logger.info(f"消息包含忽略字符 '{IGNORE_PREFIX}' ，忽略")
+        return
     clean_text = clean_text.replace(f"@{BOT_NAME}","")
     if clean_text.strip():
         BUS.message.emit(sender_name, clean_text.strip(), "QQ")
