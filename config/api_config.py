@@ -34,7 +34,10 @@ DEFAULT_CONFIG = {
     "secondary_base_url": "https://api.lucisapi.ai/v1",
     "secondary_model": "gpt-5.6-sol",
     "ollama_base_url": "http://localhost:11434",
-    "ollama_embed_model": "shaw/dmeta-embedding-zh"
+    "ollama_embed_model": "shaw/dmeta-embedding-zh",
+    "bot_qq": "123456",
+    "active_group_id": "123456",
+    "napcat_token": "Nascence"
 }
 
 def load_config():

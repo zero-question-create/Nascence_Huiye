@@ -58,16 +58,17 @@ from core.cognition import inject_message_keywords, cognitive_loop, extract_keyw
 from core.memory_engine import create_memory, access_memory, pathfind_activation, retrieve_similar, memories
 from core.virtual_clock import clock
 from config.constants import BOT_NAME
+from config.api_config import config
 
 # ---------- 配置常量 ----------
-BOT_QQ = "3852948473"  # 机器人QQ号
+BOT_QQ = str(config.get("bot_qq") or "123456")  # 机器人QQ号
 CONFIG_PATH = "config/qq_manifest.json"
 HTTP_API_BASE = "http://127.0.0.1:5700"
-HTTP_ACCESS_TOKEN = "Nascence"
+HTTP_ACCESS_TOKEN = str(config.get("napcat_token") or "Nascence")
 WS_HOST = "127.0.0.1"
 WS_PORT = 6700  # NapCat 配置中填写的端口
 WS_PATH = "/ws"
-WS_ACCESS_TOKEN = "Nascence"
+WS_ACCESS_TOKEN = str(config.get("napcat_token") or "Nascence")
 
 _recent_msg_list = []      # 有序存储 (sender_id, clean_text)
 _recent_msg_set = set()    # 快速查找去重
@@ -75,7 +76,7 @@ MAX_RECENT_MESSAGES = 20
 
 IGNORE_PREFIX = "#"     # 前缀特殊字符
 
-ACTIVE_GROUP_ID = "1057279304"  # 主动发言的目标群
+ACTIVE_GROUP_ID = str(config.get("active_group_id") or "123456")  # 主动发言的目标群
 
 _final_save_done = False            # 全局保存标识
 _napcat_websocket = None             # 当前连接的 NapCat 反向 WebSocket

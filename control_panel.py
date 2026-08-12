@@ -16,7 +16,7 @@ except ImportError:
     fcntl = None
 from datetime import datetime
 from pathlib import Path
-from config.api_config import DEFAULT_CONFIG
+from config.api_config import DEFAULT_CONFIG, config
 from config.constants import BOT_NAME
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -618,7 +618,8 @@ class ControlPanel(QMainWindow):
         form.addRow("WebSocket", QLabel("ws://127.0.0.1:6700/ws"))
         form.addRow("消息发送", QLabel("NapCat WebSocket Action"))
         form.addRow("NapCat HTTP", QLabel("http://127.0.0.1:5700（Token 已配置）"))
-        form.addRow("主动发言群", QLabel("1057279304"))
+        form.addRow("机器人QQ号", QLabel(str(config.get("bot_qq") or "123456")))
+        form.addRow("主动发言群", QLabel(str(config.get("active_group_id") or "123456")))
         layout.addWidget(panel)
         buttons = QHBoxLayout()
         start = QPushButton("启动并等待 NapCat")
@@ -630,11 +631,14 @@ class ControlPanel(QMainWindow):
         buttons.addStretch()
         layout.addLayout(buttons)
         note = QTextBrowser()
+        token = str(config.get("napcat_token") or "Nascence")
+        primary_model = str(config.get("primary_model") or "deepseek-v4-flash")
+        secondary_model = str(config.get("secondary_model") or "gpt-5.6-sol")
         note.setHtml(
             "<h3>NapCat 接入</h3>"
-            "<p>NapCat 应配置为主动 WebSocket 客户端，连接 <code>ws://127.0.0.1:6700/ws</code>，Token 为 <code>Nascence</code>。群消息发送使用同一 WebSocket 的 OneBot Action。</p>"
+            f"<p>NapCat 应配置为主动 WebSocket 客户端，连接 <code>ws://127.0.0.1:6700/ws</code>，Token 为 <code>{token}</code>。群消息发送使用同一 WebSocket 的 OneBot Action。</p>"
             "<p>引用消息原文通过同一 WebSocket 的 <code>get_msg</code> Action 获取。HTTP 5700 已通过 Token 鉴权，用于无直链语音文件的兼容处理。</p>"
-            "<p>图片、语音和视频由 Lucis GPT 模型处理；文本理解和回复由 DeepSeek Flash 处理。</p>"
+            f"<p>图片、语音和视频由 <code>{secondary_model}</code> 处理；文本理解和回复由 <code>{primary_model}</code> 处理。</p>"
         )
         layout.addWidget(note, 1)
         return page
@@ -645,7 +649,7 @@ class ControlPanel(QMainWindow):
         options = QHBoxLayout()
         self.sender_input = QLineEdit("测试群友")
         self.sender_input.setMaximumWidth(180)
-        self.group_input = QLineEdit("1057279304")
+        self.group_input = QLineEdit(str(config.get("active_group_id") or "123456"))
         self.group_input.setMaximumWidth(180)
         self.mention_check = QCheckBox(f"@{BOT_NAME}")
         self.mention_check.setChecked(True)
@@ -731,6 +735,19 @@ class ControlPanel(QMainWindow):
         save = QPushButton("保存 API 配置")
         save.clicked.connect(self.save_config)
         layout.addWidget(save, alignment=Qt.AlignLeft)
+
+        napcat_panel = QFrame(objectName="panel")
+        napcat_form = QFormLayout(napcat_panel)
+        self.bot_qq_input = QLineEdit()
+        self.active_group_input = QLineEdit()
+        self.napcat_token_input = QLineEdit()
+        napcat_form.addRow("机器人QQ号", self.bot_qq_input)
+        napcat_form.addRow("主动发言目标群号", self.active_group_input)
+        napcat_form.addRow("NapCat 鉴权 Token", self.napcat_token_input)
+        layout.addWidget(napcat_panel)
+        save_napcat = QPushButton("保存 NapCat 设置")
+        save_napcat.clicked.connect(self.save_napcat_config)
+        layout.addWidget(save_napcat, alignment=Qt.AlignLeft)
         layout.addStretch()
         return page
 
@@ -871,7 +888,7 @@ class ControlPanel(QMainWindow):
         self._running_service = "chat"
         self._refresh_running_status()
         sender = self.sender_input.text().strip() or "测试群友"
-        group_id = self.group_input.text().strip() or "1057279304"
+        group_id = self.group_input.text().strip() or str(config.get("active_group_id") or "123456")
         mentioned = self.mention_check.isChecked()
         self._append_bubble(sender, text, source="测试")
         self.chat_input.clear()
@@ -954,6 +971,9 @@ class ControlPanel(QMainWindow):
         self.lucis_url.setText(cfg.get("secondary_base_url", ""))
         self.lucis_model.setText(cfg.get("secondary_model", ""))
         self.lucis_key.setText(cfg.get("secondary_api_key", ""))
+        self.bot_qq_input.setText(str(cfg.get("bot_qq") or "123456"))
+        self.active_group_input.setText(str(cfg.get("active_group_id") or "123456"))
+        self.napcat_token_input.setText(str(cfg.get("napcat_token") or "Nascence"))
 
     def save_config(self):
         path = PROJECT_DIR / "config" / "api_config.json"
@@ -974,6 +994,23 @@ class ControlPanel(QMainWindow):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         QMessageBox.information(self, "配置已保存", "配置已写入文件。已初始化的 API 客户端需重启控制面板后生效。")
         logging.info("API 配置已保存，重启后生效")
+
+    def save_napcat_config(self):
+        path = PROJECT_DIR / "config" / "api_config.json"
+        if not path.exists():
+            cfg = dict(DEFAULT_CONFIG)
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        cfg.update({
+            "bot_qq": self.bot_qq_input.text().strip() or "123456",
+            "active_group_id": self.active_group_input.text().strip() or "123456",
+            "napcat_token": self.napcat_token_input.text().strip() or "Nascence",
+        })
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        QMessageBox.information(self, "已保存", "NapCat 设置已保存。需重启 QQ 服务后生效。")
+        logging.info("NapCat 配置已保存，重启 QQ 服务后生效")
 
     def start_training(self):
         if not self._check_service_conflict("training"):
