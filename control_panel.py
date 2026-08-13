@@ -363,7 +363,7 @@ class Runtime:
         from utils.message_history import add_message
         from utils.persistence import save_all_data
 
-        group_id = qq_bot.ACTIVE_GROUP_ID
+        group_id = qq_bot.get_active_group_id()
         fut = asyncio.run_coroutine_threadsafe(
             qq_bot.send_group_msg(group_id, text), self.qq_loop
         )
@@ -374,6 +374,23 @@ class Runtime:
         logging.info("伪造发送成功：群=%s 内容=%s 记忆ID=%s", group_id, text, memory_id)
         return memory_id
 
+    def fake_think(self, text):
+        self.initialize()
+        from core.cognition import generate_response
+        from utils.message_history import add_message
+        from utils.persistence import save_all_data, save_state
+
+        augmented = f"我（{BOT_NAME}）自己想着：{text}"
+        # 调用核心思考流程（LLM 拆解→检索→扩散→拼接），返回 (reply, user_input)
+        reply, _ = generate_response(augmented)
+        reply = str(reply or "（静默）").strip()
+        memory_text = f"我想：{reply}"
+        add_message(BOT_NAME, memory_text, "伪造思考")
+        save_all_data()
+        save_state()
+        logging.info("伪造思考完成：输入=%s 想法=%s", text, reply)
+        return reply
+
     def inject_memory(self, content):
         self.initialize()
         from core.memory_engine import create_memory
@@ -383,34 +400,6 @@ class Runtime:
         save_all_data()
         logging.info("管理员注入记忆成功，ID=%s，内容=%s", memory_id, content)
         return memory_id
-
-    def undo_dialogue(self):
-        self.initialize()
-        from core.cognition import UNDO_FILE
-        from core.memory_engine import _data_lock, _rebuild_faiss_index, links, memories, hot_ids
-        from utils.dialogue_state import set_state
-        from utils.persistence import save_all_data, save_state
-        from utils.message_history import remove_last
-
-        if not os.path.exists(UNDO_FILE):
-            raise FileNotFoundError("没有可撤销的对话快照")
-        with open(UNDO_FILE, "r", encoding="utf-8") as f:
-            snapshot = json.load(f)
-        with _data_lock:
-            memories.clear()
-            memories.update(snapshot["memories"])
-            hot_ids.clear()
-            hot_ids.update(snapshot["memories"].keys())
-            links.clear()
-            for key, value in snapshot["links"].items():
-                source, target = key.split("||")
-                links[(source, target)] = value
-            set_state(snapshot["state"])
-            _rebuild_faiss_index()
-        save_all_data()
-        save_state()
-        remove_last(2)
-        logging.info("上一轮对话已撤销并完整保存")
 
     def save(self):
         if not self.initialized:
@@ -476,8 +465,8 @@ class ControlPanel(QMainWindow):
         self.active_workers = set()
         self.busy_chat = False
         self.setWindowTitle(f"Nascence {BOT_NAME} · 控制面板")
-        self.resize(1180, 760)
-        self.setMinimumSize(900, 620)
+        self.resize(1280, 860)
+        self.setMinimumSize(1000, 700)
         self.log_views = {}
         self._shutdown_done = False
         self._running_service = None  # "qq" | "training" | "chat" | None
@@ -567,14 +556,8 @@ class ControlPanel(QMainWindow):
         self.speed_spin.setValue(1)
         self.set_speed_btn = QPushButton("应用倍速", objectName="secondaryButton")
         self.set_speed_btn.clicked.connect(self._apply_speed)
-        undo_btn = QPushButton("撤销上一轮对话", objectName="secondaryButton")
-        undo_btn.clicked.connect(lambda: self.run_worker(
-            RUNTIME.undo_dialogue,
-            on_finished=self._rebuild_chat_view
-        ))
         tools.addWidget(self.speed_spin)
         tools.addWidget(self.set_speed_btn)
-        tools.addWidget(undo_btn)
         tools.addStretch()
         action_layout.addLayout(tools)
         layout.addWidget(actions)
@@ -618,8 +601,10 @@ class ControlPanel(QMainWindow):
         form.addRow("WebSocket", QLabel("ws://127.0.0.1:6700/ws"))
         form.addRow("消息发送", QLabel("NapCat WebSocket Action"))
         form.addRow("NapCat HTTP", QLabel("http://127.0.0.1:5700（Token 已配置）"))
-        form.addRow("机器人QQ号", QLabel(str(config.get("bot_qq") or "123456")))
-        form.addRow("主动发言群", QLabel(str(config.get("active_group_id") or "123456")))
+        self.qq_bot_label = QLabel(str(config.get("bot_qq") or "123456"))
+        self.qq_group_label = QLabel(str(config.get("active_group_id") or "123456"))
+        form.addRow("机器人QQ号", self.qq_bot_label)
+        form.addRow("主动发言群", self.qq_group_label)
         layout.addWidget(panel)
         buttons = QHBoxLayout()
         start = QPushButton("启动并等待 NapCat")
@@ -630,18 +615,26 @@ class ControlPanel(QMainWindow):
         buttons.addWidget(stop)
         buttons.addStretch()
         layout.addLayout(buttons)
-        note = QTextBrowser()
+        self.qq_note = QTextBrowser()
+        self._refresh_napcat_note()
+        layout.addWidget(self.qq_note, 1)
+        return page
+
+    def _refresh_napcat_note(self):
+        """按当前 config 刷新 NapCat 接入说明与 QQ 页标签。"""
+        if hasattr(self, "qq_bot_label"):
+            self.qq_bot_label.setText(str(config.get("bot_qq") or "123456"))
+        if hasattr(self, "qq_group_label"):
+            self.qq_group_label.setText(str(config.get("active_group_id") or "123456"))
         token = str(config.get("napcat_token") or "Nascence")
         primary_model = str(config.get("primary_model") or "deepseek-v4-flash")
         secondary_model = str(config.get("secondary_model") or "gpt-5.6-sol")
-        note.setHtml(
+        self.qq_note.setHtml(
             "<h3>NapCat 接入</h3>"
             f"<p>NapCat 应配置为主动 WebSocket 客户端，连接 <code>ws://127.0.0.1:6700/ws</code>，Token 为 <code>{token}</code>。群消息发送使用同一 WebSocket 的 OneBot Action。</p>"
             "<p>引用消息原文通过同一 WebSocket 的 <code>get_msg</code> Action 获取。HTTP 5700 已通过 Token 鉴权，用于无直链语音文件的兼容处理。</p>"
             f"<p>图片、语音和视频由 <code>{secondary_model}</code> 处理；文本理解和回复由 <code>{primary_model}</code> 处理。</p>"
         )
-        layout.addWidget(note, 1)
-        return page
 
     def _chat_page(self):
         page = QWidget()
@@ -768,6 +761,19 @@ class ControlPanel(QMainWindow):
         fake_layout.addWidget(fake_btn, alignment=Qt.AlignLeft)
         layout.addWidget(fake_panel)
 
+        think_panel = QFrame(objectName="panel")
+        think_layout = QVBoxLayout(think_panel)
+        think_layout.addWidget(QLabel("伪造思考", objectName="sectionTitle"))
+        think_layout.addWidget(QLabel("模拟 bot 的内心思考流程（LLM 拆解→检索→扩散→拼接），不向 QQ 发送消息，仅写入历史与记忆库。", objectName="muted"))
+        self.fake_think_input = QPlainTextEdit()
+        self.fake_think_input.setPlaceholderText("输入要让 bot 思考的内容")
+        self.fake_think_input.setMaximumHeight(100)
+        think_layout.addWidget(self.fake_think_input)
+        think_btn = QPushButton("伪造思考")
+        think_btn.clicked.connect(self.fake_think)
+        think_layout.addWidget(think_btn, alignment=Qt.AlignLeft)
+        layout.addWidget(think_panel)
+
         panel = QFrame(objectName="panel")
         panel_layout = QVBoxLayout(panel)
         panel_layout.addWidget(QLabel("管理员记忆注入", objectName="sectionTitle"))
@@ -872,12 +878,6 @@ class ControlPanel(QMainWindow):
 
     def _on_message(self, sender, content, source):
         self._append_bubble(sender, content, source)
-
-    def _rebuild_chat_view(self):
-        from utils.message_history import get_all
-        self.chat_view.clear()
-        for msg in get_all():
-            self._append_bubble(msg["sender"], msg["content"], msg["source"])
 
     def send_chat(self):
         text = self.chat_input.toPlainText().strip()
@@ -1009,8 +1009,29 @@ class ControlPanel(QMainWindow):
         })
         with path.open("w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        QMessageBox.information(self, "已保存", "NapCat 设置已保存。需重启 QQ 服务后生效。")
-        logging.info("NapCat 配置已保存，重启 QQ 服务后生效")
+        # 热刷新：重读磁盘配置到全局 config，运行中的 QQ 服务立即感知新值（无需重启面板）
+        from config.api_config import reload_config
+        reload_config()
+        try:
+            import qq_bot
+            qq_bot.BOT_QQ = qq_bot.get_bot_qq()
+            qq_bot.ACTIVE_GROUP_ID = qq_bot.get_active_group_id()
+            qq_bot.HTTP_ACCESS_TOKEN = qq_bot.get_napcat_token()
+            qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
+        except Exception:
+            pass
+        # 刷新控制面板显示（QQ 页标签、接入说明、对话测试默认群号）
+        self._refresh_napcat_note()
+        if hasattr(self, "group_input"):
+            self.group_input.setText(str(config.get("active_group_id") or "123456"))
+        if hasattr(self, "bot_qq_input"):
+            self.bot_qq_input.setText(str(config.get("bot_qq") or "123456"))
+        if hasattr(self, "active_group_input"):
+            self.active_group_input.setText(str(config.get("active_group_id") or "123456"))
+        if hasattr(self, "napcat_token_input"):
+            self.napcat_token_input.setText(str(config.get("napcat_token") or "Nascence"))
+        QMessageBox.information(self, "已保存", "NapCat 设置已保存，运行中的 QQ 服务将自动使用新值。")
+        logging.info("NapCat 配置已保存并热刷新")
 
     def start_training(self):
         if not self._check_service_conflict("training"):
@@ -1133,6 +1154,17 @@ class ControlPanel(QMainWindow):
             RUNTIME.fake_send,
             text,
             on_result=lambda memory_id: self._append_bubble(BOT_NAME, text, source="伪造"),
+        )
+
+    def fake_think(self):
+        text = self.fake_think_input.toPlainText().strip()
+        if not text:
+            return
+        self.fake_think_input.clear()
+        self.run_worker(
+            RUNTIME.fake_think,
+            text,
+            on_result=lambda reply: self._append_bubble(BOT_NAME, f"（内心）{reply}", source="伪造思考"),
         )
 
     def inject_memory(self):

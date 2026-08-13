@@ -36,7 +36,6 @@ from core.memory_engine import get_model
 from config.constants import BOT_NAME
 from utils.persistence import load_all_data, save_all_data, load_state, save_state, append_dialogue
 from core.cognition import generate_response
-from core.cognition import UNDO_FILE
 from core.virtual_clock import clock
 from utils.monitor import monitor_start
 
@@ -92,31 +91,6 @@ def main():
                     print(f"当前时间倍速：{clock.set_speed(speed)}")
                 else:
                     print("调整失败")
-                continue
-            elif user_input.lower() == "undo":          # 撤销操作
-                import json
-                import os
-                if os.path.exists(UNDO_FILE):
-                    with open(UNDO_FILE, "r", encoding="utf-8") as f:
-                        snap = json.load(f)
-                    # 覆盖内存中的记忆图
-                    from core.memory_engine import memories, links
-                    from utils.dialogue_state import set_state
-                    memories.clear()
-                    memories.update(snap["memories"])
-                    links.clear()
-                    for key_str, val in snap["links"].items():
-                        s, t = key_str.split("||")
-                        links[(s, t)] = val
-                    set_state(snap["state"])
-                    # 同步写入主持久化文件
-                    from core.memory_engine import _rebuild_faiss_index
-                    _rebuild_faiss_index()
-                    save_all_data()
-                    save_state()
-                    print("[系统] 已撤销上一轮对话")
-                else:
-                    print("[系统] 没有可撤销的快照")
                 continue
             elif user_input.lower() == "move":
                 from utils.persistence import migrate_json_to_sqlite

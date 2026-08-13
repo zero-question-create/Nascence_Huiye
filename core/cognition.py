@@ -1,6 +1,4 @@
 # core/cognition.py
-import json
-import os
 import re
 import datetime
 import random
@@ -32,9 +30,6 @@ MODE_RETRIEVAL_K = {
     "询问": 8,
     "普通": 5,
 }
-
-# undo快照路径
-UNDO_FILE = "data/test/undo_snapshot.json"
 
 current_speaker: str = None
 
@@ -271,26 +266,15 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     """
     核心回复逻辑：
     1、预处理输入
-    2、储存撤销快照
-    3、LLM拆解
-    4、语义查找
-    5、体力行走扩散
-    6、LLM拼接
+    2、LLM拆解
+    3、语义查找
+    4、体力行走扩散
+    5、LLM拼接
     """
     # 预处理
     #clear_log()     # 可选择不清空，不清空的话直接把这行注释掉
     user_input = user_input.replace("*","")     # 对输入进行预处理，防止污染，必要时可以注释这一行
     user_input = mask_brackets(user_input)      # 对输入进行预处理，防止污染，必要时可以注释这一行
-    # 撤销操作快照
-    from core.memory_engine import memories, links
-    snapshot = {
-        "memories": memories,
-        "links": {f"{s}||{t}": v for (s, t), v in links.items()},
-        "state": get_state()
-    }
-    os.makedirs("data/test", exist_ok=True)
-    with open(UNDO_FILE, "w", encoding="utf-8") as f:
-        json.dump(snapshot, f, ensure_ascii=False)
 
     # 阶段A：LLM 拆解输入，拿到关键词
     mem_fragments, mode, new_state, keywords = decompose_input(user_input)
@@ -308,6 +292,7 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
         user_mem_ids.append(mid)
 
     # 阶段B：关键词驱动的语义检索（faiss）
+    from core.memory_engine import memories
     seed_ids = []
     faiss_results = []  # 新增：收集 faiss 检索结果
     if keywords:
@@ -769,7 +754,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # ============================
             # Step 8: 休眠
             # ============================
-            #await asyncio.sleep(2)
+            await asyncio.sleep(2)
 
             # ============================
             # 阶段5：抑制计数器衰减与清理
@@ -795,7 +780,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
                 append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
 
-            #await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             append_log("[认知循环] 已停止")

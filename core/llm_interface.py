@@ -61,7 +61,7 @@ def call_api_thinking(messages, max_tokens=8000):
             model=MODEL,
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.3,
+            temperature=0.1,
             stream=False,
             reasoning_effort="high",
             extra_body={"thinking": {"type": "enabled"}}
@@ -328,15 +328,15 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         "- 如果当前有人在对你说什么，且你想回应，'say'为true\n"
         "- 如果只是内心自然浮现的念头、碎碎念、联想，'say'为false\n"
         "- 'say'为false时，'text'可以是更碎片化、自由联想的内心独白\n"
-        "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内，只能使用给出记忆中的词语、信息\n"
-        "- 严格根据记忆，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
+        "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内，只能使用给出记忆中的词语、信息，可以适当有情绪起伏，甚至带一点吐糟或调侃，但不要过度使用比喻。避免语式重复化\n"
+        "- 严格根据记忆，记忆片段是按照时间排序的，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
         "- 不要添加动作或神态描述，禁止使用括号补充内容\n"
         "- 不要包含'xx说'，直接输出想法本身，你可以补充之前说的内容、提出观点或疑问，但是不可以重复自己说过的话"
-        "输出严格只包含 JSON：\n"
+        "输出严格只包含 JSON，只输出 json，text字段只允许至多一句话：\n"
         '{"say": true/false, "text": "..."}\n\n'
     )
 
-    user_content = f"记忆片段：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法或独白。"
+    user_content = f"记忆片段（按时间排序）：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，输出你此刻的想法或独白。"
 
     messages = [
         {"role": "system", "content": system_prompt},

@@ -49,6 +49,13 @@ def load_config():
             return cfg
     return dict(DEFAULT_CONFIG)
 
+def reload_config():
+    """重读磁盘配置并原地更新全局 config，使运行中的模块立即感知最新设置。"""
+    fresh = load_config()
+    config.clear()
+    config.update(fresh)
+    return config
+
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)

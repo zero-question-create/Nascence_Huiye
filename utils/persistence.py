@@ -41,6 +41,10 @@ def save_all_data():
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_file, MEMORY_FILE)
 
+        # 热链接下沉到 SQLite + 清理孤儿（全量对齐，冷链接保留）
+        from core.memory_engine import _sync_all_links_to_sqlite
+        _sync_all_links_to_sqlite()
+
         clock.save_state()
 
         from core.memory_engine import _faiss_index, _faiss_to_mem
@@ -114,8 +118,9 @@ def load_all_data():
             _import_metrics_counters(metrics)
 
         # 限制热记忆数量到硬上限（MAX_HOT_SIZE），把最久未访问的记忆移出内存
-        from core.memory_engine import _evict_cold_memories
+        from core.memory_engine import _evict_cold_memories, _evict_cold_links
         _evict_cold_memories()
+        _evict_cold_links()
 
 # ========== 对话状态持久化 ==========
 
@@ -174,7 +179,7 @@ def sleep_cleanup():
     removed_links = 0
     removed_wordweb = 0
 
-    # 1. 链接剪枝
+    # 1. 链接剪枝（内存热链接）
     dead_links = []
     for key, data in links.items():
         delta = now - data.get("last_accessed", data.get("creation_time", now))
@@ -186,6 +191,25 @@ def sleep_cleanup():
         removed_links += 1
         from core.memory_engine import _bump_link_deleted
         _bump_link_deleted()
+    # 剪枝 SQLite 中已下沉的冷链接（不在内存中的）
+    from core.memory_engine import _get_db
+    _cold_db = _get_db()
+    _cold_rows = _cold_db.execute(
+        "SELECT src, tgt, weight, last_accessed, creation_time FROM links"
+    ).fetchall()
+    _cold_dead = []
+    for src, tgt, weight, last_accessed, creation_time in _cold_rows:
+        if (src, tgt) in links:
+            continue  # 热链接跳过，交给内存管理
+        _delta = now - (last_accessed or creation_time or now)
+        if weight * (2 ** (-_delta / (7 * 24 * 3600))) < 0.01:
+            _cold_dead.append((src, tgt))
+    for src, tgt in _cold_dead:
+        _cold_db.execute("DELETE FROM links WHERE src = ? AND tgt = ?", (src, tgt))
+        removed_links += 1
+        from core.memory_engine import _bump_link_deleted
+        _bump_link_deleted()
+    _cold_db.commit()
 
     # 2. 字词网络整理
     dead_words = []
@@ -206,8 +230,9 @@ def sleep_cleanup():
         print(f"[睡眠维护] 物理删除 {len(expired)} 条衰变记忆，faiss 索引已重建")
 
     # 3.5 冷记忆淘汰：将超出热记忆上限的最久未访问记忆移出内存（写入 SQLite）
-    from core.memory_engine import _evict_cold_memories
+    from core.memory_engine import _evict_cold_memories, _evict_cold_links
     _evict_cold_memories()
+    _evict_cold_links()
 
     # 4. 全量持久化（含热数据写入 JSON、faiss 索引、时钟状态）
     save_all_data()
@@ -236,6 +261,16 @@ def migrate_json_to_sqlite():
              mem["half_life"], mem["last_accessed"], mem["creation_time"],
              mem.get("last_strengthen_time", mem["creation_time"]),
              json.dumps(mem.get("concept_tag_ids", [])))
+        )
+    # 迁移链接到 SQLite links 表
+    for key_str, val in data.get("links", {}).items():
+        src, tgt = key_str.split("||")
+        db.execute(
+            """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (src, tgt, val.get("weight", 0.0), val.get("type", "semantic"),
+             val.get("last_accessed", val.get("creation_time", 0)),
+             val.get("creation_time", 0))
         )
     db.commit()
     # 重建 faiss 索引（确保与 SQLite 一致）

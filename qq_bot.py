@@ -61,22 +61,48 @@ from config.constants import BOT_NAME
 from config.api_config import config
 
 # ---------- 配置常量 ----------
-BOT_QQ = str(config.get("bot_qq") or "123456")  # 机器人QQ号
 CONFIG_PATH = "config/qq_manifest.json"
 HTTP_API_BASE = "http://127.0.0.1:5700"
-HTTP_ACCESS_TOKEN = str(config.get("napcat_token") or "Nascence")
 WS_HOST = "127.0.0.1"
 WS_PORT = 6700  # NapCat 配置中填写的端口
 WS_PATH = "/ws"
-WS_ACCESS_TOKEN = str(config.get("napcat_token") or "Nascence")
+
+
+def _cfg_str(key, fallback):
+    """读取最新配置并返回字符串值（支持运行时热更新）。"""
+    try:
+        value = config.get(key)
+    except Exception:
+        value = None
+    return str(value or fallback)
+
+
+def get_bot_qq():
+    """机器人QQ号（动态读取，保存设置后无需重启即可生效）。"""
+    return _cfg_str("bot_qq", "123456")
+
+
+def get_active_group_id():
+    """主动发言的目标群（动态读取，保存设置后无需重启即可生效）。"""
+    return _cfg_str("active_group_id", "123456")
+
+
+def get_napcat_token():
+    """NapCat 鉴权 Token（动态读取，保存设置后无需重启即可生效）。"""
+    return _cfg_str("napcat_token", "Nascence")
+
+
+# 兼容旧引用（模块内部已改为动态读取）
+BOT_QQ = get_bot_qq()
+ACTIVE_GROUP_ID = get_active_group_id()
+HTTP_ACCESS_TOKEN = get_napcat_token()
+WS_ACCESS_TOKEN = get_napcat_token()
 
 _recent_msg_list = []      # 有序存储 (sender_id, clean_text)
 _recent_msg_set = set()    # 快速查找去重
 MAX_RECENT_MESSAGES = 20
 
 IGNORE_PREFIX = "#"     # 前缀特殊字符
-
-ACTIVE_GROUP_ID = str(config.get("active_group_id") or "123456")  # 主动发言的目标群
 
 _final_save_done = False            # 全局保存标识
 _napcat_websocket = None             # 当前连接的 NapCat 反向 WebSocket
@@ -249,9 +275,10 @@ async def handle_group_message(data: dict):
     if clean_text.strip():
         BUS.message.emit(sender_name, clean_text.strip(), "QQ")
 
-    is_mentioned_me = BOT_QQ in mentions
+    bot_qq = get_bot_qq()
+    is_mentioned_me = bot_qq in mentions
     if is_mentioned_me:
-        mentions = [m for m in mentions if m != BOT_QQ]
+        mentions = [m for m in mentions if m != bot_qq]
 
     # 多模态处理
     media_list = []  # 收集 (type, description)
@@ -275,7 +302,7 @@ async def handle_group_message(data: dict):
                     async with session.get(
                         f"{HTTP_API_BASE}/get_record",
                         params={"file": file_url, "out_format": "wav"},
-                        headers={"Authorization": f"Bearer {HTTP_ACCESS_TOKEN}"},
+                        headers={"Authorization": f"Bearer {get_napcat_token()}"},
                         timeout=30,
                     ) as resp:
                         if resp.status == 200:
@@ -521,7 +548,7 @@ async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Opti
             or ""
         )
         quoted_group_id = str(message_data.get("group_id") or fallback_group_id)
-        if quoted_sender_id == BOT_QQ:
+        if quoted_sender_id == get_bot_qq():
             quoted_sender = BOT_NAME
         else:
             quoted_sender = (
@@ -564,7 +591,8 @@ async def ws_handler(websocket):
         logger.warning("拒绝非 /ws WebSocket 连接: %s", request_path)
         await websocket.close(code=1008, reason="invalid path")
         return
-    if WS_ACCESS_TOKEN and header_token != WS_ACCESS_TOKEN and query_token != WS_ACCESS_TOKEN:
+    ws_token = get_napcat_token()
+    if ws_token and header_token != ws_token and query_token != ws_token:
         logger.warning("拒绝未通过 token 校验的 WebSocket 连接")
         await websocket.close(code=1008, reason="invalid token")
         return
@@ -577,7 +605,7 @@ async def ws_handler(websocket):
         from core.cognition import request_graceful_stop
         request_graceful_stop()  # 确保旧实例已清理
         _cognitive_task = asyncio.create_task(
-            cognitive_loop(send_func=send_group_msg, target_group_id=ACTIVE_GROUP_ID)
+            cognitive_loop(send_func=send_group_msg, target_group_id=get_active_group_id())
         )
         logger.info("[认知循环] 已随 NapCat 连接启动")
 
@@ -659,8 +687,9 @@ async def start_server():
             try:
                 await asyncio.sleep(600)  # 10分钟
                 from utils.persistence import save_all_data, save_state
-                from core.memory_engine import _evict_cold_memories
+                from core.memory_engine import _evict_cold_memories, _evict_cold_links
                 _evict_cold_memories()
+                _evict_cold_links()
                 save_all_data()
                 save_state()
                 logger.info("定时保存与冷数据下沉完成")

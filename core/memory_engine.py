@@ -37,6 +37,7 @@ EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
 MAX_HOT_SIZE = 1000                 # 热记忆节点硬上限，防止爆炸
+MAX_HOT_LINKS = 3000                # 热链接硬上限，防止爆炸（冷链接落入 SQLite）
 
 # ========== 体力消耗系数 ==========
 COST_FACTOR = {
@@ -219,6 +220,19 @@ def _get_db():
                 concept_tag_ids TEXT DEFAULT '[]'
             )
         """)
+        _db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+                src TEXT NOT NULL,
+                tgt TEXT NOT NULL,
+                weight REAL NOT NULL,
+                type TEXT NOT NULL,
+                last_accessed REAL NOT NULL,
+                creation_time REAL NOT NULL,
+                PRIMARY KEY (src, tgt)
+            )
+        """)
+        _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_src ON links(src)")
+        _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
     return _db_conn
 
 def _load_memory_from_db(mem_id: str) -> dict:
@@ -240,6 +254,7 @@ def _load_memory_from_db(mem_id: str) -> dict:
     }
     memories[mem_id] = mem
     hot_ids.add(mem_id)
+    _load_links_for_memory(mem_id)
     return mem
 
 def _batch_load_memories(mem_ids: list):
@@ -266,6 +281,8 @@ def _batch_load_memories(mem_ids: list):
         }
         memories[mem_id] = mem
         hot_ids.add(mem_id)
+    for mem_id in mem_ids:
+        _load_links_for_memory(mem_id)
 
 def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
     """将最久未访问的热数据移出内存，保留 SQLite 和 faiss"""
@@ -285,6 +302,110 @@ def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
             db.commit()
             del memories[mid]
             hot_ids.remove(mid)
+
+def _load_link_from_db(src_id: str, tgt_id: str):
+    """从 SQLite 加载一条链接到内存（变热）。不存在返回 None。"""
+    key = (src_id, tgt_id)
+    with _data_lock:
+        if key in links:
+            return links[key]
+        db = _get_db()
+        row = db.execute(
+            "SELECT weight, type, last_accessed, creation_time FROM links WHERE src = ? AND tgt = ?",
+            (src_id, tgt_id)
+        ).fetchone()
+        if row is None:
+            return None
+        link_data = {
+            "weight": row[0],
+            "type": row[1],
+            "last_accessed": row[2],
+            "creation_time": row[3],
+        }
+        links[key] = link_data
+        return link_data
+
+def _load_links_for_memory(mem_id: str, limit: int = 200):
+    """记忆从冷变热时，把与该记忆相连的冷链接一并载入内存（变热）。"""
+    with _data_lock:
+        db = _get_db()
+        rows = db.execute(
+            "SELECT src, tgt, weight, type, last_accessed, creation_time FROM links "
+            "WHERE src = ? OR tgt = ? LIMIT ?",
+            (mem_id, mem_id, limit)
+        ).fetchall()
+        for src, tgt, weight, ltype, last_accessed, creation_time in rows:
+            key = (src, tgt)
+            if key not in links:
+                links[key] = {
+                    "weight": weight,
+                    "type": ltype,
+                    "last_accessed": last_accessed,
+                    "creation_time": creation_time,
+                }
+
+def _evict_cold_links(max_hot=MAX_HOT_LINKS):
+    """将最久未访问的热链接移出内存（下沉到 SQLite），与热记忆淘汰对齐。"""
+    with _data_lock:
+        if len(links) <= max_hot:
+            return
+        sorted_keys = sorted(
+            links.keys(),
+            key=lambda k: links[k].get("last_accessed", links[k].get("creation_time", 0))
+        )
+        to_evict = sorted_keys[:len(links) - max_hot]
+        if not to_evict:
+            return
+        db = _get_db()
+        for (src, tgt) in to_evict:
+            d = links[(src, tgt)]
+            db.execute(
+                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (src, tgt, d["weight"], d["type"],
+                 d.get("last_accessed", d.get("creation_time", 0)),
+                 d.get("creation_time", 0))
+            )
+            del links[(src, tgt)]
+        db.commit()
+
+def _sync_all_links_to_sqlite():
+    """全量对齐 SQLite links 表与当前链接状态（内存热链接 + 已下沉冷链接），并清理孤儿。
+
+    低频调用（定时保存、睡眠维护）使用；确保 SQLite 与内存一致，
+    同时清除 decay_link 删除后残留的孤儿链接。返回写入的链接总数。
+    """
+    with _data_lock:
+        db = _get_db()
+        # 读取已下沉的冷链接（内存中没有的）
+        existing = {}
+        rows = db.execute("SELECT src, tgt, weight, type, last_accessed, creation_time FROM links").fetchall()
+        for src, tgt, weight, ltype, last_accessed, creation_time in rows:
+            key = (src, tgt)
+            if key in links:
+                continue  # 以内存热链接为准
+            existing[key] = {
+                "weight": weight,
+                "type": ltype,
+                "last_accessed": last_accessed,
+                "creation_time": creation_time,
+            }
+        # 合并：冷链接 + 热链接（热覆盖冷同名）
+        merged = dict(existing)
+        for key, d in links.items():
+            merged[key] = d
+        # 全量重写
+        db.execute("DELETE FROM links")
+        for (src, tgt), d in merged.items():
+            db.execute(
+                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (src, tgt, d["weight"], d["type"],
+                 d.get("last_accessed", d.get("creation_time", 0)),
+                 d.get("creation_time", 0))
+            )
+        db.commit()
+        return len(merged)
 
 def _build_word_to_memories():
     """从所有记忆的 content 重建词→记忆ID的倒排索引"""
@@ -838,6 +959,14 @@ def _purge_expired_memories(expiration_threshold=0.001):
     # 删除 SQLite 中的记录
     placeholders = ','.join('?' * len(expired_ids))
     db.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", expired_ids)
+    # 同时删除与过期记忆相关的链接（内存 + SQLite）
+    dead_links = [k for k in list(links.keys()) if k[0] in expired_ids or k[1] in expired_ids]
+    for k in dead_links:
+        del links[k]
+    db.execute(
+        f"DELETE FROM links WHERE src IN ({placeholders}) OR tgt IN ({placeholders})",
+        expired_ids + expired_ids
+    )
     db.commit()
 
     # 从内存字典和热数据集合中移除
