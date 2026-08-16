@@ -1,120 +1,101 @@
 @echo off
-setlocal enabledelayedexpansion
+chcp 65001 >nul
+title NASCENCE Huiye - Launcher
+setlocal
 
-title Nascence Huiye - Starting...
+pushd "%~dp0"
+set "PROJECT_DIR=%CD%"
 
 echo ==========================================
-echo  Nascence Huiye - Starting...
+echo  NASCENCE Huiye - Web Server Launcher
+echo  Client : http://127.0.0.1:8787/
+echo  Admin  : http://127.0.0.1:8787/admin
 echo ==========================================
 
-set "PROJECT_DIR=%~dp0"
-cd /d "%PROJECT_DIR%"
-
-:: ---------- 0. Check system Python ----------
+rem ==================== 1. Check system Python ====================
 set "PYTHON_OK="
 python --version >nul 2>nul
-if %errorlevel% equ 0 set "PYTHON_OK=1"
+if not errorlevel 1 set "PYTHON_OK=1"
 if not defined PYTHON_OK (
     py --version >nul 2>nul
-    if %errorlevel% equ 0 set "PYTHON_OK=1"
+    if not errorlevel 1 set "PYTHON_OK=1"
 )
 if not defined PYTHON_OK (
     echo.
     echo [ERROR] Python was not found!
-    echo.
     echo Please install Python from https://www.python.org/downloads/
     echo and make sure to check "Add Python to PATH" during installation.
     echo Then reopen the terminal and run this script again.
     echo.
     pause
+    popd
     exit /b 1
 )
 echo [OK] Python found
 
-:: ---------- 1. Check venv ----------
-if not exist "%PROJECT_DIR%venv\Scripts\python.exe" (
-    echo [Error] Virtual env not found. Please run setup.ps1 first.
-    pause
-    exit /b 1
+rem ==================== 2. Check virtual env ====================
+set "VENV_PY=%PROJECT_DIR%\venv\Scripts\python.exe"
+if not exist "%VENV_PY%" (
+    echo [*] Virtual env not found, running setup.ps1...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\setup.ps1"
+    if not exist "%VENV_PY%" (
+        echo [ERROR] Virtual env creation failed. Please run setup.ps1 manually.
+        pause
+        popd
+        exit /b 1
+    )
 )
 echo [OK] Virtual env found
 
-:: ---------- 2. Ensure data dirs ----------
-if not exist "%PROJECT_DIR%data\test" mkdir "%PROJECT_DIR%data\test"
+rem ==================== 3. Ensure data dir ====================
+if not exist "%PROJECT_DIR%\data\test" mkdir "%PROJECT_DIR%\data\test"
 
-:: ---------- 3. Start Ollama ----------
-set "OLLAMA_BIN=%PROJECT_DIR%ollama\bin\ollama.exe"
-set "OLLAMA_SERVER="
-
-if exist "%OLLAMA_BIN%" (
-    echo [*] Starting local Ollama service...
-    set "OLLAMA_HOME=%PROJECT_DIR%ollama\home"
-    if not exist "!OLLAMA_HOME!" mkdir "!OLLAMA_HOME!"
-    set "OLLAMA_MODELS=!OLLAMA_HOME!\models"
-    if not exist "!OLLAMA_MODELS!" mkdir "!OLLAMA_MODELS!"
-
-    powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-    if "!ERRORLEVEL!"=="0" (
-        echo [OK] Ollama already running
-    ) else (
-        echo [*] Launching Ollama...
-        start "Ollama" /B "%OLLAMA_BIN%" serve > nul 2>&1
-        set "OLLAMA_SERVER=1"
-        echo [*] Waiting for Ollama...
-        for /l %%i in (1,1,30) do (
-            timeout /t 1 /nobreak >nul
-            powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-            if "!ERRORLEVEL!"=="0" (
-                echo [OK] Ollama ready
-                goto :ollama_ready
-            )
-        )
-        echo [Warning] Ollama start timed out, please start manually
+rem ==================== 4. Ensure llama.cpp ====================
+if not exist "%PROJECT_DIR%\llama\bin\llama-server.exe" (
+    echo [*] llama.cpp not found, downloading...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\run\install_llama.ps1"
+    if not exist "%PROJECT_DIR%\llama\bin\llama-server.exe" (
+        echo [ERROR] llama.cpp install failed. Please check network or install manually.
+        pause
+        popd
+        exit /b 1
     )
-) else (
-    echo [Warning] Ollama not found at %OLLAMA_BIN%
-    echo [Warning] Please place ollama.exe in ollama\bin\ or start Ollama manually
 )
-:ollama_ready
+echo [OK] llama.cpp ready
 
-:: ---------- 4. Check embedding model ----------
-echo [*] Checking embedding model...
-powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 2; $d = $r.Content | ConvertFrom-Json; $found = $d.models | Where-Object { $_.name -like '*dmeta-embedding-zh*' }; if ($found) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-if "!ERRORLEVEL!"=="0" (
-    echo [OK] Embedding model exists
-) else (
-    echo [*] Pulling embedding model shaw/dmeta-embedding-zh ...
-    start "Ollama Pull" /B "%OLLAMA_BIN%" pull shaw/dmeta-embedding-zh
+rem ==================== 5. Port 8787 pre-check ====================
+set "PORT_BUSY="
+netstat -ano | findstr ":8787" | findstr "LISTENING" >nul
+if not errorlevel 1 set "PORT_BUSY=1"
+
+if defined PORT_BUSY (
+    echo.
+    echo [*] Port 8787 is already in use. Server may already be running.
+    echo [*] Opening browser to client and admin pages.
+    start "" "http://127.0.0.1:8787/"
+    start "" "http://127.0.0.1:8787/admin"
+    echo.
+    pause
+    popd
+    exit /b 0
 )
 
-:: ---------- 5. Mode selection ----------
+rem ==================== 6. Start WebUI ====================
 echo.
-echo ==========================================
-echo  Select mode:
-echo    1) CLI Interactive (main.py)
-echo    2) QQ Bot (qq_bot.py)
-echo    3) Self Training (self_training.py)
-echo ==========================================
+echo [*] Starting Web server, please wait...
+echo [*] Browser will open client and admin pages after startup.
 echo.
 
-set /p MODE_CHOICE="Choice (1/2/3, default 1): "
-if "!MODE_CHOICE!"=="" set MODE_CHOICE=1
+rem Open both pages 2s later (after port binding)
+start "" powershell -NoProfile -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:8787/'; Start-Process 'http://127.0.0.1:8787/admin'"
+"%VENV_PY%" webui.py
+set "CODE=%ERRORLEVEL%"
 
-call "%PROJECT_DIR%venv\Scripts\activate.bat"
-
-if "!MODE_CHOICE!"=="1" (
-    echo [*] Starting CLI mode...
-    python main.py
-) else if "!MODE_CHOICE!"=="2" (
-    echo [*] Starting QQ Bot mode...
-    python qq_bot.py
-) else if "!MODE_CHOICE!"=="3" (
-    echo [*] Starting Self Training mode...
-    python self_training.py
+if "%CODE%" neq "0" (
+    powershell -Command "Write-Host '[ERROR] Server exited abnormally, code: %CODE%' -ForegroundColor Red"
 ) else (
-    echo [*] Invalid choice, starting CLI mode...
-    python main.py
+    powershell -Command "Write-Host 'Server exited normally' -ForegroundColor Green"
 )
 
-call deactivate
+popd
 pause

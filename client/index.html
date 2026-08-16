@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Nascence辉夜 · 对话客户端</title>
+    <link rel="stylesheet" href="nav/nav_style.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- ======== 横向顶栏 ======== -->
+    <header id="topbar">
+        <div class="topbar-left">
+            <button class="logo-btn" id="btnOpenNav" title="展开导航站">
+                <img src="images/logo.PNG" alt="无限 Logo">
+            </button>
+            <span class="brand-title">Nascence辉夜</span>
+        </div>
+        <div class="topbar-right">
+            <button class="theme-toggle" id="btnTheme">跟随系统</button>
+            <div class="avatar-wrap">
+                <div class="user-avatar" id="userAvatar">?</div>
+                <div class="avatar-menu" id="avatarMenu">
+                    <div class="avatar-name" id="userName">未登录</div>
+                    <div class="avatar-sub" id="userSub"></div>
+                    <button class="avatar-logout" id="btnLogout">退出登录</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- ======== 登录 / 注册 弹窗 ======== -->
+    <div id="auth-overlay">
+        <div class="auth-modal">
+            <div class="auth-tabs">
+                <button class="auth-tab active" id="tabLogin">登录</button>
+                <button class="auth-tab" id="tabRegister">注册</button>
+            </div>
+            <div class="auth-body">
+                <div class="field">
+                    <label>用户名</label>
+                    <input type="text" id="authUsername" autocomplete="username">
+                </div>
+                <div class="field">
+                    <label>密码</label>
+                    <div class="password-input-wrap">
+                        <input type="password" id="authPassword" autocomplete="current-password">
+                        <button type="button" class="btn-pwd-eye" data-target="authPassword" title="显示/隐藏密码">
+                            <span class="eye-icon">👁️</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="field" id="fieldConfirmPassword" style="display:none;">
+                    <label>确认密码</label>
+                    <div class="password-input-wrap">
+                        <input type="password" id="authConfirmPassword" autocomplete="new-password">
+                        <button type="button" class="btn-pwd-eye" data-target="authConfirmPassword" title="显示/隐藏密码">
+                            <span class="eye-icon">👁️</span>
+                        </button>
+                    </div>
+                </div>
+                <button class="auth-btn" id="btnAuthSubmit">登 录</button>
+                <div class="auth-hint" id="authHint"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======== 对话页：直角标签卡（沿用原导航站 .menu-card 布局） ======== -->
+    <div id="chat-page">
+        <div id="chat-card" class="menu-card chat-tag-card">
+            <!-- 标签部分：像素闪烁（照抄原导航站） -->
+            <div class="pixel-block">
+                <div class="pixel-grid" id="chatPixelGrid"></div>
+            </div>
+            <div class="card-content chat-content">
+                <div class="card-head">
+                    <span class="card-title">对话 · <span id="mentionName">辉夜</span></span>
+                    <span class="card-sub" id="chatStatus"></span>
+                </div>
+                <div id="chat-body">
+                    <div class="welcome" id="welcome">
+                        <img src="images/logo.PNG" alt="无限 Logo" class="welcome-logo"
+                             onerror="this.classList.add('error');this.nextElementSibling.style.display='block'">
+                        <div class="welcome-logo-fallback" style="display:none">♾️</div>
+                        <h1>Nascence辉夜</h1>
+                        <p>记忆认知对话 · 随时开始</p>
+                    </div>
+                    <div class="messages" id="chatView"></div>
+                </div>
+                <div class="input-wrap">
+                    <textarea id="chatInput" placeholder="输入消息，Enter 发送，Shift+Enter / Ctrl+Enter 换行"></textarea>
+                    <button class="send-btn" id="btnChatSend">发送</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======== 遮罩（纯白，位于标签卡下方） ======== -->
+    <div id="nav-mask"></div>
+
+    <!-- ======== 原导航站（原封不动缝入） ======== -->
+    <div id="nav-station">
+        <div id="app-bg"><div id="bg-breath"></div><div id="glow"></div></div>
+        <div id="logo-container">
+            <img src="images/logo.PNG" alt="无限 Logo" id="main-logo" onerror="this.classList.add('error')">
+            <div class="fallback-logo">♾️</div>
+        </div>
+        <div id="menu-layer"></div>
+    </div>
+
+    <button class="back-chat-btn" id="btnBackChat">← 返回对话页</button>
+
+    <script src="nav/nav_script.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

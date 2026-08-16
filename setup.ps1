@@ -53,88 +53,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "[OK] Python dependencies installed"
 
-# ---------- 3. Download Ollama (Windows) ----------
-$ollamaComplete = $false
-if (Test-Path "ollama\bin\ollama.exe") {
-    $serverFound = Get-ChildItem -Path "ollama\bin" -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "llama-server.exe" } |
-        Select-Object -First 1
-    if ($null -ne $serverFound) { $ollamaComplete = $true }
-}
-if (-not $ollamaComplete) {
-    Write-Host "[*] Downloading Ollama (Windows)..."
-    try {
-        $ReleaseApi = "https://api.github.com/repos/ollama/ollama/releases/latest"
-        $ReleaseData = Invoke-RestMethod -Uri $ReleaseApi -ErrorAction Stop
-        $Tag = $ReleaseData.tag_name
-        Write-Host "    Version: $Tag"
-        $ZipUrl = "https://github.com/ollama/ollama/releases/download/${Tag}/ollama-windows-amd64.zip"
-        $ZipPath = "$ProjectDir\ollama\ollama.zip"
-        New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama" | Out-Null
-        Write-Host "[*] Downloading..."
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
-        Write-Host "[*] Extracting..."
-        $TempDir = "$ProjectDir\ollama\temp"
-        Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force -ErrorAction Stop
-        $ExeFile = Get-ChildItem -Path $TempDir -Recurse -Filter "ollama.exe" | Select-Object -First 1
-        if ($ExeFile) {
-            New-Item -ItemType Directory -Force -Path "$ProjectDir\ollama\bin" | Out-Null
-            # 复制完整发行包（ollama.exe / llama-server.exe / lib 运行时库），只复制单个 exe 会导致推理服务不可用
-            Copy-Item -Path "$($ExeFile.Directory)\*" -Destination "$ProjectDir\ollama\bin" -Recurse -Force
-            Write-Host "[OK] Ollama installed to ollama\bin\ (full package incl. llama-server)"
-        } else {
-            Write-Host "[!] ollama.exe not found in extracted files."
-        }
-        Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Host "[!] Failed to download Ollama. Error: $_"
-        Write-Host "[!] You can manually download ollama-windows-amd64.zip and place ollama.exe in ollama\bin\"
-    }
-} else {
-    Write-Host "[OK] Ollama already exists"
-}
+# ---------- 3. Install llama.cpp + 3 GGUF models ----------
+Write-Host "[*] Installing llama.cpp and GGUF models..."
+& powershell -ExecutionPolicy Bypass -File "$ProjectDir\run\install_llama.ps1"
 
 # ---------- 4. Create data directories ----------
 New-Item -ItemType Directory -Force -Path "data\test" | Out-Null
 Write-Host "[OK] Data directories created"
 
-# ---------- 5. (Optional) Pull embedding model ----------
-$OllamaBin = "$ProjectDir\ollama\bin\ollama.exe"
-if (Test-Path $OllamaBin) {
-    Write-Host "[*] Starting Ollama and pulling embedding model..."
-    $env:OLLAMA_HOME = "$ProjectDir\ollama\home"
-    $env:OLLAMA_MODELS = "$ProjectDir\ollama\home\models"
-    New-Item -ItemType Directory -Force -Path $env:OLLAMA_HOME | Out-Null
-
-    $OllamaProc = Start-Process -FilePath $OllamaBin -ArgumentList "serve" -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 3
-
-    $Model = "shaw/dmeta-embedding-zh"
-    try {
-        $TagList = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -ErrorAction Stop
-        $Exists = $TagList.models | Where-Object { $_.name -like "*dmeta-embedding-zh*" }
-    } catch {
-        $Exists = $null
-    }
-    if (-not $Exists) {
-        Write-Host "[*] Pulling model $Model (about 400MB, first time may be slow)..."
-        $PullBody = @{ model = $Model } | ConvertTo-Json
-        Invoke-RestMethod -Uri "http://localhost:11434/api/pull" -Method Post -Body $PullBody -ContentType "application/json" | Out-Null
-        Write-Host "[OK] Embedding model pulled"
-    } else {
-        Write-Host "[OK] Embedding model already exists"
-    }
-
-    Stop-Process -Id $OllamaProc.Id -Force -ErrorAction SilentlyContinue
-    Write-Host "[OK] Ollama service stopped"
-} else {
-    Write-Host "[*] Ollama not installed, skipping model pull."
-}
-
 Write-Host ""
 Write-Host "=========================================="
 Write-Host "  Setup complete! You can now run"
-Write-Host "  'start.bat' to start the project."
+Write-Host "  'start.bat' to launch the WebUI."
 Write-Host "=========================================="
 Read-Host "Press Enter to exit"

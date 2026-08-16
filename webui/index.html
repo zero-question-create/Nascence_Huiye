@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NASCENCE · 辉夜 控制面板</title>
+<link rel="stylesheet" href="/admin_static/style.css">
+</head>
+<body>
+<!-- ======== 顶部 ======== -->
+<header>
+  <div class="brand">
+    <div class="title">NASCENCE · 辉夜</div>
+    <div class="subtitle">记忆认知系统 · Web 控制台</div>
+  </div>
+  <div class="status-badge" id="globalStatus">正在初始化</div>
+</header>
+
+<!-- ======== 导航 ======== -->
+<nav>
+  <button class="tab active" data-tab="overview">总览</button>
+  <button class="tab" data-tab="chat">对话测试</button>
+  <button class="tab" data-tab="logs">日志</button>
+  <button class="tab" data-tab="config">配置</button>
+  <button class="tab" data-tab="maintenance">维护</button>
+</nav>
+
+<main>
+  <!-- ======== 总览 ======== -->
+  <section id="overview" class="page active">
+    <div class="cards">
+      <div class="card"><div class="card-title">热记忆节点</div><div class="card-value" id="statMem">--</div></div>
+      <div class="card"><div class="card-title">记忆链接</div><div class="card-value" id="statLinks">--</div></div>
+      <div class="card"><div class="card-title">词网规模</div><div class="card-value" id="statWords">--</div></div>
+      <div class="card"><div class="card-title">运行时间</div><div class="card-value" id="statRuntime">--</div></div>
+      <div class="card"><div class="card-title">虚拟时间</div><div class="card-value" id="statClock">--</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">运行控制</div>
+      <div class="row">
+        <div class="label">认知循环</div><div class="badge" id="qqStatusBadge">已停止</div>
+      </div>
+      <div class="row">
+        <button class="btn" id="btnQQStart">启动认知循环</button>
+        <button class="btn secondary" id="btnQQStop">停止认知循环</button>
+        <button class="btn secondary" id="btnSave">立即保存全部数据</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">运行情况</div>
+      <div class="status-display" id="statusDisplay">等待状态信息...</div>
+    </div>
+  </section>
+
+  <!-- ======== 对话测试 ======== -->
+  <section id="chat" class="page">
+    <div class="panel">
+      <div class="row">
+        <label>发送者</label>
+        <input type="text" id="chatSender" value="测试群友" style="width:140px">
+        <label><input type="checkbox" id="chatMention" checked> @<span id="mentionName">辉夜</span></label>
+      </div>
+    </div>
+    <div class="chat-view" id="chatView">
+      <div class="system-line">对话测试已准备。输入内容走完整认知流程（理解→检索→扩散→拼接）。</div>
+    </div>
+    <div class="composer">
+      <textarea id="chatInput" placeholder="输入消息，Ctrl+Enter 发送"></textarea>
+      <button class="btn" id="btnChatSend">发送</button>
+    </div>
+  </section>
+
+  <!-- ======== 日志 ======== -->
+  <section id="logs" class="page">
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <div class="panel-title">运行日志</div>
+        <button class="btn secondary" id="btnClearLogs">清空全部日志</button>
+      </div>
+    </div>
+    <div class="log-tabs" id="logTabs">
+      <button class="log-tab active" data-cat="runtime">运行</button>
+      <button class="log-tab" data-cat="thinking">思考</button>
+      <button class="log-tab" data-cat="model">模型</button>
+      <button class="log-tab" data-cat="connection">连接</button>
+    </div>
+    <div class="log-view" id="logView"></div>
+  </section>
+
+  <!-- ======== 配置 ======== -->
+  <section id="config" class="page">
+    <div class="panel">
+      <div class="panel-title">Bot 名字</div>
+      <div class="muted">修改机器人名字。保存后需重启进程才能生效（当前页面不做实时更改）。</div>
+      <div class="row">
+        <div class="label">Bot 名字</div>
+        <input type="text" id="botNameInput" placeholder="辉夜" style="flex:1">
+      </div>
+      <div class="row">
+        <button class="btn" id="btnSaveBotName">保存</button>
+        <span class="muted" id="botNameHint"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">服务端监听端口</div>
+      <div class="muted">修改服务端 HTTP 监听端口，保存后实时生效（无需重启）。客户端连接地址（gateway）将同步更新，客户端刷新后自动连新端口。</div>
+      <div class="row">
+        <div class="label">端口号</div>
+        <input type="number" id="serverPortInput" placeholder="8787" min="1" max="65535" style="flex:1">
+      </div>
+      <div class="row">
+        <button class="btn" id="btnSavePort">保存端口</button>
+        <span class="muted" id="portHint"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">网页版客户端端口</div>
+      <div class="muted">独立于服务端端口：随服务器运行的网页版客户端监听端口，保存后实时生效（无需重启）。浏览器访问该端口即打开与本地客户端相同的网页。</div>
+      <div class="row">
+        <div class="label">端口号</div>
+        <input type="number" id="clientPortInput" placeholder="8987" min="1" max="65535" style="flex:1">
+      </div>
+      <div class="row">
+        <button class="btn" id="btnSaveClientPort">保存客户端端口</button>
+        <span class="muted" id="clientPortHint"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">模型</div>
+      <div class="note">
+        三个能力（文本 / 语义向量 / 多模态图片）均可选择「本地默认模型」或「外部 API」。
+        本地默认模型由 llama.cpp 在启动时加载，加载后不会被关闭，切换回默认无需重启；
+        若本次启动从未加载本地模型，切回默认需重启进程。
+      </div>
+      <div id="modelCards"></div>
+    </div>
+  </section>
+
+  <!-- ======== 维护 ======== -->
+  <section id="maintenance" class="page">
+    <div class="panel">
+      <div class="panel-title">伪造思考</div>
+      <div class="muted">模拟 bot 的内心思考流程（LLM 拆解→检索→扩散→拼接），写入历史与记忆库。</div>
+      <textarea id="fakeThinkInput" placeholder="输入要让 bot 思考的内容" class="mini"></textarea>
+      <div class="row"><button class="btn" id="btnFakeThink">伪造思考</button></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">管理员记忆注入</div>
+      <div class="muted">直接写入记忆图并立即持久化。</div>
+      <textarea id="memInput" placeholder="输入要植入的记忆" class="mini"></textarea>
+      <div class="row"><button class="btn" id="btnInject">注入并保存记忆</button></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">语义向量维度重建</div>
+      <div class="muted">
+        当 embed 模型输出维度与记忆库/faiss 索引维度不一致时（例如切换了 embedding 模型），
+        用此工具把全部记忆向量按目标维度全量重建并重建索引。重建期间请勿操作记忆。
+      </div>
+      <div class="row">
+        <div class="label">当前存储维度</div><span id="dimStored">--</span>
+        <div class="label">模型输出维度</div><span id="dimModel">--</span>
+        <div class="label">记忆总数</div><span id="dimCount">--</span>
+      </div>
+      <div class="row">
+        <div class="label">目标维度</div>
+        <input type="number" id="dimTarget" placeholder="留空=按模型维度" style="width:180px">
+        <button class="btn" id="btnRebuildDim">开始全量重建</button>
+      </div>
+      <div class="row">
+        <span class="muted" id="dimProgress"></span>
+      </div>
+      <div class="status-display" id="dimLog" style="max-height:180px;overflow:auto;">尚无任务记录</div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <button class="btn danger" id="btnShutdown">安全退出服务</button>
+</footer>
+
+<script src="/admin_static/app.js"></script>
+</body>
+</html>

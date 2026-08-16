@@ -1,13 +1,12 @@
 # utils/persistence.py
 import json
 import os
-import threading
 import time
 from core.memory_engine import memories, links, pending_deletion, wordweb, hot_ids
 from core.memory_engine import check_and_handle_expired, _evict_cold_memories
+from core.memory_engine import _data_lock as _io_lock  # 与 memory_engine 共用同一把锁
 from core.virtual_clock import clock
-
-_io_lock = threading.Lock()
+from core import runtime_paths
 
 MEMORY_FILE = "data/test/memory.json"
 STATE_FILE = "data/test/dialogue_state.json"
@@ -16,6 +15,21 @@ FAISS_INDEX_FILE = "data/test/faiss.index"
 FAISS_MAPPING_FILE = "data/test/faiss_mapping.json"
 METRICS_COUNTERS_FILE = "data/test/metrics_counters.json"
 
+
+def _refresh_paths():
+    """按当前运行时数据目录重算路径常量。"""
+    global MEMORY_FILE, STATE_FILE, DIALOGUE_LOG_FILE
+    global FAISS_INDEX_FILE, FAISS_MAPPING_FILE, METRICS_COUNTERS_FILE
+    MEMORY_FILE = runtime_paths.file("memory.json")
+    STATE_FILE = runtime_paths.file("dialogue_state.json")
+    DIALOGUE_LOG_FILE = runtime_paths.file("dialogue_log.jsonl")
+    FAISS_INDEX_FILE = runtime_paths.file("faiss.index")
+    FAISS_MAPPING_FILE = runtime_paths.file("faiss_mapping.json")
+    METRICS_COUNTERS_FILE = runtime_paths.file("metrics_counters.json")
+
+
+runtime_paths.register(_refresh_paths)
+
 # ========== 记忆持久化 ==========
 
 def save_all_data():
@@ -23,7 +37,8 @@ def save_all_data():
     with _io_lock:
         from core.memory_engine import _get_db, hot_ids, memories
         db = _get_db()
-        for mid in hot_ids:
+        hot_ids_snapshot = list(hot_ids)  # 快照拷贝：杜绝遍历中被并发修改
+        for mid in hot_ids_snapshot:
             mem = memories.get(mid)
             if mem:
                 db.execute(
@@ -32,10 +47,10 @@ def save_all_data():
                 )
         db.commit()
 
-        os.makedirs("data/test", exist_ok=True)
+        os.makedirs(runtime_paths.get_data_dir(), exist_ok=True)
         serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in links.items()}
         serializable_word_links = {f"{a}||{b}": val for (a, b), val in wordweb.items()}
-        data = {"memories": {mid: memories[mid] for mid in hot_ids}, "links": serializable_sentence_links, "wordweb": serializable_word_links}
+        data = {"memories": {mid: memories[mid] for mid in hot_ids_snapshot}, "links": serializable_sentence_links, "wordweb": serializable_word_links}
         tmp_file = MEMORY_FILE + ".tmp"
         with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -48,10 +63,11 @@ def save_all_data():
         clock.save_state()
 
         from core.memory_engine import _faiss_index, _faiss_to_mem
-        import faiss
-        faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
-        with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_faiss_to_mem, f, ensure_ascii=False)
+        if _faiss_index is not None:
+            import faiss
+            faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
+            with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
+                json.dump(_faiss_to_mem, f, ensure_ascii=False)
 
         # 保存每日指标计数器快照
         from core.memory_engine import _export_metrics_counters
@@ -60,57 +76,76 @@ def save_all_data():
             json.dump(metrics, f, ensure_ascii=False)
 
 def load_all_data():
-    """从文件加载记忆和链接"""
+    """从持久化加载记忆和链接。
+
+    冷热分离设计下，SQLite 保存全量记忆，memory.json 仅为热快照。
+    启动加载策略：
+      1. 若 memory.json 有热记忆快照，优先用它恢复热区（兼容旧版）
+      2. 从 SQLite 加载最近活跃的 MAX_HOT_SIZE 条记忆到热区
+         （覆盖 memory.json 为空/旧的情况，保证热区有数据）
+      3. faiss 索引始终从 SQLite 全量重建，保证检索覆盖所有记忆
+    """
     global memories, links
     with _io_lock:
-        if not os.path.exists(MEMORY_FILE):
-            return
-        with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        from core.memory_engine import _get_db, hot_ids
+        db = _get_db()
+
+        # 1. 若 memory.json 存在，读取热快照（可能有旧数据）
+        snap = {}
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+                    snap = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                snap = {}
+
+        # 2. 从 SQLite 查询最近活跃的记忆 ID（按 last_accessed 降序取 MAX_HOT_SIZE 条）
+        hot_limit = _get_hot_limit()
+        rows = db.execute(
+            "SELECT id FROM memories ORDER BY last_accessed DESC LIMIT ?",
+            (hot_limit,)
+        ).fetchall()
+        recent_ids = [r[0] for r in rows]
+
         memories.clear()
-        from core.memory_engine import hot_ids
         hot_ids.clear()
-        memories.update(data.get("memories", {}))
-        hot_ids.update(memories.keys())
-        links.clear()
-        for key_str, val in data.get("links", {}).items():
-            src, tgt = key_str.split("||")
-            links[(src, tgt)] = val
+        links.clear()          # 先清空旧链接，再通过记忆加载重新填充
         wordweb.clear()
-        for key_str, val in data.get("wordweb", {}).items():
+
+        # 先恢复 memory.json 里的热记忆（若有）
+        from core.memory_engine import _load_memory_from_db
+        for mem_id in list(snap.get("memories", {}).keys()):
+            if mem_id in recent_ids or mem_id not in [r[0] for r in rows]:
+                loaded = _load_memory_from_db(mem_id)
+                if loaded is None:
+                    # 快照里的记忆已不在 SQLite，用快照数据兜底
+                    mem = snap["memories"][mem_id]
+                    memories[mem_id] = mem
+                    hot_ids.add(mem_id)
+        # 再从 SQLite 补齐最近活跃的记忆（确保热区达到上限）
+        from core.memory_engine import _batch_load_memories
+        need = [mid for mid in recent_ids if mid not in hot_ids]
+        _batch_load_memories(need[:hot_limit - len(hot_ids)])
+
+        # 链接与词网：memory.json 快照中的链接补充（batch 加载已拉取 SQLite 链接）
+        for key_str, val in snap.get("links", {}).items():
+            src, tgt = key_str.split("||")
+            if (src, tgt) not in links:
+                links[(src, tgt)] = val
+        for key_str, val in snap.get("wordweb", {}).items():
             a, b = key_str.split("||")
             wordweb[(a, b)] = val
-        from core.memory_engine import _build_word_to_memories
-        _build_word_to_memories()
 
-        # faiss持久化
-        from core.memory_engine import (
-            _faiss_index, _faiss_to_mem, _mem_to_faiss,
-            _init_faiss_index, _rebuild_faiss_index
-        )
-        import faiss
-        if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(FAISS_MAPPING_FILE):
-            # 读取索引
-            _faiss_index_global = faiss.read_index(FAISS_INDEX_FILE)
-            # 读取映射表
-            with open(FAISS_MAPPING_FILE, 'r', encoding='utf-8') as f:
-                loaded_mapping = json.load(f)
-            # 验证长度一致性
-            if len(loaded_mapping) == _faiss_index_global.ntotal:
-                # 赋值给全局变量
-                import core.memory_engine as me
-                me._faiss_index = _faiss_index_global
-                me._faiss_to_mem = loaded_mapping
-                # 重建反向映射
-                me._mem_to_faiss = {mem_id: idx for idx, mem_id in enumerate(loaded_mapping)}
-            else:
-                print("[持久化] faiss 索引与映射表不一致，将全量重建索引")
-                _rebuild_faiss_index()
-        else:
-            # 没有 faiss 文件，可能是首次运行或旧版本，全量重建
-            print("[持久化] 未找到 faiss 文件，全量重建索引")
-            _rebuild_faiss_index()
-        
+        from core.memory_engine import _build_word_to_memories, _rebuild_wordweb
+        _build_word_to_memories()
+        # 重建词网（共现网络）：memory.json 快照为空时，从热记忆内容重建，
+        # 保证词网规模不为 0、字词共现联想可用
+        _rebuild_wordweb()
+
+        # 3. faiss 索引始终从 SQLite 全量重建（保证检索覆盖全部记忆）
+        from core.memory_engine import _rebuild_faiss_index
+        _rebuild_faiss_index()
+
         if os.path.exists(METRICS_COUNTERS_FILE):
             with open(METRICS_COUNTERS_FILE, 'r', encoding='utf-8') as f:
                 metrics = json.load(f)
@@ -122,12 +157,29 @@ def load_all_data():
         _evict_cold_memories()
         _evict_cold_links()
 
+        print(f"[持久化] 加载完成：热记忆 {len(hot_ids)} 条，faiss 全量 {_get_faiss_count()} 条")
+
+
+def _get_hot_limit():
+    """获取热记忆上限（MAX_HOT_SIZE）。"""
+    from core.memory_engine import MAX_HOT_SIZE
+    return MAX_HOT_SIZE
+
+
+def _get_faiss_count():
+    """返回当前 faiss 索引向量数（用于日志）。"""
+    try:
+        from core.memory_engine import _faiss_index
+        return _faiss_index.ntotal if _faiss_index is not None else 0
+    except Exception:
+        return 0
+
 # ========== 对话状态持久化 ==========
 
 def save_state():
     """保存对话状态到 JSON 文件"""
     with _io_lock:
-        os.makedirs("data/test", exist_ok=True)
+        os.makedirs(runtime_paths.get_data_dir(), exist_ok=True)
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             from utils.dialogue_state import current_state
             json.dump(current_state, f, ensure_ascii=False, indent=2)
@@ -162,7 +214,7 @@ def append_dialogue(user_input: str, bot_reply: str):
         "bot": bot_reply
     }
     with _io_lock:
-        os.makedirs("data/test", exist_ok=True)
+        os.makedirs(runtime_paths.get_data_dir(), exist_ok=True)
         with open(DIALOGUE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

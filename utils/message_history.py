@@ -1,11 +1,22 @@
 import os, json, threading
 
+from core import runtime_paths
+
 _message_history = []
 _max_history = 200
 _lock = threading.Lock()
 _flushed_count = 0
 _HISTORY_FILE = "data/test/message_history.log"
 _STATE_FILE = "data/test/message_state.json"
+
+
+def _refresh_paths():
+    global _HISTORY_FILE, _STATE_FILE
+    _HISTORY_FILE = runtime_paths.file("message_history.log")
+    _STATE_FILE = runtime_paths.file("message_state.json")
+
+
+runtime_paths.register(_refresh_paths)
 
 
 def add_message(sender, content, source):

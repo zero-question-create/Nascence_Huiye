@@ -1,36 +1,50 @@
 # core/llm_interface.py
+# ========================================================================
+# LLM 统一接口层
+#
+# 本文件是系统所有"文本理解/生成 + 多模态(图片)理解"的唯一调用入口。
+# 在"本地化重构"后，这里不再直接依赖 DeepSeek/Lucis 双客户端，而是：
+#   - 文本能力   → core.model_backend.BACKENDS["text"].client()
+#   - 多模态图片 → core.model_backend.BACKENDS["multimodal"].client()
+#
+# 控制面板的模型开关决定每个能力使用"本地 llama.cpp"还是"外部 API"，
+# 每次调用都动态取客户端，因此运行中切换开关可即时生效（无需重启）。
+#
+# 注意：按需求已「舍弃音视频功能」，本文件不再提供
+#       describe_audio_from_path / describe_video_from_path。
+# ========================================================================
+
 import json
 import base64
 import os
 import re
 import aiofiles
 import asyncio
-import subprocess
-import tempfile
-#import requests    # 使用网络访问链接LLM（已弃用）
-from openai import OpenAI
 import datetime
+
 from utils.monitor import append_log
 from utils.dialogue_state import get_state, set_state
 
-from config.api_config import config
 from config.constants import BOT_NAME
 
-client = OpenAI(
-    api_key=config["primary_api_key"],
-    base_url=config["primary_base_url"],
-)
 
-client_ = OpenAI(
-    api_key=config["secondary_api_key"],
-    base_url=config["secondary_base_url"],
-)
+# ------------------------------------------------------------------------
+# 模型能力 → 后端名字映射
+# ------------------------------------------------------------------------
+def _text_client():
+    """获取当前文本能力对应的 OpenAI 客户端。"""
+    from core.model_backend import BACKENDS
+    return BACKENDS["text"].client()
 
-MODEL = config["primary_model"]
-MODEL_ = config["secondary_model"]
+
+def _vision_client():
+    """获取当前多模态(图片)能力对应的 OpenAI 客户端。"""
+    from core.model_backend import BACKENDS
+    return BACKENDS["multimodal"].client()
 
 
 def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ"):
+    """把一轮对话写入历史（供上下文与 WebUI 展示）。"""
     from utils.message_history import add_message
     if user_text:
         add_message(sender_name, user_text, source)
@@ -39,11 +53,13 @@ def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ"
 
 
 def load_dialogue_history():
+    """从磁盘加载历史对话。"""
     from utils.message_history import load_state
     load_state()
 
+
 def get_history_context() -> str:
-    """生成格式化的对话历史（xx说 / 我说）"""
+    """生成格式化的对话历史（xx说 / 我说）。"""
     from utils.message_history import get_recent
     text = get_recent(10)
     if not text:
@@ -52,25 +68,41 @@ def get_history_context() -> str:
     append_log(result)
     return result
 
+
 def call_api_thinking(messages, max_tokens=8000):
-    """
-    LLM思考模式唯一外部调用接口
-    """
+    """LLM 思考模式唯一外部调用接口（文本能力，动态路由）。"""
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.1,
-            stream=False,
-            reasoning_effort="high",
-            extra_body={"thinking": {"type": "enabled"}}
-        )
+        client = _text_client()
+        kwargs = {
+            "model": _current_text_model(),
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as api_err:
+            # 降级去除 temperature 兼容部分特殊端点
+            kwargs.pop("temperature", None)
+            response = client.chat.completions.create(**kwargs)
+
         content = response.choices[0].message.content
         return content.strip() if content else None
     except Exception as e:
         print(f"[API Error] {e}")
+        append_log(f"[API Error] {e}")
         return None
+
+
+def _current_text_model() -> str:
+    """返回当前文本能力使用的模型名（本地默认 / 外部 API 模型名）。"""
+    from core.model_backend import BACKENDS
+    backend = BACKENDS["text"]
+    if backend.use_default() and backend.is_local_ready():
+        return backend.local_model.stem  # 本地默认模型
+    return backend.api_model() or "default"
+
 
 def decompose_input(user_input: str) -> tuple:
     """
@@ -115,15 +147,21 @@ def decompose_input(user_input: str) -> tuple:
     append_log(str(user_input))
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=8000,
-            temperature=0.1,
-            stream=False,
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        client = _text_client()
+        kwargs = {
+            "model": _current_text_model(),
+            "messages": messages,
+            "max_tokens": 4000,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            response = client.chat.completions.create(
+                **kwargs,
+                response_format={"type": "json_object"}
+            )
+        except Exception:
+            response = client.chat.completions.create(**kwargs)
         result = response.choices[0].message.content
     except Exception as e:
         append_log(f"[API Error] {e}")
@@ -186,6 +224,7 @@ def decompose_input(user_input: str) -> tuple:
     append_log(f"记忆：{memories}\n模式：{mode}\n状态：{new_state}\n关键词：{keywords}")
 
     return memories, mode, new_state, keywords
+
 
 def _safe_json_parse(text: str) -> dict:
     """
@@ -365,13 +404,15 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
 
 
 async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁，禁止猜测或识别人物等信息，只要客观陈述") -> str:
+    """从本地路径读取图片并交给多模态(图片)能力理解。
+
+    注意：本项目已舍弃音视频，仅保留图片理解。
+    本地模式使用 Qwen2.5-VL（llama.cpp OpenAI 兼容接口），
+    外部模式使用用户配置的多模态 API。
     """
-    从本地路径读取图片
-    """
-    # 检查文件是否存在
     if not os.path.exists(image_path):
         return f"[图片文件不存在: {image_path}]"
-    
+
     try:
         # 异步读取文件并转 Base64
         loop = asyncio.get_event_loop()
@@ -379,7 +420,7 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
             async with aiofiles.open(image_path, "rb") as f:
                 data = await f.read()
                 return base64.b64encode(data).decode('utf-8')
-        
+
         base64_str = await read_and_encode()
         # 推测 MIME 类型（根据扩展名）
         ext = os.path.splitext(image_path)[1].lower()
@@ -389,27 +430,34 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
             '.webp': 'image/webp', '.bmp': 'image/bmp'
         }
         mime_type = mime_map.get(ext, 'image/jpeg')
-        
-        # 调用 API
-        response = client_.chat.completions.create(
-            model=MODEL_,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_str}"
-                            }
-                        },
-                    ],
-                }
-            ],
-            stream=False,
-            max_tokens=10000,
-        )
+
+        # 动态获取多模态客户端与模型名
+        from core.model_backend import BACKENDS
+        backend = BACKENDS["multimodal"]
+        client = _vision_client()
+        model = backend.local_model.stem if (backend.use_default() and backend.is_local_ready()) else backend.api_model()
+
+        # 在事件循环中执行同步的 LLM 调用，避免阻塞 asyncio
+        def _call():
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{base64_str}"},
+                            },
+                        ],
+                    }
+                ],
+                stream=False,
+                max_tokens=4096,
+            )
+
+        response = await asyncio.to_thread(_call)
         content = response.choices[0].message.content
         reply = content.strip() if content else ""
         append_log("="*30+"多模态理解"+"="*30)
@@ -417,85 +465,3 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
         return reply
     except Exception as e:
         return f"[图片识别失败: {e}]"
-
-async def describe_audio_from_path(audio_path: str, prompt: str = "请描述这段音频内容") -> str:
-    return await _describe_media_from_path(audio_path, "audio", prompt)
-
-async def describe_video_from_path(video_path: str, prompt: str = "请描述这段视频内容") -> str:
-    return await _describe_media_from_path(video_path, "video", prompt)
-
-async def _describe_media_from_path(file_path: str, media_type: str, prompt: str) -> str:
-    """通用媒体描述（供音频/视频调用）"""
-    if not os.path.exists(file_path):
-        return f"[文件不存在: {file_path}]"
-    try:
-        source_path = file_path
-        converted_path = None
-        if media_type == "audio":
-            source_path = await _convert_audio_to_wav(file_path)
-            converted_path = source_path if source_path != file_path else None
-
-        # 读取并编码
-        async with aiofiles.open(source_path, "rb") as f:
-            data = await f.read()
-            base64_str = base64.b64encode(data).decode('utf-8')
-        if media_type == "audio":
-            content = [
-                {"type": "text", "text": prompt},
-                {"type": "input_audio", "input_audio": {"data": base64_str, "format": "wav"}},
-            ]
-        else:
-            ext = os.path.splitext(file_path)[1].lower()
-            mime_map = {
-                '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo'
-            }
-            mime_type = mime_map.get(ext, 'video/mp4')
-            content = [
-                {"type": "text", "text": prompt},
-                {"type": "video_url", "video_url": {"url": f"data:{mime_type};base64,{base64_str}"}},
-            ]
-
-        response = client_.chat.completions.create(
-            model=MODEL_,
-            messages=[{"role": "user", "content": content}],
-            stream=False,
-            max_tokens=10000,
-        )
-        response_content = response.choices[0].message.content
-        reply = response_content.strip() if response_content else ""
-        append_log("="*30+"多模态理解"+"="*30)
-        append_log(reply)
-        return reply
-    except Exception as e:
-        print(f"[API ERROR] 多模态解析：{e}")
-        return f"[{media_type}识别失败: {e}]"
-    finally:
-        if 'converted_path' in locals() and converted_path:
-            try:
-                os.remove(converted_path)
-            except OSError:
-                pass
-
-
-async def _convert_audio_to_wav(audio_path: str) -> str:
-    """将 NapCat 常见的 AMR/音频文件转换为 Lucis 可接受的 WAV。"""
-    if os.path.splitext(audio_path)[1].lower() == ".wav":
-        return audio_path
-
-    fd, wav_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    try:
-        await asyncio.to_thread(
-            subprocess.run,
-            ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        return wav_path
-    except Exception:
-        try:
-            os.remove(wav_path)
-        except OSError:
-            pass
-        raise RuntimeError("语音格式转换失败，请确认 ffmpeg 已安装且支持 NapCat 音频格式")

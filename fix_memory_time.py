@@ -62,7 +62,7 @@ def fix_all():
     print("=== 修复完成，请重启 Bot ===")
 
 if __name__ == "__main__":
-    # 初始化必要的模块（虚拟时钟、Ollama 等可跳过，但我们只需要改数据，不需要模型）
+    # 初始化必要的模块（虚拟时钟等可跳过，但我们只需要改数据，不需要模型）
     # 确保 clock 已初始化，以免后续调用出错
     from core.virtual_clock import clock
     import time

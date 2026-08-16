@@ -12,22 +12,47 @@ venv/
 
 # 配置文件（只忽略敏感凭据，保留 API 读取类 + 示例框架）
 config/api_config.json
-config/qq_manifest.json
 config/__pycache__/
 
 # 运行数据（记忆、向量索引、日志等）
-data/__pycache__
-data/test
+data/
 
-# 本地 Ollama 部署（大模型二进制）
-ollama/
+# 用户与会话数据（含密码哈希与会话 token，绝不入库）
+gateway/users.json
+gateway/sessions.json
+
+# ZCode 工具文件
+.zcode/
+
+# 本地大模型（llama.cpp 二进制 + GGUF 模型文件）
+llama/
+models/
 
 # 运行时产物
 run/logs/
-run/control_panel.lock
+run/*.lock
 run/bat_temp.bat
-run/qt-plugins/
-run/lib/
+
+# 验收截图（开发测试产物）
+run/screenshots/
+run/screenshots_realtime/
+
+# 测试脚本（开发/验收工具，不入库）
+run/real_e2e_*.py
+run/verify_*.py
+run/capture_*.py
+run/*_server.log
+run/probe_server.log
+capture_client_screenshots.py
+capture_nav_light.py
+capture_all_pages_clean.py
+run_browser_verification.py
+verify_shutdown_fix.py
+test_ws_speed.py
+test_*.py
+test_*
+run_job_test.py
+start_gbk.bat
 
 # IDE
 .vscode/

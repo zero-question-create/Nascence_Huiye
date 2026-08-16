@@ -1,127 +1,97 @@
 #!/bin/bash
 # ============================================================
-# Nascence 辉夜 一键启动脚本
-# 所有环境/文件均位于项目文件夹内，不污染系统环境
+# NASCENCE 辉夜 - 一键启动脚本（Linux/macOS）
+# 所有环境文件均位于项目文件夹内，不污染系统环境
+# 启动后同时打开 客户端(/) 与 管理台(/admin) 两个标签页
 # ============================================================
-
-set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
 echo "=========================================="
-echo "  Nascence 辉夜 - 启动中..."
+echo "  NASCENCE 辉夜 - 启动 Web 服务"
+echo "  客户端: http://127.0.0.1:8787/"
+echo "  管理台: http://127.0.0.1:8787/admin"
 echo "=========================================="
 
-# ---------- 1. 检查 venv ----------
-if [ ! -f "venv/bin/python3" ]; then
-    echo "[!] 虚拟环境未找到，正在创建..."
-    python3 -m venv venv --without-pip
+# ---------- 1. 检查 venv，缺失则自动创建并安装依赖 ----------
+if [ ! -f "venv/bin/python" ]; then
+    echo "[*] 虚拟环境未找到，正在创建..."
+    if ! python3 -m venv venv --without-pip 2>/dev/null; then
+        if ! python3 -m venv venv; then
+            echo "[!] 创建虚拟环境失败，请检查 python3-venv 是否已安装" >&2
+            exit 1
+        fi
+    fi
     source venv/bin/activate
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3 > /dev/null 2>&1
+    # 引导 pip（--without-pip 场景）
+    if ! pip --version >/dev/null 2>&1; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | python3 || {
+            echo "[!] pip 引导失败，请手动安装 pip" >&2
+            exit 1
+        }
+    fi
     pip install -r requirements.txt -q -i https://mirrors.huaweicloud.com/repository/pypi/simple/ \
         || { echo "[!] 华为源安装失败，尝试切换清华源..."; pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple \
-             || { echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."; pip install -r requirements.txt -q -i https://pypi.org/simple/; }; }
+             || { echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."; pip install -r requirements.txt -q -i https://pypi.org/simple/ \
+                  || { echo "[!] 依赖安装失败，请检查 requirements.txt" >&2; exit 1; }; }; }
     echo "[√] 虚拟环境已创建，依赖已安装"
 else
     echo "[√] 虚拟环境正常"
+    source venv/bin/activate
 fi
-
-source venv/bin/activate
 
 # ---------- 2. 确保数据目录 ----------
 mkdir -p data/test
 
-# ---------- 3. 启动 Ollama ----------
-OLLAMA_BIN="$PROJECT_DIR/ollama/bin/ollama"
-OLLAMA_PID=""
+# ---------- 3. 确保 llama.cpp 与模型 ----------
+if [ ! -f "llama/bin/llama-server" ]; then
+    echo "[*] llama.cpp 未找到，正在下载..."
+    bash "$PROJECT_DIR/run/install_llama.sh" || echo "[!] llama.cpp 安装失败，请手动安装"
+fi
+mkdir -p models
 
-start_ollama() {
-    if [ -f "$OLLAMA_BIN" ]; then
-        export OLLAMA_HOME="$PROJECT_DIR/ollama/home"
-        mkdir -p "$OLLAMA_HOME"
-        
-        # 检查是否已有 Ollama 在运行
-        if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            echo "[√] Ollama 服务已在运行"
-            return 0
-        fi
-        
-        echo "[*] 启动本地 Ollama 服务..."
-        "$OLLAMA_BIN" serve > /dev/null 2>&1 &
-        OLLAMA_PID=$!
-        
-        # 等待 Ollama 就绪
-        for i in $(seq 1 30); do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                echo "[√] Ollama 服务已就绪"
-                return 0
-            fi
-            sleep 1
-        done
-        echo "[!] Ollama 启动超时"
-        return 1
-    else
-        echo "[!] Ollama 二进制未找到 ($OLLAMA_BIN)"
-        echo "[!] 请确保系统已安装 Ollama 或重新运行 setup.sh"
-        return 1
+# ---------- 4. 端口 8787 预检（已在运行则直接开浏览器） ----------
+if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":8787 ") \
+   || (command -v netstat >/dev/null 2>&1 && netstat -ltn 2>/dev/null | grep -q ":8787 "); then
+    echo "[*] 检测到 8787 端口已被占用，服务可能已在运行，直接打开浏览器。"
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "http://127.0.0.1:8787/" >/dev/null 2>&1
+        xdg-open "http://127.0.0.1:8787/admin" >/dev/null 2>&1
+    elif command -v open >/dev/null 2>&1; then
+        open "http://127.0.0.1:8787/"
+        open "http://127.0.0.1:8787/admin"
     fi
-}
-
-start_ollama || echo "[!] Ollama 启动失败，请手动启动"
-
-# ---------- 4. 检查并拉取 Embedding 模型 ----------
-if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    MODEL="shaw/dmeta-embedding-zh"
-    if ! curl -s http://localhost:11434/api/tags | grep -q "dmeta-embedding-zh"; then
-        echo "[*] 正在拉取 Embedding 模型: $MODEL ..."
-        curl -s -X POST http://localhost:11434/api/pull -d "{\"model\":\"$MODEL\"}" > /dev/null 2>&1
-        echo "[√] Embedding 模型已就绪"
-    else
-        echo "[√] Embedding 模型已存在"
-    fi
+    exit 0
 fi
 
-# ---------- 5. 启动模式选择 ----------
-cleanup() {
-    echo ""
-    echo "[*] 正在关闭服务..."
-    if [ -n "$OLLAMA_PID" ]; then
-        kill "$OLLAMA_PID" 2>/dev/null || true
+# ---------- 5. 启动 WebUI（延迟打开两个标签页） ----------
+echo ""
+echo "=========================================="
+echo "  正在启动 Web 服务..."
+echo "  客户端: http://127.0.0.1:8787/"
+echo "  管理台: http://127.0.0.1:8787/admin"
+echo "=========================================="
+
+# 延迟 2 秒等端口绑定后再打开浏览器
+(
+    sleep 2
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "http://127.0.0.1:8787/" >/dev/null 2>&1
+        xdg-open "http://127.0.0.1:8787/admin" >/dev/null 2>&1
+    elif command -v open >/dev/null 2>&1; then
+        open "http://127.0.0.1:8787/"
+        open "http://127.0.0.1:8787/admin"
     fi
-    echo "[√] 已退出"
-    exit 0
-}
-trap cleanup SIGINT SIGTERM
+) &
 
-echo ""
-echo "=========================================="
-echo "  请选择启动模式:"
-echo "    1) CLI 命令行交互模式 (main.py)"
-echo "    2) QQ Bot 模式 (qq_bot.py)"
-echo "    3) 自我训练模式 (self_training.py)"
-echo "=========================================="
-echo ""
-read -p "输入选择 (1/2/3，默认 1): " MODE_CHOICE
-MODE_CHOICE=${MODE_CHOICE:-1}
+python3 webui.py
+CODE=$?
 
-case "$MODE_CHOICE" in
-    1)
-        echo "[*] 启动 CLI 模式..."
-        python3 main.py
-        ;;
-    2)
-        echo "[*] 启动 QQ Bot 模式..."
-        python3 qq_bot.py
-        ;;
-    3)
-        echo "[*] 启动自我训练模式..."
-        python3 self_training.py
-        ;;
-    *)
-        echo "[!] 无效选择，启动 CLI 模式..."
-        python3 main.py
-        ;;
-esac
+if [ "$CODE" -ne 0 ]; then
+    echo "[ERROR] 服务异常退出，代码: $CODE" >&2
+else
+    echo "[√] 服务已正常退出"
+fi
 
-cleanup
+exit "$CODE"

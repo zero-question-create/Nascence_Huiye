@@ -41,15 +41,17 @@ from utils.monitor import monitor_start
 
 # 批量注入函数
 def cold_start_batch_injection():
-    """批量注入冷启动记忆，用于初始化记忆库"""
-    try:
-        from data.cold_start_prompts import COLD_START_DIALOGS
-    except (ImportError, ModuleNotFoundError):
-        print("[冷启动] 未找到 data/cold_start_prompts.py，跳过冷启动")
-        return
+    """批量注入冷启动记忆，用于初始化记忆库。
+
+    冷启动对话内联于此。
+    """
+    COLD_START_DIALOGS = [
+        ("你好，请问你是谁？", f"我是{BOT_NAME}，很高兴认识你。"),
+        (f"{BOT_NAME}，你叫什么名字？", f"我叫{BOT_NAME}。"),
+    ]
     from core.memory_engine import create_memory, add_link
     from utils.dialogue_state import set_state, get_state
-    
+
     for user_text, bot_text in COLD_START_DIALOGS:
         user_mem_id = create_memory(user_text, half_life=7*24*3600)
         bot_mem_id = create_memory(f"我说：{bot_text}", half_life=7*24*3600)
@@ -65,8 +67,8 @@ def cold_start_batch_injection():
 
 def main():
     monitor_start()
+    clock.enable_qq_mode()
     get_model()
-    print(f"当前时间倍速：{clock.set_speed(144)}")
     load_all_data()
     load_state()
     global memories
@@ -85,13 +87,6 @@ def main():
                 continue
             if user_input.lower() == "exit":            # 退出操作
                 break
-            elif user_input.lower() == "speed":         # 调整时间倍速
-                speed = int(input("输入调整后的倍速："))
-                if speed > 0:
-                    print(f"当前时间倍速：{clock.set_speed(speed)}")
-                else:
-                    print("调整失败")
-                continue
             elif user_input.lower() == "move":
                 from utils.persistence import migrate_json_to_sqlite
                 migrate_json_to_sqlite()
@@ -104,6 +99,8 @@ def main():
     finally:
         save_all_data()
         save_state()
+        from core.model_backend import stop_all_backends
+        stop_all_backends()   # 结束本次运行的 llama-server 进程
         print("再见。")
 
 if __name__ == "__main__":

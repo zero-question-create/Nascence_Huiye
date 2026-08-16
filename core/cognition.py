@@ -405,11 +405,11 @@ async def process_dialogue(augmented_input: str, extra_context: str = "") -> Tup
     if extra_context:
         full_input = f"{extra_context}\n{augmented_input}"
 
-    # 解析当前说话人（从增强输入中提取）
+    # 解析当前说话人（从增强输入中提取；兼容 "xx说：" 与旧版 "[xx 对 yy 说]：" 两种格式）
     current_speaker = None
-    match = re.match(r"^\[(.+?) 对 .+? 说\]：", augmented_input)
+    match = re.match(r"^(?:\[(.+?) 对 .+? 说\]：|(.+?)说：)", augmented_input)
     if match:
-        current_speaker = match.group(1)
+        current_speaker = match.group(1) or match.group(2)
 
     loop = asyncio.get_event_loop()
     reply, user_input = await loop.run_in_executor(
@@ -443,7 +443,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     关键词来源：上一轮的回复（心理活动或发送消息）与接收到的消息，
     均以 jieba 搜索引擎模式分词后进入消费队列，每轮取空队列处理全部关键词。
 
-    在 NapCat 连接后启动，断开时 request_graceful_stop 触发：
+    由 cognition_runner 独立线程启动；request_graceful_stop 触发优雅停止：
       当前轮继续执行到回复输出，跳过复搜后退出。
     """
     global _keyword_queue, _shallow_pool, _cognitive_running, _graceful_stop
@@ -681,6 +681,12 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # ============================
             # Step 4: 拼接层处理
             # ============================
+            # 严格刹停：停止信号到达且本轮尚未进入 verbalize（最耗时的阶段）时，
+            # 立即退出，不再消费队列关键词、不再开始新一轮 → 保证"本轮内刹停"。
+            if _graceful_stop:
+                append_log("[认知循环] 收到停止信号，跳过本轮 verbalize，立即退出")
+                break
+
             state = get_state()
 
             pinned_memories = dialogue_memories + ([prev_mem] if prev_mem else []) + ([drowsy_mem] if drowsy_mem else [])
@@ -725,13 +731,16 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
 
             # ============================
-            # Step 6: 发送消息（若应发言）
+            # Step 6: 输出发言（解耦：不再依赖外部 send_func）
             # ============================
-            if should_speak and thought_text and send_func and target_group_id:
-                await send_func(target_group_id, thought_text)
+            # 发言统一写入历史/记忆库，并推送到对话测试页（BUS）。
+            # send_func/target_group_id 仅作为可选的外部发送钩子，保持向后兼容。
+            if should_speak and thought_text:
                 add_to_history(None, None, thought_text)
                 from utils.event_bus import BUS
-                BUS.message.emit(BOT_NAME, thought_text, "QQ")
+                BUS.emit_message(BOT_NAME, thought_text, "认知")
+                if send_func and target_group_id:
+                    await send_func(target_group_id, thought_text)
 
             # ============================
             # Step 7: 优雅停止检查（不复搜）

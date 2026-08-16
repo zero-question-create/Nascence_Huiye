@@ -5,7 +5,17 @@ import threading    # 主要运用：发散线程
 import random
 import datetime
 
+from core import runtime_paths
+
 STATE_FILE = "data/test/clock_state.txt"     # 持久化保存路径
+
+
+def _refresh_paths():
+    global STATE_FILE
+    STATE_FILE = runtime_paths.file("clock_state.txt")
+
+
+runtime_paths.register(_refresh_paths)
 
 
 class VirtualClock:

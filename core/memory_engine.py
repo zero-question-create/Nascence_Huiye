@@ -5,7 +5,6 @@ import jieba
 import os
 import time
 import json
-import requests
 import faiss
 import numpy as np
 import sqlite3
@@ -18,8 +17,7 @@ _data_lock = threading.RLock()
 
 # ========== 配置常量 ==========
 from config.api_config import config
-OLLAMA_BASE_URL = config["ollama_base_url"]
-OLLAMA_EMBED_MODEL = config["ollama_embed_model"]
+from core import runtime_paths
 DB_FILE = "data/test/memory.db"     # 冷热数据交换保存地址
 SIMILARITY_THRESHOLD = 0.22         # 建立语义链接的最低相似度
 DEDUP_THRESHOLD = 0.92              # 余弦相似度超过此值视为重复
@@ -33,7 +31,7 @@ RETRIEVAL_DEDUP_THRESHOLD = 0.75    # 检索结果去冗余弦相似度
 RETRIEVAL_MIN_EFFECTIVE = 0.02      # 有效相似度最低门槛
 WORDWEB_WINDOW_SIZE = 5             # 滑动窗口大小（以词为单位）
 WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与后期扩散
-EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
+EMBED_DIM = config.get("embed_dim", 768)  # 语义向量维度（可由「维护」页维度重建工具更新）
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
 MAX_HOT_SIZE = 1000                 # 热记忆节点硬上限，防止爆炸
@@ -56,7 +54,7 @@ _faiss_to_mem = []                  # faiss_id → memory_id
 _mem_to_faiss = {}                  # memory_id → faiss_id
 _db_conn = None                     # 全局数据库实例
 hot_ids = set()                     # 当前在内存中的记忆 ID
-_last_created_ids = []              # 存储本轮新增的记忆 ID（QQ接口：用于追踪本轮对话新创建的记忆（供 QQ bot 获取））
+_last_created_ids = []              # 存储本轮新增的记忆 ID（供上层追踪本轮对话新创建的记忆）
 word_to_memories = {}               # {词: set(memory_id)}
 
 # ========== 每日指标计数器 ==========
@@ -67,7 +65,7 @@ _count_link_created = 0
 _count_link_deleted = 0
 _count_wordweb_created = 0
 
-# 其他指标计数器（在 qq_bot 中递增）
+# 其他指标计数器（由上层模块递增）
 _count_message_sent = 0
 _count_self_ref = 0
 _count_active_attempt = 0
@@ -91,6 +89,16 @@ def _bump_link_deleted():
 # 日志文件路径
 METRICS_LOG_FILE = "data/test/metrics_daily.jsonl"
 METRICS_BASELINE_FILE = "data/test/metrics_baseline.json"
+
+
+def _refresh_paths():
+    global DB_FILE, METRICS_LOG_FILE, METRICS_BASELINE_FILE
+    DB_FILE = runtime_paths.file("memory.db")
+    METRICS_LOG_FILE = runtime_paths.file("metrics_daily.jsonl")
+    METRICS_BASELINE_FILE = runtime_paths.file("metrics_baseline.json")
+
+
+runtime_paths.register(_refresh_paths)
 
 def _write_daily_metrics():
     """每日24点调用：计算今日增量，写入日志，更新基线"""
@@ -420,82 +428,89 @@ def _build_word_to_memories():
     print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词")
 
 
-# ========== 模型加载 ==========
+# ========== 模型加载（语义向量：走 embed 后端） ==========
 def _ensure_embedding_model():
-    """确保 embedding 模型已拉取；缺失则通过 Ollama API 自动拉取。"""
-    import requests
-    base_name = OLLAMA_EMBED_MODEL.split(":")[0]
-    try:
-        tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10).json()
-        models = [m.get("name", "") for m in tags.get("models", [])]
-        if any(m == OLLAMA_EMBED_MODEL or m.startswith(base_name) for m in models):
-            return
-    except Exception:
-        # 列表请求失败（Ollama 未就绪等）则跳过自动拉取，交给后续错误提示
-        return
+    """确保 embedding 能力可用。
 
-    print(f"[Ollama] 未检测到模型 {OLLAMA_EMBED_MODEL}，正在自动拉取（约400MB，首次可能较慢）...")
-    try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/pull",
-            json={"model": OLLAMA_EMBED_MODEL},
-            timeout=1800,
-        )
-        resp.raise_for_status()
-        print("[Ollama] 模型拉取完成")
-    except Exception as e:
-        print(f"[Ollama] 模型拉取失败: {e}")
+    本地重构后，embedding 由 core.model_backend 的 embed 后端统一管理：
+      - 配置 use_default=True 时由 llama.cpp 加载 qwen3-embedding GGUF；
+      - 否则使用用户配置的外部 API。
+    此函数仅做一次预热检查并记录状态，不阻塞启动。
+    """
+    from core.model_backend import BACKENDS
+    backend = BACKENDS["embed"]
+    if backend.use_default():
+        if not backend.is_local_ready():
+            # 本地模型尚未就绪：尝试启动（幂等）
+            ok = backend.start_local(wait=True)
+            if ok:
+                print("[embed] 本地 embedding 模型已就绪")
+            else:
+                print("[embed] 本地 embedding 模型启动失败，将尝试使用外部 API（若已配置）")
+    else:
+        print("[embed] 配置为外部 API，跳过本地模型加载")
 
 
 def get_model():
+    """启动时调用：预热文本 / embedding 两个能力（多模态按需懒加载）。"""
     print("正在启动语义模型")
     try:
         _ensure_embedding_model()
         text_to_vector("启动")
     except Exception as e:
-        print(f"[Ollama] 模型预热失败: {e}")
+        print(f"[模型] embedding 预热失败: {e}")
     print("语义模型启动完成！")
+
 
 def text_to_vector(text: str) -> list:
     """
-    使用 Ollama 的 API 将文本转换为向量。
-    兼容新旧端点：新版 Ollama 用 /api/embed（旧 /api/embeddings 已移除），
-    先尝试新版，404 时回退旧版。
-    前提：Ollama 已在本地运行，且已通过 `ollama pull shaw/dmeta-embedding-zh` 拉取模型。
+    将文本转换为语义向量。
+
+    通过 core.model_backend 的 embed 后端：
+      - 本地模式：llama.cpp 的 OpenAI 兼容 /v1/embeddings 接口（qwen3-embed-0.6b）
+      - 外部模式：用户配置的 embedding API（OpenAI 兼容格式）
+    返回 EMBED_DIM（config.embed_dim）维向量列表。
     """
-    url_new = f"{OLLAMA_BASE_URL}/api/embed"
-    url_old = f"{OLLAMA_BASE_URL}/api/embeddings"
-    try:
-        # 新版端点 /api/embed
-        resp = requests.post(url_new, json={"model": OLLAMA_EMBED_MODEL, "input": text}, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            embeddings = data.get("embeddings")
-            if embeddings:
-                return embeddings[0]
-        # 旧版端点 /api/embeddings（新版不可用时回退）
-        resp = requests.post(url_old, json={"model": OLLAMA_EMBED_MODEL, "prompt": text}, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        embedding = data.get("embedding")
-        if embedding is None:
-            raise ValueError("Ollama 返回的数据中未找到 'embedding' 字段")
-        return embedding
-    except requests.exceptions.ConnectionError:
-        print("[Ollama] 连接失败，请确认 Ollama 服务是否已启动（默认地址：http://localhost:11434）")
-        raise
-    except requests.exceptions.Timeout:
-        print("[Ollama] 请求超时，请检查网络或 Ollama 服务响应")
-        raise
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            print(f"[Ollama] 模型不存在或未拉取，请运行: ollama pull {OLLAMA_EMBED_MODEL}")
-        else:
-            print(f"[Ollama] HTTP 错误: {e}")
-        raise
-    except (KeyError, ValueError) as e:
-        print(f"[Ollama] 解析响应失败: {e}")
-        raise
+    from core.model_backend import BACKENDS
+    backend = BACKENDS["embed"]
+
+    if backend.use_default() and backend.is_local_ready():
+        # 本地 llama.cpp embedding（带 503 重试容错）
+        client = backend.client()
+        model = backend.local_model.stem
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = client.embeddings.create(model=model, input=text)
+                embedding = resp.data[0].embedding
+                if not embedding:
+                    raise ValueError("embedding 返回为空")
+                return list(embedding)
+            except Exception as e:
+                if "503" in str(e) and attempt < max_retries - 1:
+                    time.sleep(1.0)
+                    continue
+                raise e
+
+    # 外部 API 模式（OpenAI 兼容）
+    if backend.use_default() and not backend.is_local_ready():
+        # 本地模型未就绪但开关开着：尝试启动一次；失败则回落外部 API
+        backend.start_local(wait=True)
+        if backend.is_local_ready():
+            return text_to_vector(text)
+    url = backend.api_base_url()
+    model = backend.api_model()
+    if not (url and model):
+        raise RuntimeError(
+            "[embed] 本地默认模型未就绪，且未配置外部 API。请运行 setup 脚本下载模型，"
+            "或在控制面板的「模型」页配置 embedding API。"
+        )
+    client = backend.client()
+    resp = client.embeddings.create(model=model, input=text)
+    embedding = resp.data[0].embedding
+    if not embedding:
+        raise ValueError("外部 embedding API 返回为空")
+    return list(embedding)
 
 def cosine_similarity(vec_a: list, vec_b: list) -> float:
     a = np.array(vec_a)
@@ -537,6 +552,29 @@ def _grow_wordweb(content: str, mem_id: str):
             word_to_memories[word] = set()
         word_to_memories[word].add(mem_id)
 
+
+def _rebuild_wordweb():
+    """从当前热记忆的内容重建词网（共现网络）。
+
+    冷热分离重构后，wordweb 只存在于内存与 memory.json 热快照中，
+    SQLite 并不持久化词网。若 memory.json 快照为空（例如冷热分离
+    迁移后、或历史快照被覆盖），历史记忆不会自动重织词网，导致
+    「词网规模」显示 0。此函数在加载时对热记忆批量重建词网，
+    确保联想（retrieve_and_diffuse 的字词共现路径）可用。
+    """
+    global wordweb, _count_wordweb_created
+    wordweb.clear()
+    # 不重复计数（重建视为恢复，不计入"今日新增"指标）
+    saved_counter = _count_wordweb_created
+    for mem_id, mem in list(memories.items()):
+        try:
+            _grow_wordweb(mem.get("content", ""), mem_id)
+        except Exception:
+            continue
+    # 恢复计数器：重建不改变"创建总数"
+    _count_wordweb_created = saved_counter
+    print(f"[词网] 从 {len(memories)} 条热记忆重建完成，共 {len(wordweb)} 组共现")
+
 # ========== faiss索引操作 ==========
 def _init_faiss_index():
     """初始化或加载 faiss 索引"""
@@ -561,6 +599,34 @@ def _rebuild_faiss_index():
             _faiss_to_mem.append(mem_id)
             _mem_to_faiss[mem_id] = faiss_id
         print(f"[faiss] 从 SQLite 全量重建完成，共 {_faiss_index.ntotal} 条向量")
+
+
+def reset_engine_state():
+    """切换数据目录（用户）时重置全部内存状态，供网关按用户隔离。
+
+    关闭旧 SQLite 连接、清空热记忆/链接/词网/faiss，并重新初始化空索引。
+    之后需调用 utils.persistence.load_all_data() 加载新目录的数据。
+    """
+    global _db_conn, memories, links, pending_deletion, wordweb, hot_ids
+    global _last_created_ids, word_to_memories, _faiss_index, _faiss_to_mem, _mem_to_faiss
+    with _data_lock:
+        if _db_conn is not None:
+            try:
+                _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
+        memories.clear()
+        links.clear()
+        pending_deletion.clear()
+        wordweb.clear()
+        hot_ids.clear()
+        _last_created_ids.clear()
+        word_to_memories.clear()
+        _faiss_to_mem = []
+        _mem_to_faiss = {}
+        _init_faiss_index()
+    print("[记忆引擎] 状态已重置，等待加载新数据目录")
 
 # ========== 记忆核心操作 ==========
 def generate_memory_id() -> str:
