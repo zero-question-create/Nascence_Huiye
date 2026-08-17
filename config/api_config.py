@@ -113,7 +113,11 @@ def _deep_default(cfg):
 
 
 def load_config():
-    """读取磁盘配置并补齐默认值；若配置为旧版则自动迁移一次。"""
+    """读取磁盘配置并补齐默认值；若配置为旧版则自动迁移一次。
+
+    首次运行时配置文件不存在：直接生成一份默认配置并写盘，
+    方便无图形界面的服务器直接编辑 config/api_config.json 生效。
+    """
     cfg = {}
     if os.path.exists(CONFIG_FILE):
         try:
@@ -121,6 +125,15 @@ def load_config():
                 cfg = json.load(f)
         except (json.JSONDecodeError, OSError):
             cfg = {}
+    else:
+        # 配置文件缺失：生成默认配置（含 API Key 占位），供直接编辑
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            save_config(cfg)
+            print(f"[配置] 首次运行，已生成默认配置文件: {CONFIG_FILE}")
+        except Exception as e:
+            print(f"[配置] 生成默认配置文件失败: {e}")
 
     # 旧版配置迁移：检测到旧键且新结构为空时，把旧键映射到新键
     if "backends" not in cfg and any(k in cfg for k in _LEGACY_MIGRATION):
