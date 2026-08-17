@@ -290,6 +290,33 @@ class ModelBackend:
     # ------------------------------------------------------------------
     # 启动 / 停止本地模型
     # ------------------------------------------------------------------
+    def _ensure_llama_runtime(self) -> bool:
+        """确保 llama-server 可执行文件存在。
+
+        仅在真正要启动本地模型时调用：缺失时提示用户并尝试运行安装脚本
+        （run/install_llama.sh / .ps1，幂等，已存在则跳过），而非强制预下载。
+        """
+        if LLAMA_SERVER_EXE.exists():
+            return True
+        logger.warning("[%s] 未找到 llama-server（%s），正在尝试运行安装脚本下载...",
+                       self.name, LLAMA_SERVER_EXE)
+        script = PROJECT_DIR / "run" / ("install_llama.ps1" if sys.platform == "win32" else "install_llama.sh")
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                    cwd=PROJECT_DIR, timeout=3600,
+                )
+            else:
+                subprocess.run(["bash", str(script)], cwd=PROJECT_DIR, timeout=3600)
+        except Exception as e:
+            logger.error("[%s] 安装脚本执行失败: %s", self.name, e)
+        if LLAMA_SERVER_EXE.exists():
+            logger.info("[%s] llama-server 已就绪", self.name)
+            return True
+        logger.error("[%s] llama-server 仍不可用，请手动运行 setup 脚本下载", self.name)
+        return False
+
     def start_local(self, wait=True) -> bool:
         """启动本地 llama-server 并加载模型。
 
@@ -306,13 +333,19 @@ class ModelBackend:
             if os.environ.get("NASCENCE_IS_WORKER") == "1":
                 logger.warning("[%s] 子进程环境不允许启动本地模型服务，统一使用主进程共享模型", self.name)
                 return False
-            # 先校验本后端能否启动，再停掉其他后端，避免无谓地杀掉正在运行的服务器
-            if not LLAMA_SERVER_EXE.exists():
-                logger.error("[%s] 未找到 llama-server: %s", self.name, LLAMA_SERVER_EXE)
+            # 只有真正要启动本地模型时，才提示下载并尝试（不强制、不在启动阶段预下载）
+            if not self._ensure_llama_runtime():
+                logger.error("[%s] llama-server 不可用，无法启动本地模型。请先运行 setup 脚本或 install_llama 脚本下载", self.name)
                 return False
             if not self.local_model.exists():
-                logger.error("[%s] 未找到模型文件: %s", self.name, self.local_model)
-                return False
+                spec = MODEL_DOWNLOADS.get(self.name)
+                logger.warning("[%s] 未找到模型文件 %s，尝试下载...", self.name, self.local_model.name)
+                if spec is None or not _download_file(spec):
+                    logger.error("[%s] 模型下载失败，无法启动本地模型", self.name)
+                    return False
+            if self.mmproj is not None and not self.mmproj.exists():
+                logger.warning("[%s] 未找到 mmproj 文件 %s，尝试下载...", self.name, self.mmproj.name)
+                _download_file(MMPROJ_DOWNLOAD)
             # 保证全局只有一个 llama-server：确认能启动后，先停掉其他后端进程
             for other in BACKENDS.values():
                 if other is not self:
@@ -559,22 +592,17 @@ def start_default_backends():
       0. 先全局清理系统中所有 llama-server 进程（残留/孤儿/其它实例），
          确保全局只有本项目拉起的一套 llama-server，避免端口冲突与内存翻倍
       1. 读取三个开关（config.backends.*.use_default）
-      2. 对 use_default=True 的后端，先检查模型文件是否存在，缺失则自动下载
-      3. 下载成功后启动 llama-server 加载本地模型
+      2. 对 use_default=True 的后端尝试启动本地模型；
+         不强制预下载——缺失的 llama-server / 模型文件会在 start_local
+         内部提示并尝试按需下载（只有真正启动本地模型时才下载）
     返回 dict：{name: bool}，表示每个后端是否就绪。
     """
     # 系统启动：先杀掉所有 llama-server，保证全局唯一
     kill_all_llama_servers()
 
     results = {}
-    ok, failed = ensure_model_files()
-    if not ok:
-        logger.error("[模型] 以下后端模型下载失败: %s", ", ".join(failed))
     for name, backend in BACKENDS.items():
         if backend.use_default():
-            if name in failed:
-                results[name] = False
-                continue
             results[name] = backend.start_local(wait=True)
         else:
             logger.info("[%s] 配置为使用外部 API，跳过本地加载", name)
@@ -585,8 +613,8 @@ def start_default_backends():
 def check_models_ready():
     """启动门槛检查：确保每个能力至少有一种可用来源（本地模型 或 外部 API）。
 
-    对 use_default=True 的后端，若本地模型文件/llama-server 缺失且未配置外部 API，
-    抛 RuntimeError 阻止启动并给出明确提示。
+    仅记录提示，不再抛错阻止启动——缺模型时可先使用外部 API，
+    或由用户切换到本地模型时触发按需下载。
     """
     problems = []
     for name, backend in BACKENDS.items():
@@ -608,10 +636,8 @@ def check_models_ready():
         else:
             problems.append(f"「{name}」本地模型启动失败，且未配置外部 API")
     if problems:
-        raise RuntimeError(
-            "模型能力未就绪，无法启动：\n- " + "\n- ".join(problems) +
-            "\n\n请运行 setup 脚本下载模型，或在控制面板「模型」页配置外部 API。"
-        )
+        for p in problems:
+            logger.warning("[模型] %s（切换到本地模型时将提示下载）", p)
 
 
 def kill_all_llama_servers():

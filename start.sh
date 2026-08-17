@@ -47,12 +47,9 @@ echo "[√] 虚拟环境已创建，依赖已安装"
 # ---------- 2. 确保数据目录 ----------
 mkdir -p data/test
 
-# ---------- 3. 确保 llama.cpp 与模型 ----------
-if [ ! -f "llama/bin/llama-server" ]; then
-    echo "[*] llama.cpp 未找到，正在下载..."
-    bash "$PROJECT_DIR/run/install_llama.sh" || echo "[!] llama.cpp 安装失败，请手动安装"
-fi
+# ---------- 3. 模型目录（不强制下载；首次使用本地模型时由服务端提示并下载） ----------
 mkdir -p models
+echo "[*] 提示：使用本地默认模型时，服务端会在启动模型时自动提示并下载所需 llama.cpp 与模型"
 
 # ---------- 4. 端口 8787 预检（已在运行则直接开浏览器） ----------
 if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":8787 ") \
