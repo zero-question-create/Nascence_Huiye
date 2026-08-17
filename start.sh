@@ -51,17 +51,24 @@ mkdir -p data/test
 mkdir -p models
 echo "[*] 提示：使用本地默认模型时，服务端会在启动模型时自动提示并下载所需 llama.cpp 与模型"
 
+# ---------- 浏览器打开辅助：仅在有图形界面时尝试，无 GUI 只提示 URL ----------
+open_url() {
+    local url="$1"
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1
+    elif [ "$(uname)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
+        open "$url" >/dev/null 2>&1
+    else
+        echo "  [提示] 未检测到图形界面，请手动在浏览器打开: $url"
+    fi
+}
+
 # ---------- 4. 端口 8787 预检（已在运行则直接开浏览器） ----------
 if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":8787 ") \
    || (command -v netstat >/dev/null 2>&1 && netstat -ltn 2>/dev/null | grep -q ":8787 "); then
     echo "[*] 检测到 8787 端口已被占用，服务可能已在运行，直接打开浏览器。"
-    if command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "http://127.0.0.1:8787/" >/dev/null 2>&1
-        xdg-open "http://127.0.0.1:8787/admin" >/dev/null 2>&1
-    elif command -v open >/dev/null 2>&1; then
-        open "http://127.0.0.1:8787/"
-        open "http://127.0.0.1:8787/admin"
-    fi
+    open_url "http://127.0.0.1:8787/"
+    open_url "http://127.0.0.1:8787/admin"
     exit 0
 fi
 
@@ -76,13 +83,8 @@ echo "=========================================="
 # 延迟 2 秒等端口绑定后再打开浏览器
 (
     sleep 2
-    if command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "http://127.0.0.1:8787/" >/dev/null 2>&1
-        xdg-open "http://127.0.0.1:8787/admin" >/dev/null 2>&1
-    elif command -v open >/dev/null 2>&1; then
-        open "http://127.0.0.1:8787/"
-        open "http://127.0.0.1:8787/admin"
-    fi
+    open_url "http://127.0.0.1:8787/"
+    open_url "http://127.0.0.1:8787/admin"
 ) &
 
 "$PY" webui.py
