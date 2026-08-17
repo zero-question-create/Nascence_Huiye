@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "embed_dim": 768,     # 语义向量维度（与 embed 模型输出一致；由「维护」页维度重建工具更新）
     "server_port": 8787,  # 服务端(管理面板)监听端口
     "client_port": 8987,  # 网页版客户端独立端口（随服务器运行，访问该端口即打开客户端）
+    "auto_start_cognition": False,  # 无界面自动启动认知循环（--cognition 参数或本配置）
     "backends": {
         "text": {
             "use_default": False,

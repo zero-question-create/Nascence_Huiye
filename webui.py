@@ -871,6 +871,10 @@ async def api_config_save(request):
             logging.exception("[配置] 网页版客户端端口切换失败")
             return web.json_response({"ok": False, "message": f"网页版客户端端口切换失败: {e}"})
 
+    # 无界面自动启动认知循环开关（重启进程生效）
+    if "auto_start_cognition" in data:
+        config["auto_start_cognition"] = bool(data.get("auto_start_cognition"))
+
     save_config(config)
     reload_config()
     logging.info("配置已保存（bot_name=%s%s%s）", config.get("bot_name"), port_msg, client_port_msg)
@@ -935,14 +939,24 @@ async def api_embed_dim_rebuild(request):
     return web.json_response(result)
 
 
-async def api_cognition_start(request):
+def _start_cognition_global():
+    """全局启动认知循环（同步执行，可能在后台线程运行）。
+
+    供管理面板按钮（api_cognition_start）与无界面自动启动
+    （--cognition 参数 / auto_start_cognition 配置）共用，逻辑一致不分叉。
+    """
     global GLOBAL_COGNITION_ENABLED
+    GLOBAL_COGNITION_ENABLED = True
+    # 初始化主进程集中式模型服务
+    RUNTIME.initialize()
+    # 通知所有已注册的活跃子进程启动其各自独立的认知循环
+    USER_WORKERS.start_cognition_for_all()
+    logging.info("认知循环已全局启动（各用户专属子进程已激活）")
+
+
+async def api_cognition_start(request):
     try:
-        GLOBAL_COGNITION_ENABLED = True
-        # 初始化主进程集中式模型服务
-        await asyncio.to_thread(RUNTIME.initialize)
-        # 通知所有已注册的活跃子进程启动其各自独立的认知循环
-        USER_WORKERS.start_cognition_for_all()
+        await asyncio.to_thread(_start_cognition_global)
         _broadcast({"type": "status", "text": "认知循环已全局启动（各用户专属子进程已激活）"})
         return web.json_response({"ok": True})
     except Exception as e:
@@ -1305,6 +1319,11 @@ def main():
     except Exception:
         pass
 
+    # 无界面自动启动认知循环：--cognition 命令行参数优先，其次读配置 auto_start_cognition
+    auto_cognition = "--cognition" in args
+    if not auto_cognition:
+        auto_cognition = bool(config.get("auto_start_cognition"))
+
     os.chdir(PROJECT_DIR)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     configure_logging()
@@ -1339,7 +1358,7 @@ def main():
 
     app = build_app()
     runner = web.AppRunner(app)
-    asyncio.run(_serve(runner, port, client_port))
+    asyncio.run(_serve(runner, port, client_port, auto_cognition))
 
 
 async def _start_client_site(cp: int):
@@ -1374,7 +1393,7 @@ async def _apply_client_port(cp: int):
     await _start_client_site(cp)
 
 
-async def _serve(runner, port, client_port=None):
+async def _serve(runner, port, client_port=None, auto_cognition=False):
     global _ws_broadcast_queue, _ws_broadcast_task, _main_loop, _RUNNER, _SITES, _CURRENT_PORT
     # 记录主事件循环 + 初始化广播队列，供任意线程的日志/事件入队
     _main_loop = asyncio.get_event_loop()
@@ -1416,6 +1435,12 @@ async def _serve(runner, port, client_port=None):
             await _start_client_site(client_port)
         except Exception:
             logging.exception("启动网页版客户端服务失败（端口=%s）", client_port)
+
+    # 无界面自动启动认知循环（--cognition 参数或配置 auto_start_cognition）
+    if auto_cognition:
+        logging.info("[认知循环] 检测到自动启动配置，正在无界面启动认知循环...")
+        await asyncio.to_thread(_start_cognition_global)
+        _broadcast({"type": "status", "text": "认知循环已自动启动（无界面模式）"})
 
     try:
         # 保持事件循环运行（等待 Ctrl+C / 退出请求）

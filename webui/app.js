@@ -301,14 +301,29 @@ async function loadBotName() {
     if (portInput) portInput.value = cfg.server_port || "";
     const clientPortInput = $("clientPortInput");
     if (clientPortInput) clientPortInput.value = cfg.client_port || "";
+    const autoCog = $("autoCognitionCheck");
+    if (autoCog) autoCog.checked = !!cfg.auto_start_cognition;
     const hint = $("botNameHint");
     if (hint) hint.textContent = "";
     const portHint = $("portHint");
     if (portHint) portHint.textContent = "";
     const clientPortHint = $("clientPortHint");
     if (clientPortHint) clientPortHint.textContent = "";
+    const autoCogHint = $("autoCognitionHint");
+    if (autoCogHint) autoCogHint.textContent = "";
   } catch (e) { /* silent */ }
 }
+
+bind("btnSaveAutoCognition", async () => {
+  const cb = $("autoCognitionCheck");
+  const val = cb ? cb.checked : false;
+  const r = await runAction("btnSaveAutoCognition", () => api("/api/config", "POST", { auto_start_cognition: val }));
+  if (r) {
+    const hint = $("autoCognitionHint");
+    hint.textContent = "已保存，重启进程后生效。";
+    alert(`自动启动认知循环已${val ? "开启" : "关闭"}，重启进程后生效。`);
+  }
+});
 
 bind("btnSaveBotName", async () => {
   const input = $("botNameInput");
