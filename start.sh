@@ -15,31 +15,34 @@ echo "  管理台: http://127.0.0.1:8787/admin"
 echo "=========================================="
 
 # ---------- 1. 检查 venv，缺失则自动创建并安装依赖 ----------
-if [ ! -f "venv/bin/python" ]; then
+PY="$PROJECT_DIR/venv/bin/python"
+if [ ! -f "$PY" ]; then
     echo "[*] 虚拟环境未找到，正在创建..."
-    if ! python3 -m venv venv --without-pip 2>/dev/null; then
-        if ! python3 -m venv venv; then
-            echo "[!] 创建虚拟环境失败，请检查 python3-venv 是否已安装" >&2
-            exit 1
-        fi
+    if ! python3 -m venv venv; then
+        echo "[!] 创建虚拟环境失败，请先安装 python3-venv（如 apt install python3-venv）" >&2
+        exit 1
     fi
-    source venv/bin/activate
-    # 引导 pip（--without-pip 场景）
-    if ! pip --version >/dev/null 2>&1; then
-        curl -sS https://bootstrap.pypa.io/get-pip.py | python3 || {
+fi
+# 确保 venv 内有 pip（残缺 venv / 旧版 --without-pip 场景）
+if ! "$PY" -m pip --version >/dev/null 2>&1; then
+    echo "[*] venv 内未找到 pip，正在引导..."
+    if ! "$PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | "$PY" || {
             echo "[!] pip 引导失败，请手动安装 pip" >&2
             exit 1
         }
     fi
-    pip install -r requirements.txt -q -i https://mirrors.huaweicloud.com/repository/pypi/simple/ \
-        || { echo "[!] 华为源安装失败，尝试切换清华源..."; pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple \
-             || { echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."; pip install -r requirements.txt -q -i https://pypi.org/simple/ \
-                  || { echo "[!] 依赖安装失败，请检查 requirements.txt" >&2; exit 1; }; }; }
-    echo "[√] 虚拟环境已创建，依赖已安装"
-else
-    echo "[√] 虚拟环境正常"
-    source venv/bin/activate
 fi
+# 统一用 venv 内 python -m pip（避免误用系统 pip 触发 PEP 668）
+if ! "$PY" -m pip install -r requirements.txt -q -i https://mirrors.huaweicloud.com/repository/pypi/simple/ 2>/dev/null; then
+    echo "[!] 华为源安装失败，尝试切换清华源..."
+    if ! "$PY" -m pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null; then
+        echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."
+        "$PY" -m pip install -r requirements.txt -q -i https://pypi.org/simple/ \
+            || { echo "[!] 依赖安装失败，请检查 requirements.txt" >&2; exit 1; }
+    fi
+fi
+echo "[√] 虚拟环境已创建，依赖已安装"
 
 # ---------- 2. 确保数据目录 ----------
 mkdir -p data/test
@@ -85,7 +88,7 @@ echo "=========================================="
     fi
 ) &
 
-python3 webui.py
+"$PY" webui.py
 CODE=$?
 
 if [ "$CODE" -ne 0 ]; then

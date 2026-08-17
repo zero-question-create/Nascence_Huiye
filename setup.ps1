@@ -25,7 +25,19 @@ if (-not (Test-Path "venv\Scripts\python.exe")) {
     Write-Host "[OK] Virtual environment already exists"
 }
 
-$Pip = "$ProjectDir\venv\Scripts\pip.exe"
+$Py = "$ProjectDir\venv\Scripts\python.exe"
+
+# 确保 venv 内有 pip（残缺 venv / 旧版 --without-pip 场景）
+& $Py -m pip --version 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[*] venv 内未找到 pip，正在引导..."
+    & $Py -m ensurepip --upgrade 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[!] pip 引导失败，请手动安装 pip"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
 
 # ---------- 2. Install dependencies ----------
 Write-Host "[*] Installing Python dependencies..."
@@ -34,16 +46,16 @@ $HuaweiSource = "https://mirrors.huaweicloud.com/repository/pypi/simple/"
 $TsinghuaSource = "https://pypi.tuna.tsinghua.edu.cn/simple"
 $OfficialSource = "https://pypi.org/simple/"
 
-# 优先使用华为云 PyPI 镜像源
-& $Pip install -r requirements.txt -q -i $HuaweiSource
+# 统一用 venv 内 python -m pip（避免误用系统 pip）
+& $Py -m pip install -r requirements.txt -q -i $HuaweiSource
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[!] 使用华为源安装失败（可能超时或包不存在）"
     Write-Host "[!] 尝试切换清华源..."
-    & $Pip install -r requirements.txt -q -i $TsinghuaSource
+    & $Py -m pip install -r requirements.txt -q -i $TsinghuaSource
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[!] 使用清华源安装失败"
         Write-Host "[!] 尝试使用默认源（Python 官方源）..."
-        & $Pip install -r requirements.txt -q -i $OfficialSource
+        & $Py -m pip install -r requirements.txt -q -i $OfficialSource
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[!] Dependency installation failed. Check requirements.txt."
             Read-Host "Press Enter to exit"
