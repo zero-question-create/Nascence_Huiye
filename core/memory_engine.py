@@ -588,9 +588,18 @@ def _rebuild_faiss_index():
     """从 SQLite 全量重建 faiss 索引和映射表"""
     with _data_lock:
         global _faiss_index, _faiss_to_mem, _mem_to_faiss
-        _init_faiss_index()
         db = _get_db()
         rows = db.execute("SELECT id, vector FROM memories").fetchall()
+        # 按库中实际向量维度初始化索引（可能与配置 embed_dim 不一致）
+        if rows:
+            dim = len(np.frombuffer(rows[0][1], dtype=np.float32))
+            _init_faiss_index()
+            if _faiss_index.d != dim:
+                global EMBED_DIM
+                EMBED_DIM = dim
+                _init_faiss_index()
+        else:
+            _init_faiss_index()
         for mem_id, vec_blob in rows:
             vec = np.frombuffer(vec_blob, dtype=np.float32).reshape(1, -1)
             faiss.normalize_L2(vec)
@@ -687,8 +696,43 @@ def build_initial_links(new_mem_id: str):
             add_link(new_mem_id, other_id, sim, "semantic")
             add_link(other_id, new_mem_id, sim, "semantic")
 
+def _ensure_index_dim(vec_dim: int):
+    """确保 faiss 索引维度与当前向量一致；不一致时按实际维度重建索引。
+
+    外部 embed API / 本地模型输出的向量维度可能变化（如 768↔1024），
+    索引按 config.embed_dim 初始化会维度不匹配崩溃（AssertionError: d == self.d）。
+    这里在写入前动态对齐：维度变化时重建索引并保留已有同维热记忆，
+    同时把发现的实际维度写回配置，重启后直接按正确维度初始化。
+    """
+    global _faiss_index, _faiss_to_mem, _mem_to_faiss, EMBED_DIM
+    with _data_lock:
+        if _faiss_index is not None and _faiss_index.d == vec_dim:
+            return
+        old_mems = [m for m in memories.values() if len(m.get("vector", [])) == vec_dim]
+        EMBED_DIM = vec_dim
+        _init_faiss_index()
+        for mem in old_mems:
+            v = np.array(mem["vector"], dtype=np.float32).reshape(1, -1)
+            faiss.normalize_L2(v)
+            _faiss_index.add(v)
+            _faiss_to_mem.append(mem["id"])
+            _mem_to_faiss[mem["id"]] = _faiss_index.ntotal - 1
+        print(f"[faiss] 向量维度对齐为 {vec_dim}，索引已重建（保留 {len(old_mems)} 条热记忆）")
+        # 写回配置，重启后直接按实际维度初始化
+        try:
+            from config.api_config import config, save_config
+            if config.get("embed_dim") != vec_dim:
+                config["embed_dim"] = vec_dim
+                save_config(config)
+                print(f"[faiss] 已把 embed_dim 更新为 {vec_dim}")
+        except Exception:
+            pass
+
+
 def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
     vec = text_to_vector(content)
+    # 向量维度可能与索引不一致（外部 API 或本地模型维度变化）→ 先对齐索引
+    _ensure_index_dim(len(vec))
     mem_id = generate_memory_id()
     now = clock.now()
     memory_dict = {
