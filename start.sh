@@ -87,7 +87,7 @@ echo "=========================================="
     open_url "http://127.0.0.1:8787/admin"
 ) &
 
-"$PY" webui.py
+"$PY" webui.py "$@"
 CODE=$?
 
 if [ "$CODE" -ne 0 ]; then
