@@ -36,8 +36,8 @@ WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与
 EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
-MAX_HOT_SIZE = 1000                 # 热记忆节点硬上限，防止爆炸
-MAX_HOT_LINKS = 3000                # 热链接硬上限，防止爆炸（冷链接落入 SQLite）
+MAX_HOT_SIZE = 3000                 # 热记忆节点硬上限，防止爆炸
+MAX_HOT_LINKS = 100000                # 热链接硬上限，防止爆炸（冷链接落入 SQLite）
 
 # ========== 体力消耗系数 ==========
 COST_FACTOR = {

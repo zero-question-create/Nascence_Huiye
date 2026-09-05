@@ -155,6 +155,7 @@ class Runtime:
         self.qq_loop = None
         self.qq_task = None
         self._lock = threading.Lock()
+        self._fake_lock = threading.Lock()
 
     def start_ollama(self):
         import requests
@@ -354,42 +355,44 @@ class Runtime:
         return value
     def fake_send(self, text):
         self.initialize()
-        if not self.qq_loop or not self.qq_task or self.qq_task.done():
-            raise RuntimeError("QQ 服务未运行，无法通过 NapCat 发送消息")
-        import qq_bot
-        if qq_bot._napcat_websocket is None:
-            raise RuntimeError("NapCat 尚未连接，无法发送消息")
-        from core.memory_engine import create_memory
-        from utils.message_history import add_message
-        from utils.persistence import save_all_data
+        with self._fake_lock:
+            if not self.qq_loop or not self.qq_task or self.qq_task.done():
+                raise RuntimeError("QQ 服务未运行，无法通过 NapCat 发送消息")
+            import qq_bot
+            if qq_bot._napcat_websocket is None:
+                raise RuntimeError("NapCat 尚未连接，无法发送消息")
+            from core.memory_engine import create_memory
+            from utils.message_history import add_message
+            from utils.persistence import save_all_data
 
-        group_id = qq_bot.get_active_group_id()
-        fut = asyncio.run_coroutine_threadsafe(
-            qq_bot.send_group_msg(group_id, text), self.qq_loop
-        )
-        fut.result(timeout=10)
-        add_message(BOT_NAME, text, "伪造")
-        memory_id = create_memory(f"我说：{text}")
-        save_all_data()
-        logging.info("伪造发送成功：群=%s 内容=%s 记忆ID=%s", group_id, text, memory_id)
-        return memory_id
+            group_id = qq_bot.get_active_group_id()
+            fut = asyncio.run_coroutine_threadsafe(
+                qq_bot.send_group_msg(group_id, text), self.qq_loop
+            )
+            fut.result(timeout=10)
+            add_message(BOT_NAME, text, "伪造")
+            memory_id = create_memory(f"我说：{text}")
+            save_all_data()
+            logging.info("伪造发送成功：群=%s 内容=%s 记忆ID=%s", group_id, text, memory_id)
+            return memory_id
 
     def fake_think(self, text):
         self.initialize()
-        from core.cognition import generate_response
-        from utils.message_history import add_message
-        from utils.persistence import save_all_data, save_state
+        with self._fake_lock:
+            from core.cognition import generate_response
+            from utils.message_history import add_message
+            from utils.persistence import save_all_data, save_state
 
-        augmented = f"我（{BOT_NAME}）自己想着：{text}"
-        # 调用核心思考流程（LLM 拆解→检索→扩散→拼接），返回 (reply, user_input)
-        reply, _ = generate_response(augmented)
-        reply = str(reply or "（静默）").strip()
-        memory_text = f"我想：{reply}"
-        add_message(BOT_NAME, memory_text, "伪造思考")
-        save_all_data()
-        save_state()
-        logging.info("伪造思考完成：输入=%s 想法=%s", text, reply)
-        return reply
+            augmented = f"我（{BOT_NAME}）自己想着：{text}"
+            # 调用核心思考流程（LLM 拆解→检索→扩散→拼接），返回 (reply, user_input)
+            reply, _ = generate_response(augmented)
+            reply = str(reply or "（静默）").strip()
+            memory_text = f"我想：{reply}"
+            add_message(BOT_NAME, memory_text, "伪造思考")
+            save_all_data()
+            save_state()
+            logging.info("伪造思考完成：输入=%s 想法=%s", text, reply)
+            return reply
 
     def inject_memory(self, content):
         self.initialize()
@@ -756,7 +759,7 @@ class ControlPanel(QMainWindow):
         self.fake_input.setPlaceholderText("输入要以 bot 身份发送的内容")
         self.fake_input.setMaximumHeight(100)
         fake_layout.addWidget(self.fake_input)
-        fake_btn = QPushButton("伪造发送")
+        fake_btn = self.fake_btn = QPushButton("伪造发送")
         fake_btn.clicked.connect(self.fake_send)
         fake_layout.addWidget(fake_btn, alignment=Qt.AlignLeft)
         layout.addWidget(fake_panel)
@@ -769,7 +772,7 @@ class ControlPanel(QMainWindow):
         self.fake_think_input.setPlaceholderText("输入要让 bot 思考的内容")
         self.fake_think_input.setMaximumHeight(100)
         think_layout.addWidget(self.fake_think_input)
-        think_btn = QPushButton("伪造思考")
+        think_btn = self.think_btn = QPushButton("伪造思考")
         think_btn.clicked.connect(self.fake_think)
         think_layout.addWidget(think_btn, alignment=Qt.AlignLeft)
         layout.addWidget(think_panel)
@@ -1150,10 +1153,12 @@ class ControlPanel(QMainWindow):
         if not text:
             return
         self.fake_input.clear()
+        self.fake_btn.setEnabled(False)
         self.run_worker(
             RUNTIME.fake_send,
             text,
             on_result=lambda memory_id: self._append_bubble(BOT_NAME, text, source="伪造"),
+            on_finished=lambda: self.fake_btn.setEnabled(True),
         )
 
     def fake_think(self):
@@ -1161,10 +1166,12 @@ class ControlPanel(QMainWindow):
         if not text:
             return
         self.fake_think_input.clear()
+        self.think_btn.setEnabled(False)
         self.run_worker(
             RUNTIME.fake_think,
             text,
             on_result=lambda reply: self._append_bubble(BOT_NAME, f"（内心）{reply}", source="伪造思考"),
+            on_finished=lambda: self.think_btn.setEnabled(True),
         )
 
     def inject_memory(self):

@@ -41,16 +41,24 @@ def save_state():
     with _lock:
         data = list(_message_history)
     os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
-    with open(_STATE_FILE, "w", encoding="utf-8") as f:
+    tmp_file = _STATE_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, _STATE_FILE)
 
 
 def load_state():
     global _message_history, _flushed_count
     if not os.path.exists(_STATE_FILE):
         return
-    with open(_STATE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print(f"[消息历史] 状态文件损坏，已重建：{_STATE_FILE}")
+        with _lock:
+            _message_history, _flushed_count = [], 0
+        return
     with _lock:
         _message_history = data[-_max_history:]
         _flushed_count = len(_message_history)
