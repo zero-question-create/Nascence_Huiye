@@ -39,3 +39,6 @@ Thumbs.db
 
 # 环境变量
 .env
+
+# 本地工具/代理配置
+.zcode/
