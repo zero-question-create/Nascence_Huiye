@@ -52,20 +52,25 @@ def get_history_context() -> str:
     append_log(result)
     return result
 
-def call_api_thinking(messages, max_tokens=8000):
+def call_api_thinking(messages, max_tokens=8000, thinking=True):
     """
-    LLM思考模式唯一外部调用接口
+    LLM思考模式唯一外部调用接口。
+
+    thinking=False 时关闭推理（不发送 reasoning_effort / thinking 字段），
+    用于“输出一句 JSON 短句”这类不需要推理的调用，可大幅降低输出 token。
     """
+    kwargs = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+        "stream": False,
+    }
+    if thinking:
+        kwargs["reasoning_effort"] = "high"
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.1,
-            stream=False,
-            reasoning_effort="high",
-            extra_body={"thinking": {"type": "enabled"}}
-        )
+        response = client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
         return content.strip() if content else None
     except Exception as e:
@@ -344,7 +349,8 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
         {"role": "user", "content": user_content}
     ]
 
-    reply = call_api_thinking(messages, max_tokens=8000)
+    # 认知循环高频调用：只需输出一句 JSON 短句，关闭推理以大幅降低输出 token
+    reply = call_api_thinking(messages, max_tokens=8000, thinking=False)
 
     append_log("="*30+"理解回复"+"="*30)
     append_log(reply)
