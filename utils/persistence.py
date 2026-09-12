@@ -138,12 +138,10 @@ def load_state():
     try:
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
             loaded = json.load(f)
-        # 标准化键名，将可能的变体统一到标准键
+        # 标准化键名，仅保留在用的状态键；历史遗留的“已知信息”类字段直接丢弃
         normalized = {}
         for key, value in loaded.items():
-            if key == "我的已知信息" or key == "辉夜的已知信息" or key == "“我”的已知信息" or key == "你的已知信息":
-                normalized["我的已知信息"] = value
-            elif key in ("参与者", "最近话题"):
+            if key in ("参与者", "最近话题"):
                 normalized[key] = value
         # 更新状态，不清空，防止空覆盖
         if normalized:

@@ -57,9 +57,6 @@ def cold_start_batch_injection():
 
     state = get_state()
     state["参与者"] = [BOT_NAME]
-    state["我的已知信息"] = [
-        f"我的名字是{BOT_NAME}"
-    ]
     set_state(state)
     print(f"[冷启动] 已注入 {len(COLD_START_DIALOGS)} 条基础记忆")
 

@@ -342,7 +342,7 @@ class SelfTraining:
 
     def _decide(self, snapshot, vision, hearing, feeling, memory_context, stamina):
         cur_state = get_state()
-        state_hint = json.dumps({"参与者": cur_state.get("参与者", []), "topic": cur_state.get("最近话题", ""), "info": cur_state.get("我的已知信息", [])}, ensure_ascii=False)
+        state_hint = json.dumps({"参与者": cur_state.get("参与者", []), "topic": cur_state.get("最近话题", "")}, ensure_ascii=False)
         conv = self._build_conversation_history()
         prompt = f"""当前对话状态：{state_hint}
 当前环境：{snapshot['location_desc']}
@@ -359,11 +359,11 @@ class SelfTraining:
 第一行：一句以"我想"开头的意图自述。
 第二行：一句以"我感到"开头的状态自述。
 第三行：[关键词：<2个关键词，用逗号分隔>]
-第四行：状态更新 JSON — {{"participants":["{BOT_NAME}",...],"topic":"...","info":["..."]}}
+第四行：状态更新 JSON — {{"participants":["{BOT_NAME}",...],"topic":"..."}}
 只根据以上提供的信息输出，不得添加未给出的内容。"""
         msg = [{"role": "system", "content": BASE_SYSTEM},
                {"role": "user", "content": prompt}]
-        raw = call_api_thinking(msg, max_tokens=8000) or "我想四处看看\n我感到身体状态正常\n[关键词：环境，探索]\n{\"participants\":[\"{BOT_NAME}\"],\"topic\":\"\",\"info\":[]}"
+        raw = call_api_thinking(msg, max_tokens=8000) or "我想四处看看\n我感到身体状态正常\n[关键词：环境，探索]\n{\"participants\":[\"{BOT_NAME}\"],\"topic\":\"\"}"
         lines = [l.strip() for l in raw.split("\n") if l.strip()]
         intention = "我想四处看看"
         state = "我感到身体状态正常"
@@ -385,7 +385,6 @@ class SelfTraining:
             mapped = {
                 "参与者": state_json.get("participants", cur_state.get("参与者", [])),
                 "最近话题": state_json.get("topic", cur_state.get("最近话题", "")),
-                "我的已知信息": state_json.get("info", cur_state.get("我的已知信息", [])),
             }
             set_state(mapped)
             save_state()

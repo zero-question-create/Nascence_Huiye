@@ -83,8 +83,7 @@ def decompose_input(user_input: str) -> tuple:
     # 缩减为英文，减少tokens消耗，这里使用临时映射，不影响全局中文键名
     normalized_state = {
         "participants": state.get("参与者", []),
-        "topic": state.get("最近话题", ""),
-        "info": state.get("我的已知信息", [])
+        "topic": state.get("最近话题", "")
     }
     state_str = json.dumps(normalized_state, ensure_ascii=False)
     now = datetime.datetime.now()
@@ -95,12 +94,12 @@ def decompose_input(user_input: str) -> tuple:
 2. 每条记忆片段都是是一个完整清晰的第一人称陈述句，不限数量，但是每一条尽量简短。所有记忆片段必须明确谁说了什么、对谁说的，内容不要做任何删减。
 3. 不要凭空添加对方未说的信息，也不要修改任何细节，没有记忆需要存储则返回“无”。
 4. 关键词：从输入中提取 1-3 个原词，不做联想。
-5. 状态维护：更新“participants”、“topic”，info 数组最多保留 20 条最关键信息，请对该数组加以修改整合，选择最重要的记忆存放在数组中,每条最多30字。
+5. 状态维护：仅更新“participants”与“topic”。
 6. 纯指令或重复的输入不需要转为记忆片段，直接跳过。
 7. 只根据以上提供的信息输出，不得添加未给出的内容。
 
-输出严格只包含 JSON，info 数组长度不得超过20，字段如下：
-{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题","info":["已知1","已知2"]}}}}
+输出严格只包含 JSON，字段如下：
+{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题"}}}}
 """
 
     messages = [
@@ -163,8 +162,7 @@ def decompose_input(user_input: str) -> tuple:
     if new_state:
         new_state = {
             "参与者": new_state.get("participants", []),
-            "最近话题": new_state.get("topic", ""),
-            "我的已知信息": new_state.get("info", [])
+            "最近话题": new_state.get("topic", "")
         }
 
     # 模式映射：store -> 存储, ask -> 询问, 其他 -> 普通
