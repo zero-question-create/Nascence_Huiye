@@ -12,6 +12,7 @@ from .memory_engine import (
 )
 from .llm_interface import decompose_input, verbalize
 from .virtual_clock import clock
+from .biorhythm import BIORHYTHM
 from config.constants import BOT_NAME
 from utils.dialogue_state import set_state, reset_state, get_state
 from utils.persistence import save_state
@@ -93,33 +94,17 @@ _current_round_seeds: list = []
 _current_round_edges: list = []
 
 # ========== 睡眠配置 ==========
-# 睡眠窗口由 core.virtual_clock 统一管理（sleep_start_hour / sleep_duration）
-DROWSY_MARGIN = 15              # 睡前/醒后迷糊的分钟数
+# 睡眠时机不再由固定钟点决定，改由 core.biorhythm 的睡眠压力涌现。
+# 该常量保留仅为兼容旧引用，不再参与睡眠判定。
+DROWSY_MARGIN = 15              # 保留字段：兼容旧引用
 
 
 def _get_drowsy_memory() -> str:
     """
-    根据当前真实时间，返回应注入的困倦/刚醒虚拟记忆。
-    若不在迷糊时段，返回 None。
+    返回应注入的第一人称身体感受（困倦/疲惫/精神），由生物钟精力分档生成。
+    这是"内心感受"通道：让辉夜自己感到累，而不只是内部数值。
     """
-    now = datetime.datetime.now()
-    current_min = now.hour * 60 + now.minute
-    start_min = clock.sleep_start_hour * 60
-    end_min = clock.sleep_end_hour * 60
-
-    # 距离最近一次睡眠开始的分种数（恰在睡眠开始时视为已入睡，不触发困倦）
-    minutes_to_sleep = (start_min - current_min) % (24 * 60)
-    if minutes_to_sleep == 0:
-        minutes_to_sleep = 24 * 60
-
-    # 距上次睡眠结束的分种数（醒来后经过多久）
-    minutes_since_wake = (current_min - end_min) % (24 * 60)
-
-    if minutes_to_sleep <= DROWSY_MARGIN:
-        return "[现在] 我现在有点困，想睡觉了"
-    if minutes_since_wake <= DROWSY_MARGIN:
-        return "[现在] 我刚睡醒，还有点迷糊"
-    return None
+    return BIORHYTHM.feeling_text()
 
 def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
                          inhibited_seeds: set = None,
@@ -141,18 +126,25 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
 
     global _current_round_seeds, _current_round_edges
 
+    # 精力调制思考深度：精力越低，检索面越窄、扩散越浅（想得浅一点）
+    depth = BIORHYTHM.depth_factor()
+    retr_k = max(2, round(5 * depth))
+    max_mem = max(4, round(max_memories * depth))
+    bfs_stamina = max(1.5, 3.0 * depth)
+    bfs_topk = max(4, round(8 * depth))
+
     # 语义检索（faiss）
     seed_ids = []
     faiss_results = []
     for kw in keywords:
-        similar = retrieve_similar(kw, k=5)
+        similar = retrieve_similar(kw, k=retr_k)
         for score, mem in similar:
             if mem["id"] not in seed_ids:
                 seed_ids.append(mem["id"])
             faiss_results.append((score, mem))
 
     # 精确关键词检索（词网）
-    exact_results = retrieve_by_exact_keywords(keywords, k=5)
+    exact_results = retrieve_by_exact_keywords(keywords, k=retr_k)
     for score, mem in exact_results:
         if mem["id"] not in seed_ids:
             seed_ids.append(mem["id"])
@@ -164,7 +156,7 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
     _current_round_edges = []
     activated_memories = []
     if seed_ids:
-        activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8,
+        activated = pathfind_activation(seed_ids, max_stamina=bfs_stamina, top_k=bfs_topk,
                                         inhibited_edges=inhibited_edges,
                                         output_visited_edges=_current_round_edges)
         activated_memories = [(mem, score) for mem, score in activated]
@@ -194,7 +186,7 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
         if content not in seen_texts:
             seen_texts.add(content)
             final_mem_objects.append(mem)
-        if len(final_mem_objects) >= max_memories:
+        if len(final_mem_objects) >= max_mem:
             break
 
     # 添加时间标记
@@ -469,13 +461,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     append_log("="*40)
 
     while not _graceful_stop:
-        # 睡眠暂停：到达睡眠窗口后，当前轮（若正在执行）会自然跑完，
-        # 从下一轮开始暂停认知循环，直到起床时间再恢复。
-        if clock.in_sleep_window():
-            append_log("[认知循环] 进入睡眠窗口，本轮结束后暂停，等待起床")
-            while not _graceful_stop and clock.in_sleep_window():
+        # 睡眠暂停：由生物钟的睡眠压力涌现判定，而非固定钟点。
+        # 入睡后当前轮会自然跑完，从下一轮开始挂起，直到精力恢复自然醒来。
+        BIORHYTHM.tick()
+        if BIORHYTHM.is_asleep():
+            append_log("[认知循环] 生物钟判定已入睡，认知循环挂起")
+            while not _graceful_stop and BIORHYTHM.is_asleep():
                 await asyncio.sleep(5)
-            append_log("[认知循环] 已到起床时间（或收到停止信号），认知循环恢复")
+                BIORHYTHM.tick()
+            append_log("[认知循环] 自然醒来（或被唤醒），认知循环恢复")
             continue
 
         try:

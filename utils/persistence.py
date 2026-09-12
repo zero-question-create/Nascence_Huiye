@@ -59,6 +59,13 @@ def save_all_data():
         with open(METRICS_COUNTERS_FILE, 'w', encoding='utf-8') as f:
             json.dump(metrics, f, ensure_ascii=False)
 
+        # 保存生物钟状态（精力/睡眠压力/睡眠债）
+        try:
+            from core.biorhythm import BIORHYTHM
+            BIORHYTHM.save()
+        except Exception:
+            pass
+
 def load_all_data():
     """从文件加载记忆和链接"""
     global memories, links
@@ -121,6 +128,13 @@ def load_all_data():
         from core.memory_engine import _evict_cold_memories, _evict_cold_links
         _evict_cold_memories()
         _evict_cold_links()
+
+        # 加载生物钟状态（按离线真实时长补算）
+        try:
+            from core.biorhythm import BIORHYTHM
+            BIORHYTHM.load()
+        except Exception:
+            pass
 
 # ========== 对话状态持久化 ==========
 

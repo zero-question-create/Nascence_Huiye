@@ -57,6 +57,7 @@ from utils.event_bus import BUS
 from core.cognition import inject_message_keywords, cognitive_loop, extract_keywords_jieba
 from core.memory_engine import create_memory, access_memory, pathfind_activation, retrieve_similar, memories
 from core.virtual_clock import clock
+from core.biorhythm import BIORHYTHM
 from config.constants import BOT_NAME
 from config.api_config import config
 
@@ -183,14 +184,18 @@ def extract_quote_message_id(message_segments: List[Dict]) -> Optional[str]:
     return None
 
 async def drift_loop():
-    """后台发散任务：随机激活记忆以强化半衰期，为认知循环提供热身种子"""
+    """后台发散任务：持续驱动生物钟，并随机激活记忆以强化半衰期、提供热身种子"""
     logger.info("[浅层意识] 发散任务已启动")
     while True:
-        if is_sleeping() and not _sleeping:
+        # 由生物钟自行判定入睡/醒来（不再依赖固定钟点）
+        BIORHYTHM.tick()
+        if BIORHYTHM.is_asleep() and not _sleeping:
             enter_sleep()
-        if _sleeping and not clock.in_sleep_window():
+        elif not BIORHYTHM.is_asleep() and _sleeping:
             wake_up()
         await asyncio.sleep(30)
+        if BIORHYTHM.is_asleep():
+            continue
         if not memories:
             continue
         mem_id = random.choice(list(memories.keys()))
@@ -199,14 +204,14 @@ async def drift_loop():
         logger.info(f"[浅层意识] 激活记忆 {mem_id[:8]}...")
 
 def is_sleeping() -> bool:
-    """判断当前是否处于睡眠时间窗口（含启动时强制睡眠状态）"""
+    """判断当前是否处于睡眠状态（由生物钟判定）"""
     global _sleeping
     if _sleeping:
         return True
-    return clock.in_sleep_window()
+    return BIORHYTHM.is_asleep()
 
 def enter_sleep():
-    """强制进入睡眠状态，并安排自动唤醒"""
+    """进入睡眠状态，并执行睡眠维护"""
     global _sleeping
     _sleeping = True
     logger.info(f"{BOT_NAME}进入了睡眠状态")
@@ -218,25 +223,24 @@ def enter_sleep():
         logger.error(f"[睡眠维护] 执行失败: {e}")
 
 def wake_up():
-    """从睡眠中唤醒（由定时器触发）"""
+    """从睡眠中唤醒"""
     global _sleeping
     _sleeping = False
     logger.info(f"{BOT_NAME}醒来了！")
 
 def init_sleep_state():
-    """启动时调用，如果当前处于睡眠窗口则立即进入睡眠"""
+    """启动时调用，若生物钟判定处于睡眠则立即进入睡眠"""
     if is_sleeping():
         enter_sleep()
     else:
-        # 如果不在睡眠窗口，但曾因重启丢失了唤醒定时器，则无需操作
-        logger.info(f"当前不在睡眠窗口，{BOT_NAME}保持清醒。")
+        logger.info(f"当前不在睡眠状态，{BOT_NAME}保持清醒。")
 
 # ---------- 消息处理核心 ----------
 async def handle_group_message(data: dict):
-    if is_sleeping():
-        return
-    """处理单条群消息"""
-    
+    """处理单条群消息
+
+    睡眠期间的策略：未被 @ 的消息直接忽略；被 @ 则唤醒后正常回应。
+    """
     group_id = str(data.get("group_id"))
     
     # 白名单过滤
@@ -279,6 +283,16 @@ async def handle_group_message(data: dict):
     is_mentioned_me = bot_qq in mentions
     if is_mentioned_me:
         mentions = [m for m in mentions if m != bot_qq]
+
+    # 睡眠判定（在解析出 @ 之后）：未被 @ 则忽略；被 @ 则唤醒后继续回应
+    if is_sleeping():
+        if is_mentioned_me:
+            logger.info(f"{BOT_NAME}正在睡觉，被 @ 唤醒")
+            BIORHYTHM.wake("qq@")
+            wake_up()   # 同步模块级睡眠标志，避免后续消息仍被当作睡眠期丢弃
+        else:
+            logger.debug(f"{BOT_NAME}正在睡觉，消息未被 @，忽略")
+            return
 
     # 多模态处理
     media_list = []  # 收集 (type, description)

@@ -528,7 +528,8 @@ class ControlPanel(QMainWindow):
         self.word_card = StatCard("词网规模")
         self.runtime_card = StatCard("运行时间")
         self.clock_card = StatCard("虚拟时间")
-        for card in (self.mem_card, self.link_card, self.word_card, self.runtime_card, self.clock_card):
+        self.energy_card = StatCard("精力")
+        for card in (self.mem_card, self.link_card, self.word_card, self.runtime_card, self.clock_card, self.energy_card):
             cards.addWidget(card)
         layout.addLayout(cards)
 
@@ -957,6 +958,11 @@ class ControlPanel(QMainWindow):
                 hours = int((virt_now % 86400) // 3600)
                 mins = int((virt_now % 3600) // 60)
                 self.clock_card.value.setText(f"{days}d {hours:02d}:{mins:02d}  ×{clock.speed:g}")
+
+            from core.biorhythm import BIORHYTHM
+            snap = BIORHYTHM.snapshot()
+            label = "睡眠中" if snap["state"] == "asleep" else "清醒"
+            self.energy_card.value.setText(f"{int(snap['energy']*100)}% {label}")
         except Exception:
             pass
 
