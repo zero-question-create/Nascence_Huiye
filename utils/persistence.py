@@ -28,10 +28,12 @@ def save_all_data():
             for mid in list(hot_ids):
                 mem = memories.get(mid)
                 if mem:
+                    creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
+                    strengthen = mem.get("last_strengthen_time", creation)
                     update_params.append((
-                        mem["last_accessed"],
-                        mem["half_life"],
-                        mem.get("last_strengthen_time", mem["creation_time"]),
+                        mem.get("last_accessed", 0.0),
+                        mem.get("half_life", 172800),
+                        strengthen,
                         mid
                     ))
             if update_params:

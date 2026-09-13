@@ -1,6 +1,7 @@
 # core/cognition.py
 import re
 import datetime
+import time
 import random
 from collections import deque
 

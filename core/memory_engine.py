@@ -37,8 +37,8 @@ WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与
 EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
-MAX_HOT_SIZE = 3000                 # 热记忆节点硬上限，防止爆炸
-MAX_HOT_LINKS = 100000                # 热链接硬上限，防止爆炸（冷链接落入 SQLite）
+MAX_HOT_SIZE = 1500                 # 热记忆节点硬上限，防止爆炸
+MAX_HOT_LINKS = 5000                # 热链接硬上限，防止爆炸（冷链接落入 SQLite）
 
 # ========== 体力消耗系数 ==========
 COST_FACTOR = {
@@ -301,10 +301,12 @@ def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
         params = []
         for mid in to_evict:
             mem = memories[mid]
+            creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
+            strengthen = mem.get("last_strengthen_time", creation)
             params.append((
-                mem["last_accessed"],
-                mem["half_life"],
-                mem.get("last_strengthen_time", mem["creation_time"]),
+                mem.get("last_accessed", 0.0),
+                mem.get("half_life", DEFAULT_HALF_LIFE),
+                strengthen,
                 mid
             ))
             del memories[mid]
@@ -659,11 +661,22 @@ def build_initial_links(new_mem_id: str):
             add_link(other_id, new_mem_id, sim, "semantic")
 
 def get_random_memory_id() -> str | None:
-    """在锁保护下安全随机选取一个热记忆 ID，避免并发迭代或下沉删除引发异常。"""
+    """在锁保护下安全随机选取一个记忆 ID，避免并发迭代或下沉删除引发异常。
+    依次检查：hot_ids -> memories -> SQLite 数据库兜底。
+    """
     with _data_lock:
-        if not hot_ids:
-            return None
-        return random.choice(tuple(hot_ids))
+        if hot_ids:
+            return random.choice(tuple(hot_ids))
+        if memories:
+            return random.choice(tuple(memories.keys()))
+        try:
+            db = _get_db()
+            row = db.execute("SELECT id FROM memories ORDER BY RANDOM() LIMIT 1").fetchone()
+            if row:
+                return row[0]
+        except Exception:
+            pass
+        return None
 
 def get_memory_content(mem_id: str) -> str | None:
     """在锁保护下安全获取记忆文本。如果已不在内存则从数据库兜底读取。"""
