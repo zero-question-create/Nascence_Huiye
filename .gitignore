@@ -28,6 +28,8 @@ run/control_panel.lock
 run/bat_temp.bat
 run/qt-plugins/
 run/lib/
+*.log
+debug.log
 
 # IDE
 .vscode/
