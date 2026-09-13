@@ -10,6 +10,7 @@ import faiss
 import numpy as np
 import sqlite3
 import threading
+import random
 from collections import deque
 from .virtual_clock import clock
 from utils.monitor import append_log
@@ -285,23 +286,37 @@ def _batch_load_memories(mem_ids: list):
         _load_links_for_memory(mem_id)
 
 def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
-    """将最久未访问的热数据移出内存，保留 SQLite 和 faiss"""
+    """将最久未访问的热数据移出内存，保留 SQLite 和 faiss。使用批量事务提升性能与安全性。"""
     with _data_lock:
         if len(hot_ids) <= max_hot:
             return
-        sorted_ids = sorted(hot_ids, key=lambda mid: memories[mid]["last_accessed"])
+        sorted_ids = sorted(
+            [mid for mid in hot_ids if mid in memories],
+            key=lambda mid: memories[mid]["last_accessed"]
+        )
         to_evict = sorted_ids[:len(hot_ids) - max_hot]
+        if not to_evict:
+            return
+
+        params = []
         for mid in to_evict:
             mem = memories[mid]
-            db = _get_db()
-            db.execute(
-                """UPDATE memories SET last_accessed = ?, half_life = ?, last_strengthen_time = ?
-                   WHERE id = ?""",
-                (mem["last_accessed"], mem["half_life"], mem["last_strengthen_time"], mid)
-            )
-            db.commit()
+            params.append((
+                mem["last_accessed"],
+                mem["half_life"],
+                mem.get("last_strengthen_time", mem["creation_time"]),
+                mid
+            ))
             del memories[mid]
             hot_ids.remove(mid)
+
+        db = _get_db()
+        db.executemany(
+            """UPDATE memories SET last_accessed = ?, half_life = ?, last_strengthen_time = ?
+               WHERE id = ?""",
+            params
+        )
+        db.commit()
 
 def _load_link_from_db(src_id: str, tgt_id: str):
     """从 SQLite 加载一条链接到内存（变热）。不存在返回 None。"""
@@ -642,6 +657,24 @@ def build_initial_links(new_mem_id: str):
         if sim >= SIMILARITY_THRESHOLD:
             add_link(new_mem_id, other_id, sim, "semantic")
             add_link(other_id, new_mem_id, sim, "semantic")
+
+def get_random_memory_id() -> str | None:
+    """在锁保护下安全随机选取一个热记忆 ID，避免并发迭代或下沉删除引发异常。"""
+    with _data_lock:
+        if not hot_ids:
+            return None
+        return random.choice(tuple(hot_ids))
+
+def get_memory_content(mem_id: str) -> str | None:
+    """在锁保护下安全获取记忆文本。如果已不在内存则从数据库兜底读取。"""
+    with _data_lock:
+        mem = memories.get(mem_id)
+        if mem:
+            return mem.get("content")
+        loaded = _load_memory_from_db(mem_id)
+        if loaded:
+            return loaded.get("content")
+        return None
 
 def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
     vec = text_to_vector(content)

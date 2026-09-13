@@ -208,9 +208,10 @@ async def drift_loop():
         await asyncio.sleep(30)
         if BIORHYTHM.is_asleep():
             continue
-        if not memories:
+        from core.memory_engine import get_random_memory_id
+        mem_id = get_random_memory_id()
+        if not mem_id:
             continue
-        mem_id = random.choice(list(memories.keys()))
         access_memory(mem_id)
         pathfind_activation([mem_id], max_stamina=1.0, top_k=3, max_steps=1)
         logger.info(f"[浅层意识] 激活记忆 {mem_id[:8]}...")

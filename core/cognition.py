@@ -489,29 +489,27 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 append_log(f"[认知循环] 消费队列关键词: {current_keywords}")
 
             # ============================
-            # Step 2: 若无关键词，从记忆库取种子
+            # Step 2: 若无关键词，从记忆库取种子（线程安全）
             # ============================
             if not current_keywords:
-                if memories:
-                    seed_text = None
-                    if _shallow_pool:
-                        mem_id = random.choice(list(_shallow_pool))
-                        mem = memories.get(mem_id)
-                        if mem:
-                            seed_text = mem["content"][:50]
-                    else:
-                        mem_id = random.choice(list(memories.keys()))
-                        mem = memories.get(mem_id)
-                        if mem:
-                            seed_text = mem["content"][:50]
+                from .memory_engine import get_random_memory_id, get_memory_content
+                seed_text = None
+                if _shallow_pool:
+                    mem_id = random.choice(list(_shallow_pool))
+                    content = get_memory_content(mem_id)
+                    if content:
+                        seed_text = content[:50]
+                if not seed_text:
+                    mem_id = get_random_memory_id()
+                    if mem_id:
+                        content = get_memory_content(mem_id)
+                        if content:
+                            seed_text = content[:50]
                             access_memory(mem_id)
 
-                    if seed_text:
-                        current_keywords = [seed_text]
-                        append_log(f"[认知循环] 无新消息，随机种子: {seed_text[:30]}...")
-                    else:
-                        await asyncio.sleep(10)
-                        continue
+                if seed_text:
+                    current_keywords = [seed_text]
+                    append_log(f"[认知循环] 无新消息，随机种子: {seed_text[:30]}...")
                 else:
                     await asyncio.sleep(10)
                     continue
@@ -579,9 +577,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 forced_seed_id = None
                 if _shallow_pool:
                     forced_seed_id = random.choice(list(_shallow_pool))
-                    forced_mem = memories.get(forced_seed_id)
-                    if forced_mem:
-                        current_keywords = [forced_mem["content"][:50]]
+                    forced_content = get_memory_content(forced_seed_id)
+                    if forced_content:
+                        current_keywords = [forced_content[:50]]
                         append_log(f"[反刍抑制] 强制转向：从浅层池抽取新种子 {forced_seed_id[:8]}...")
                     else:
                         forced_seed_id = None
