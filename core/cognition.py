@@ -455,6 +455,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     current_keywords = []
     prev_thought_text = None
     prev_should_speak = False
+    last_eviction_time = time.time()
 
     append_log("="*40)
     append_log("[认知循环] 永续认知循环启动")
@@ -773,6 +774,17 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                     expired_keywords += 1
             if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
                 append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
+
+            # ============================
+            # 阶段6：定时冷热数据下沉（每10分钟）
+            # ============================
+            if time.time() - last_eviction_time >= 600:
+                last_eviction_time = time.time()
+                try:
+                    from .memory_engine import periodic_cold_eviction
+                    periodic_cold_eviction()
+                except Exception as e:
+                    append_log(f"[认知循环] 定时下沉异常: {e}")
 
             await asyncio.sleep(1)
 

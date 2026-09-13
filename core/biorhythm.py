@@ -174,17 +174,24 @@ class Biorhythm:
         """精力 → 思考深度系数 ∈ [0.5, 1.0]。低精力时想得浅。"""
         return 0.5 + 0.5 * self.energy
 
-    def feeling_text(self) -> str:
-        """按精力分档生成第一人称身体感受（纯字符串，不调 LLM）。"""
+    def feeling_text(self) -> str | None:
+        """按精力分档生成第一人称身体感受（纯字符串，不调 LLM）。
+
+        - 正常起床且精力充沛（energy >= 0.4）：返回 None，不产生多余记忆。
+        - 刚被叫醒（用户 @ 唤醒，处于清醒锁定窗口期）：体现被吵醒的迷糊状态。
+        - 仅在精力 < 0.4（开始疲惫/极度困倦）时附加感受。
+        """
+        now = time.time()
+        # 1. 处于被强行唤醒的锁定保护期
+        if self.woke_by_user and now < self.awake_until:
+            return "[现在] 我刚被吵醒，脑子还发懵，有点迷糊"
+
         e = self.energy
-        if self.is_asleep():
-            return "[现在] 我睡着了，意识沉在很深的地方"
-        if e >= 0.75:
-            return "[现在] 我精神很好，思路很清楚"
-        if e >= 0.55:
-            return "[现在] 我还行，注意力还算集中"
+        # 2. 精力充沛正常状态：不附加任何感受记忆
         if e >= 0.4:
-            return "[现在] 我有点乏了，注意力没那么容易集中"
+            return None
+
+        # 3. 疲乏与濒临入睡状态（仅 < 0.4 时附加）
         if e >= 0.25:
             return "[现在] 我挺累的，眼皮开始发沉，想找个地方歇一会儿"
         return "[现在] 我快撑不住了，脑子迷迷糊糊的，只想睡觉"

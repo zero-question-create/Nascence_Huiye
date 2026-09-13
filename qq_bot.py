@@ -184,8 +184,9 @@ def extract_quote_message_id(message_segments: List[Dict]) -> Optional[str]:
     return None
 
 async def drift_loop():
-    """后台发散任务：持续驱动生物钟，并随机激活记忆以强化半衰期、提供热身种子"""
+    """后台发散任务：持续驱动生物钟，并随机激活记忆以强化半衰期、提供热身种子，定时执行冷热下沉"""
     logger.info("[浅层意识] 发散任务已启动")
+    last_eviction_time = time.time()
     while True:
         # 由生物钟自行判定入睡/醒来（不再依赖固定钟点）
         BIORHYTHM.tick()
@@ -193,6 +194,17 @@ async def drift_loop():
             enter_sleep()
         elif not BIORHYTHM.is_asleep() and _sleeping:
             wake_up()
+
+        # 定时下沉：每 10 分钟检查一次，将超出上限的最久未访问记忆与链接下沉至 SQLite
+        now = time.time()
+        if now - last_eviction_time >= 600:
+            last_eviction_time = now
+            try:
+                from core.memory_engine import periodic_cold_eviction
+                periodic_cold_eviction()
+            except Exception as e:
+                logger.error(f"[定时下沉] 执行异常: {e}")
+
         await asyncio.sleep(30)
         if BIORHYTHM.is_asleep():
             continue

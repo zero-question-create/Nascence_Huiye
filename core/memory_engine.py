@@ -369,6 +369,28 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
             del links[(src, tgt)]
         db.commit()
 
+def periodic_cold_eviction(max_mem=MAX_HOT_SIZE, max_link=MAX_HOT_LINKS) -> dict:
+    """定时热节点与热链接下沉检查。超出上限的部分下沉到 SQLite，维持内存稳定。"""
+    with _data_lock:
+        mem_before = len(hot_ids)
+        link_before = len(links)
+        _evict_cold_memories(max_hot=max_mem)
+        _evict_cold_links(max_hot=max_link)
+        mem_evicted = mem_before - len(hot_ids)
+        link_evicted = link_before - len(links)
+
+    if mem_evicted > 0 or link_evicted > 0:
+        append_log(
+            f"[定时下沉] 已淘汰热数据: 记忆节点下沉 {mem_evicted} 条 (剩余热节点 {len(hot_ids)}), "
+            f"热链接下沉 {link_evicted} 条 (剩余热链接 {len(links)})"
+        )
+    return {
+        "mem_evicted": mem_evicted,
+        "mem_hot": len(hot_ids),
+        "link_evicted": link_evicted,
+        "link_hot": len(links),
+    }
+
 def _sync_all_links_to_sqlite():
     """全量对齐 SQLite links 表与当前链接状态（内存热链接 + 已下沉冷链接），并清理孤儿。
 
