@@ -38,6 +38,17 @@ logging.basicConfig(
     ],
 )
 
+_is_shutting_down = False  # 标志是否处于优雅关停过程中
+
+class _ShutdownHandshakeFilter(logging.Filter):
+    """过滤关服瞬态由服务端主动关闭导致的握手失败噪音频出。"""
+    def filter(self, record):
+        if _is_shutting_down and ("opening handshake failed" in record.getMessage() or "server closing" in record.getMessage()):
+            return False
+        return True
+
+logging.getLogger("websockets.server").addFilter(_ShutdownHandshakeFilter())
+
 if sys.platform == "linux":
     local_lib = RUN_DIR / "lib" / "usr" / "lib" / "x86_64-linux-gnu"
     if local_lib.is_dir():
@@ -729,40 +740,66 @@ async def start_server():
 
     # 浅层意识发散任务（记忆热身，认知循环随 NapCat 连接启动）
     drift_task = asyncio.create_task(drift_loop())
-    
+
+    global _is_shutting_down
+    _is_shutting_down = False
+
+    # 针对 Windows 平台 ProactorEventLoop 关机时底层 IOCP 的 _attach AssertionError 竞态进行静默过滤
+    loop = asyncio.get_running_loop()
+    orig_handler = loop.get_exception_handler()
+    def _graceful_exception_handler(current_loop, context):
+        exc = context.get("exception")
+        handle = str(context.get("handle", ""))
+        if isinstance(exc, AssertionError) and "_attach" in handle:
+            return
+        if "BaseProactorEventLoop._start_serving" in handle:
+            return
+        if orig_handler:
+            orig_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_graceful_exception_handler)
+
+    server = await websockets.serve(ws_handler, WS_HOST, WS_PORT)
     try:
-        async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
-            logger.info(f"WebSocket 服务器已启动，等待 NapCat 连接: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
-            await _shutdown_event.wait()
+        logger.info(f"WebSocket 服务器已启动，等待 NapCat 连接: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
+        await _shutdown_event.wait()
 
-            # ========== 服务停止：优雅关停 ==========
-            # 顺序：请求认知循环完成当前轮 → 等待其退出 → 再断开 NapCat
-            logger.info("[服务停止] 请求认知循环完成当前轮…")
-            from core.cognition import request_graceful_stop
-            request_graceful_stop()
-            if _cognitive_task and not _cognitive_task.done():
+        # ========== 服务停止：优雅关停 ==========
+        _is_shutting_down = True
+        logger.info("[服务停止] 请求认知循环完成当前轮…")
+        from core.cognition import request_graceful_stop
+        request_graceful_stop()
+        if _cognitive_task and not _cognitive_task.done():
+            try:
+                await asyncio.wait_for(_cognitive_task, timeout=60)
+            except asyncio.TimeoutError:
+                _cognitive_task.cancel()
                 try:
-                    await asyncio.wait_for(_cognitive_task, timeout=60)
-                except asyncio.TimeoutError:
-                    _cognitive_task.cancel()
-                    try:
-                        await _cognitive_task
-                    except asyncio.CancelledError:
-                        pass
-                    logger.warning("[服务停止] 认知循环超时强制取消")
-                _cognitive_task = None
-                logger.info("[服务停止] 认知循环已结束")
-            else:
-                logger.info("[服务停止] 认知循环未运行")
+                    await _cognitive_task
+                except asyncio.CancelledError:
+                    pass
+                logger.warning("[服务停止] 认知循环超时强制取消")
+            _cognitive_task = None
+            logger.info("[服务停止] 认知循环已结束")
+        else:
+            logger.info("[服务停止] 认知循环未运行")
 
-            # 认知循环结束后再断开 NapCat（触发 ws_handler 的 finally 释放）
-            if _napcat_websocket is not None:
-                try:
-                    await _napcat_websocket.close(code=1000, reason="service stopping")
-                    logger.info("[服务停止] NapCat 已断开")
-                except Exception:
-                    logger.warning("[服务停止] NapCat 断开失败（可能已断开）")
+        # 认知循环结束后先断开 NapCat
+        if _napcat_websocket is not None:
+            try:
+                await _napcat_websocket.close(code=1000, reason="service stopping")
+                logger.info("[服务停止] NapCat 已断开")
+            except Exception:
+                logger.warning("[服务停止] NapCat 断开失败（可能已断开）")
+
+        # 显式关闭监听服务器并等待底层资源释放
+        server.close()
+        await server.wait_closed()
+        await asyncio.sleep(0.05)  # 留出短暂缓冲排空底层残余事件
     finally:
+        _is_shutting_down = True
         global _final_save_done
         _napcat_websocket = None
         _final_save_done = False
@@ -772,9 +809,15 @@ async def start_server():
             _cognitive_task.cancel()
             try:
                 await _cognitive_task
-            except:
+            except Exception:
                 pass
         await asyncio.gather(save_task, drift_task, return_exceptions=True)
+        try:
+            server.close()
+            await server.wait_closed()
+        except Exception:
+            pass
+        loop.set_exception_handler(orig_handler)
         if not _final_save_done:
             _final_save_done = True
             from utils.persistence import save_all_data, save_state
