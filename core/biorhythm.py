@@ -38,8 +38,8 @@ STATE_FILE = "data/test/biorhythm.json"
 T_WAKE = 19.0 * 3600
 # 睡眠时睡眠压力回落的指数时间常数（秒）→ 决定"睡多久会醒"
 T_SLEEP = 9.1 * 3600
-# 入睡阈值（须落在 S 的渐近区间 (0,1) 内，否则永不触达）
-ONSET_THRESHOLD = 0.72
+# 入睡阈值（从 0.72 调低至 0.65，使精力降到 0.35 时迅速触发入睡，避免在微困区间久悬）
+ONSET_THRESHOLD = 0.65
 # 醒来阈值
 WAKE_THRESHOLD = 0.30
 # 被用户点名唤醒后的清醒锁定时间（秒）：期间不会立刻重新睡去，以便完成回应
@@ -71,6 +71,7 @@ class Biorhythm:
         self.last_onset = None      # 上次入睡真实时刻（供观测实际节律）
         self.last_wake = None
         self.awake_until = 0.0      # 清醒锁定到此时刻（被点名唤醒后）
+        self.last_feeling_time = 0.0 # 上次注入身体感受的时刻（防每轮轰炸）
         self._replaying = False     # 离线补算中（跳过重量级睡眠维护）
         _load_params()
         self.load()
@@ -174,16 +175,19 @@ class Biorhythm:
         """精力 → 思考深度系数 ∈ [0.5, 1.0]。低精力时想得浅。"""
         return 0.5 + 0.5 * self.energy
 
-    def feeling_text(self) -> str | None:
+    def feeling_text(self, min_interval: float = 900.0) -> str | None:
         """按精力分档生成第一人称身体感受（纯字符串，不调 LLM）。
 
         - 正常起床且精力充沛（energy >= 0.4）：返回 None，不产生多余记忆。
         - 刚被叫醒（用户 @ 唤醒，处于清醒锁定窗口期）：体现被吵醒的迷糊状态。
-        - 仅在精力 < 0.4（开始疲惫/极度困倦）时附加感受。
+        - 仅在精力 < 0.4 时附加感受，且加 15 分钟 (900s) 冷却，绝不每轮重复洗脑。
         """
         now = time.time()
         # 1. 处于被强行唤醒的锁定保护期
         if self.woke_by_user and now < self.awake_until:
+            if now - self.last_feeling_time < min_interval:
+                return None
+            self.last_feeling_time = now
             return "[现在] 我刚被吵醒，脑子还发懵，有点迷糊"
 
         e = self.energy
@@ -191,7 +195,12 @@ class Biorhythm:
         if e >= 0.4:
             return None
 
-        # 3. 疲乏与濒临入睡状态（仅 < 0.4 时附加）
+        # 3. 冷却检查：疲倦感受 15 分钟内最多浮现一次，避免认知循环每 3 秒自我催眠
+        if now - self.last_feeling_time < min_interval:
+            return None
+
+        self.last_feeling_time = now
+        # 4. 疲乏与濒临入睡状态（仅 < 0.4 时附加）
         if e >= 0.25:
             return "[现在] 我挺累的，眼皮开始发沉，想找个地方歇一会儿"
         return "[现在] 我快撑不住了，脑子迷迷糊糊的，只想睡觉"
