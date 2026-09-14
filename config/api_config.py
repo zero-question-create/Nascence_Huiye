@@ -39,10 +39,10 @@ DEFAULT_CONFIG = {
     "active_group_id": "123456",
     "napcat_token": "Nascence",
     # ===== 生物钟参数（动力学速率，非钟点；不预设节律周期）=====
-    "biorhythm_wake_seconds": 19.0 * 3600,  # 清醒时睡眠压力上升的指数时间常数（秒）
+    "biorhythm_wake_seconds": 18.40 * 3600, # 清醒时睡眠压力上升的指数时间常数（秒）
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）
-    "biorhythm_onset_threshold": 0.65,      # 入睡阈值（S 达到此值即精力跌破 0.35 时迅速入睡）
-    "biorhythm_wake_threshold": 0.30        # 醒来阈值（S 低于此值醒来）
+    "biorhythm_onset_threshold": 0.62,      # 入睡阈值（S 达到 0.62 即精力 0.38 时入睡）
+    "biorhythm_wake_threshold": 0.20        # 醒来阈值（S 低于 0.20 即精力回到 0.80 时醒来）
 }
 
 def load_config():
