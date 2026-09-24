@@ -157,6 +157,10 @@ class Biorhythm:
             # 清醒锁定：给足时间完成这次回应，不会话说到一半又睡回去
             self.awake_until = now + AWAKE_LOCK
             append_log(f"[生物钟] 被唤醒（{reason}，仅睡 {dur/3600:.2f}h，压力仍 {self.s:.2f}）")
+            try:
+                self.save()
+            except Exception as e:
+                append_log(f"[生物钟] 保存唤醒状态失败: {e}")
 
     def force_sleep(self, reason: str = "manual"):
         """外部强制入睡（调试/面板用）。"""

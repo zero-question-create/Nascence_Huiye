@@ -161,9 +161,14 @@ manifest = QQManifest()
 
 # ---------- 工具函数 ----------
 def parse_cq_code(text: str) -> Tuple[str, List[str]]:
-    """移除CQ码，提取被@的QQ号列表"""
-    pattern = re.compile(r'\[CQ:at,qq=(\d+)(?:,name=[^\]]+)?\]')
-    mentions = pattern.findall(text)
+    """移除CQ码，提取被@的QQ号列表（兼容扩展字段如 text/name 以及参数顺序）"""
+    # 匹配 [CQ:at,qq=123456] 或 [CQ:at,qq=123456,text=@xxx] 或 [CQ:at,text=@xxx,qq=123456] 等
+    mentions = []
+    for m in re.finditer(r'\[CQ:at,([^\]]+)\]', text):
+        params_str = m.group(1)
+        qq_match = re.search(r'(?:^|,)qq=(\w+)', params_str)
+        if qq_match:
+            mentions.append(qq_match.group(1))
     clean_text = re.sub(r'\[CQ:[^\]]+\]', '', text).strip()
     return clean_text, mentions
 
@@ -292,6 +297,18 @@ async def handle_group_message(data: dict):
     raw_str = data.get("raw_message", "")
     clean_text, mentions = parse_cq_code(raw_str)
 
+    # 从结构化 message 数组补充 @ 目标（处理 NapCat 未以标准 CQ 码上报或多段消息）
+    for seg in data.get("message", []):
+        if seg.get("type") == "at":
+            at_qq = str(seg.get("data", {}).get("qq", "")).strip()
+            if at_qq and at_qq not in mentions:
+                mentions.append(at_qq)
+
+    # 检查纯文本手打 @（如 "@辉夜"）或 @全体成员
+    bot_qq = get_bot_qq()
+    text_has_bot_name = f"@{BOT_NAME}" in raw_str or f"@{BOT_NAME}" in clean_text
+    is_mentioned_me = (bot_qq in mentions) or ("all" in mentions) or text_has_bot_name
+
     # 消息前缀忽略
     if clean_text.lstrip().startswith(IGNORE_PREFIX):
         logger.info(f"消息以忽略前缀 '{IGNORE_PREFIX}' 开头，忽略")
@@ -299,14 +316,12 @@ async def handle_group_message(data: dict):
     elif IGNORE_PREFIX in clean_text:           # 包含即忽略
         logger.info(f"消息包含忽略字符 '{IGNORE_PREFIX}' ，忽略")
         return
-    clean_text = clean_text.replace(f"@{BOT_NAME}","")
-    if clean_text.strip():
-        BUS.message.emit(sender_name, clean_text.strip(), "QQ")
+    clean_text = clean_text.replace(f"@{BOT_NAME}", "").strip()
+    if clean_text:
+        BUS.message.emit(sender_name, clean_text, "QQ")
 
-    bot_qq = get_bot_qq()
-    is_mentioned_me = bot_qq in mentions
     if is_mentioned_me:
-        mentions = [m for m in mentions if m != bot_qq]
+        mentions = [m for m in mentions if m != bot_qq and m != "all"]
 
     # 睡眠判定（在解析出 @ 之后）：未被 @ 则忽略；被 @ 则唤醒后继续回应
     if is_sleeping():
@@ -446,10 +461,25 @@ async def handle_group_message(data: dict):
         old_key = _recent_msg_list.pop(0)
         _recent_msg_set.discard(old_key)
 
-    # 纯@无文本 → 简单回复，不存入记忆（因为是无效交互）
-    if not augmented_input and not mentions:
-        # “纯@机器人”（只@了机器人且无文字）
-        await send_group_msg(group_id, "嗯？我在呢~")
+    # 纯@无文本（且无多媒体）→ 简单回复，记录对话并通知，不存入深层记忆
+    if is_mentioned_me and not clean_text and not media_list and not mentions:
+        # 判断是否处于刚被吵醒的迷糊锁定状态
+        if BIORHYTHM.woke_by_user and time.time() < BIORHYTHM.awake_until:
+            wake_reply = random.choice([
+                "唔……刚被叫醒，脑子还迷迷糊糊的，怎么啦？",
+                "嗯……还在犯困呢，找我有什么事吗？",
+                "哈欠……醒了醒了，怎么啦？"
+            ])
+        else:
+            wake_reply = random.choice([
+                "嗯？我在呢~",
+                "怎么啦？我在这呢。",
+                "在的，找我有什么事吗？"
+            ])
+        await send_group_msg(group_id, wake_reply)
+        from core.llm_interface import add_to_history
+        add_to_history(sender_name, "（叫了辉夜一声）", wake_reply, "QQ")
+        BUS.message.emit(BOT_NAME, wake_reply, "QQ")
         return
 
     # 提取引用消息

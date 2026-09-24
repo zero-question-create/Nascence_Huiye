@@ -325,6 +325,12 @@ class Runtime:
         from core.cognition import process_dialogue
         from core.llm_interface import add_to_history
         from utils.persistence import append_dialogue, save_all_data, save_state
+        from core.biorhythm import BIORHYTHM
+        import qq_bot
+
+        if mentioned and BIORHYTHM.is_asleep():
+            BIORHYTHM.wake("panel@")
+            qq_bot.wake_up()
 
         augmented = (
             f'{sender}对{BOT_NAME}说：“{text}”'
