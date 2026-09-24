@@ -473,6 +473,11 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
 
     global _pending_note_memory
 
+    # 已收到停止信号：不再发起新的 LLM 抉择，让本轮尽快收尾。
+    # 抉择一轮最多要连发 5 次 API 请求（翻页），会把关停拖住。
+    if _graceful_stop:
+        return None
+
     if not action_enabled():
         return None
 

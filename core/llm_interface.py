@@ -52,12 +52,13 @@ def get_history_context() -> str:
     append_log(result)
     return result
 
-def call_api_thinking(messages, max_tokens=8000, thinking=True):
+def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
     """
     LLM思考模式唯一外部调用接口。
 
     thinking=False 时关闭推理（不发送 reasoning_effort / thinking 字段），
     用于“输出一句 JSON 短句”这类不需要推理的调用，可大幅降低输出 token。
+    timeout: 单次请求超时（秒）。默认 60 秒，避免网络挂起把认知循环与关停一起拖住。
     """
     kwargs = {
         "model": MODEL,
@@ -65,6 +66,7 @@ def call_api_thinking(messages, max_tokens=8000, thinking=True):
         "max_tokens": max_tokens,
         "temperature": 0.1,
         "stream": False,
+        "timeout": timeout,
     }
     if thinking:
         kwargs["reasoning_effort"] = "high"

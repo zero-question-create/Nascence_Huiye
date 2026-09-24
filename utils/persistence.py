@@ -9,6 +9,12 @@ from core.virtual_clock import clock
 
 _io_lock = threading.Lock()
 
+# 保存节流：关停路径上 QQ 服务与面板会各保存一次，短时间内的重复调用只是重做同样的落盘。
+# 小于该间隔的重复保存直接跳过；关停时用 save_all_data(force=True) 保证最后一次一定落盘。
+_SAVE_MIN_INTERVAL = 3.0
+_last_save_time = 0.0
+_save_count = 0                # 统计实际执行的保存次数（供测试与观测）
+
 MEMORY_FILE = "data/test/memory.json"
 STATE_FILE = "data/test/dialogue_state.json"
 DIALOGUE_LOG_FILE = "data/test/dialogue_log.jsonl"
@@ -18,64 +24,84 @@ METRICS_COUNTERS_FILE = "data/test/metrics_counters.json"
 
 # ========== 记忆持久化 ==========
 
-def save_all_data():
-    """保存记忆和链接到文件（原子写入，双锁保护避免并发下沉冲突）"""
+def save_all_data(force: bool = False) -> bool:
+    """保存记忆和链接到文件（原子写入，双锁保护避免并发下沉冲突）。
+
+    force=False 时做节流：距上次保存不足 _SAVE_MIN_INTERVAL 秒则跳过，
+    避免关停等路径上重复执行同一份落盘。返回是否真正执行了保存。
+    """
+    global _last_save_time, _save_count
     with _io_lock:
-        from core.memory_engine import _data_lock, _get_db, hot_ids, memories
-        with _data_lock:
-            db = _get_db()
-            update_params = []
-            for mid in list(hot_ids):
-                mem = memories.get(mid)
-                if mem:
-                    creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
-                    strengthen = mem.get("last_strengthen_time", creation)
-                    update_params.append((
-                        mem.get("last_accessed", 0.0),
-                        mem.get("half_life", 172800),
-                        strengthen,
-                        mid
-                    ))
-            if update_params:
-                db.executemany(
-                    "UPDATE memories SET last_accessed=?, half_life=?, last_strengthen_time=? WHERE id=?",
-                    update_params
-                )
-                db.commit()
+        now = time.time()
+        if not force and (now - _last_save_time) < _SAVE_MIN_INTERVAL:
+            return False
+        _last_save_time = now
+        _save_count += 1
+        _do_save_all_data()
+        return True
 
-            os.makedirs("data/test", exist_ok=True)
-            serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in list(links.items())}
-            serializable_word_links = {f"{a}||{b}": val for (a, b), val in list(wordweb.items())}
-            data = {"memories": {mid: memories[mid] for mid in list(hot_ids) if mid in memories}, "links": serializable_sentence_links, "wordweb": serializable_word_links}
-            tmp_file = MEMORY_FILE + ".tmp"
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, MEMORY_FILE)
 
-            # 热链接下沉到 SQLite + 清理孤儿（全量对齐，冷链接保留）
-            from core.memory_engine import _sync_all_links_to_sqlite
-            _sync_all_links_to_sqlite()
+def _do_save_all_data():
+    """实际执行保存（调用方需持有 _io_lock）。"""
+    from core.memory_engine import _data_lock, _get_db, hot_ids, memories
+    with _data_lock:
+        db = _get_db()
+        update_params = []
+        for mid in list(hot_ids):
+            mem = memories.get(mid)
+            if mem:
+                creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
+                strengthen = mem.get("last_strengthen_time", creation)
+                update_params.append((
+                    mem.get("last_accessed", 0.0),
+                    mem.get("half_life", 172800),
+                    strengthen,
+                    mid
+                ))
+        if update_params:
+            db.executemany(
+                "UPDATE memories SET last_accessed=?, half_life=?, last_strengthen_time=? WHERE id=?",
+                update_params
+            )
+            db.commit()
 
-            clock.save_state()
+        os.makedirs("data/test", exist_ok=True)
+        serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in list(links.items())}
+        serializable_word_links = {f"{a}||{b}": val for (a, b), val in list(wordweb.items())}
+        data = {
+            "memories": {mid: memories[mid] for mid in list(hot_ids) if mid in memories},
+            "links": serializable_sentence_links,
+            "wordweb": serializable_word_links,
+        }
+        tmp_file = MEMORY_FILE + ".tmp"
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, MEMORY_FILE)
 
-            from core.memory_engine import _faiss_index, _faiss_to_mem
-            import faiss
-            faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
-            with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
-                json.dump(_faiss_to_mem, f, ensure_ascii=False)
+        # 热链接增量下沉到 SQLite（只写本轮发生变化的行）
+        from core.memory_engine import _sync_all_links_to_sqlite
+        _sync_all_links_to_sqlite()
 
-        # 保存每日指标计数器快照
-        from core.memory_engine import _export_metrics_counters
-        metrics = _export_metrics_counters()
-        with open(METRICS_COUNTERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(metrics, f, ensure_ascii=False)
+        clock.save_state()
 
-        # 保存生物钟状态（精力/睡眠压力/睡眠债）
-        try:
-            from core.biorhythm import BIORHYTHM
-            BIORHYTHM.save()
-        except Exception:
-            pass
+        from core.memory_engine import _faiss_index, _faiss_to_mem
+        import faiss
+        faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
+        with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_faiss_to_mem, f, ensure_ascii=False)
+
+    # 保存每日指标计数器快照
+    from core.memory_engine import _export_metrics_counters
+    metrics = _export_metrics_counters()
+    with open(METRICS_COUNTERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, ensure_ascii=False)
+
+    # 保存生物钟状态（精力/睡眠压力/睡眠债）
+    try:
+        from core.biorhythm import BIORHYTHM
+        BIORHYTHM.save()
+    except Exception:
+        pass
 
 def load_all_data():
     """从文件加载记忆和链接"""
@@ -214,7 +240,9 @@ def sleep_cleanup():
         for key in dead_links:
             del links[key]
             removed_links += 1
-            from core.memory_engine import _bump_link_deleted
+            from core.memory_engine import _bump_link_deleted, _deleted_links, _dirty_links
+            _dirty_links.discard(key)
+            _deleted_links.add(key)
             _bump_link_deleted()
         # 剪枝 SQLite 中已下沉的冷链接（不在内存中的）
         from core.memory_engine import _get_db

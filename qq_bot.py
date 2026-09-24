@@ -874,7 +874,9 @@ async def start_server():
         request_graceful_stop()
         if _cognitive_task and not _cognitive_task.done():
             try:
-                await asyncio.wait_for(_cognitive_task, timeout=60)
+                # 认知循环当前轮含多次 LLM 调用，收尾时间收紧到 20 秒，
+                # 避免单次 API 挂起把整个关停拖满一分钟以上。
+                await asyncio.wait_for(_cognitive_task, timeout=20)
             except asyncio.TimeoutError:
                 _cognitive_task.cancel()
                 try:
@@ -922,7 +924,8 @@ async def start_server():
         if not _final_save_done:
             _final_save_done = True
             from utils.persistence import save_all_data, save_state
-            save_all_data()
+            # 关停的最后一次保存必须落盘，绕过节流
+            save_all_data(force=True)
             save_state()
             logger.info("最终保存：记忆和状态已持久化")
 

@@ -325,7 +325,8 @@ class Runtime:
             except Exception:
                 pass
         if self.qq_thread:
-            self.qq_thread.join(timeout=90)
+            # 关停已走优雅路径（等认知循环收尾 + 落盘），给足时间但不再无限等待
+            self.qq_thread.join(timeout=30)
 
     def chat(self, sender, text, group_id, mentioned):
         self.initialize()
@@ -417,12 +418,12 @@ class Runtime:
         logging.info("管理员注入记忆成功，ID=%s，内容=%s", memory_id, content)
         return memory_id
 
-    def save(self):
+    def save(self, force: bool = False):
         if not self.initialized:
             return
         from utils.persistence import save_all_data, save_state
 
-        save_all_data()
+        save_all_data(force=force)
         save_state()
         logging.info("记忆和对话状态已完整保存")
 
@@ -435,7 +436,8 @@ class Runtime:
         except Exception:
             pass
         try:
-            self.save()
+            # 关停是最后一次落盘机会，绕过节流确保写入
+            self.save(force=True)
         except Exception:
             logging.exception("退出保存失败")
         if self.ollama_process and self.ollama_process.poll() is None:
@@ -1233,12 +1235,38 @@ class ControlPanel(QMainWindow):
         QMessageBox.critical(self, "任务执行失败", "任务发生错误，完整堆栈已写入日志页面。")
 
     def closeEvent(self, event):
-        self.timer.stop()
+        # 关停包含停服务、落盘、关 Ollama 等同步阻塞步骤（最坏可达十余秒）。
+        # 若直接在 GUI 线程里跑，窗口会失去响应、被系统标记为"未响应"，
+        # 因此改为：先在后台线程完成关停，结束后再真正关闭窗口。
+        if not getattr(self, "_shutdown_started", False):
+            self._shutdown_started = True
+            event.ignore()
+            self.timer.stop()
+            self.set_status("正在停止服务并保存数据…")
+            self.status_display.setText("正在停止服务并保存数据，请稍候…\n窗口将在完成后自动关闭。")
+            self.setEnabled(False)
+            self.run_worker(self._shutdown_background, on_finished=self._finish_close)
+            return
         event.accept()
-        self._shutdown_done = True
+
+    def _shutdown_background(self):
+        """在后台线程执行的关停流程（不触碰任何 Qt 控件）。"""
         from utils.message_history import flush_to_file
-        RUNTIME.shutdown()
-        flush_to_file()
+        try:
+            RUNTIME.shutdown()
+        except Exception:
+            logging.exception("关停过程中出现异常")
+        try:
+            flush_to_file()
+        except Exception:
+            logging.exception("对话历史落盘失败")
+        # 必须先于窗口真正关闭完成，避免 main() 重复执行关停
+        self._shutdown_done = True
+
+    def _finish_close(self):
+        """关停完成后回到 GUI 线程关闭窗口。"""
+        self.timer.stop()
+        self.close()
 
 
 STYLE = """

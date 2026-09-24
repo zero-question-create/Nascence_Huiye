@@ -60,6 +60,12 @@ hot_ids = set()                     # 当前在内存中的记忆 ID
 _last_created_ids = []              # 存储本轮新增的记忆 ID（QQ接口：用于追踪本轮对话新创建的记忆（供 QQ bot 获取））
 word_to_memories = {}               # {词: set(memory_id)}
 
+# ========== 链接增量同步标记 ==========
+# 热链接的改动记在这里，保存时只落这部分，避免每次全量重写整张 links 表。
+# 规模较大时（实测 9 万行）全量重写要十几秒，而绝大多数行并未变化。
+_dirty_links = set()                # {(src, tgt)}：新增或权重/类型有变化
+_deleted_links = set()              # {(src, tgt)}：已从内存移除，需要从 SQLite 删除
+
 # ========== 每日指标计数器 ==========
 # 当日累计值（每次事件发生时 +1）
 _count_mem_created = 0
@@ -209,6 +215,8 @@ def _get_db():
         os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
         _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         _db_conn.execute("PRAGMA journal_mode=WAL")  # 提高并发读性能
+        # 记忆数据可容忍断电丢最后少量事务，换取明显更快的批量写入
+        _db_conn.execute("PRAGMA synchronous=NORMAL")
         _db_conn.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -232,7 +240,9 @@ def _get_db():
                 PRIMARY KEY (src, tgt)
             )
         """)
-        _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_src ON links(src)")
+        # 主键 (src, tgt) 已能服务 src 前缀查询，idx_links_src 属重复索引，只拖慢写入。
+        # idx_links_tgt 供"邻居查询"（src=? OR tgt=?）使用，保留。
+        _db_conn.execute("DROP INDEX IF EXISTS idx_links_src")
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
     return _db_conn
 
@@ -384,6 +394,9 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
                  d.get("creation_time", 0))
             )
             del links[(src, tgt)]
+            # 已直接写入 SQLite，无需再算作待同步的脏数据
+            _dirty_links.discard((src, tgt))
+            _deleted_links.discard((src, tgt))
         db.commit()
 
 def periodic_cold_eviction(max_mem=MAX_HOT_SIZE, max_link=MAX_HOT_LINKS) -> dict:
@@ -408,43 +421,79 @@ def periodic_cold_eviction(max_mem=MAX_HOT_SIZE, max_link=MAX_HOT_LINKS) -> dict
         "link_hot": len(links),
     }
 
-def _sync_all_links_to_sqlite():
-    """全量对齐 SQLite links 表与当前链接状态（内存热链接 + 已下沉冷链接），并清理孤儿。
+def _sync_all_links_to_sqlite(full: bool = False):
+    """把内存中发生变化的链接增量同步到 SQLite，并处理被删除的链接。
 
-    低频调用（定时保存、睡眠维护）使用；确保 SQLite 与内存一致，
-    同时清除 decay_link 删除后残留的孤儿链接。返回写入的链接总数。
+    默认增量：只写 _dirty_links 标记过的行、删 _deleted_links 标记过的行。
+    链接规模可达数万行（实测 9 万行时全量重写需十几秒），而每次保存真正变化的
+    通常只有几十行，因此增量写入把这一步从"十几秒"降到"毫秒级"。
+
+    full=True 时退回全量对齐（读取冷链接 + 覆盖写入），仅用于修复性场景。
+    返回本次写入的链接数。
     """
     with _data_lock:
         db = _get_db()
-        # 读取已下沉的冷链接（内存中没有的）
-        existing = {}
-        rows = db.execute("SELECT src, tgt, weight, type, last_accessed, creation_time FROM links").fetchall()
-        for src, tgt, weight, ltype, last_accessed, creation_time in rows:
-            key = (src, tgt)
-            if key in links:
-                continue  # 以内存热链接为准
-            existing[key] = {
-                "weight": weight,
-                "type": ltype,
-                "last_accessed": last_accessed,
-                "creation_time": creation_time,
-            }
-        # 合并：冷链接 + 热链接（热覆盖冷同名）
-        merged = dict(existing)
-        for key, d in links.items():
-            merged[key] = d
-        # 全量重写
-        db.execute("DELETE FROM links")
-        for (src, tgt), d in merged.items():
-            db.execute(
+
+        if full:
+            existing = {}
+            rows = db.execute("SELECT src, tgt, weight, type, last_accessed, creation_time FROM links").fetchall()
+            for src, tgt, weight, ltype, last_accessed, creation_time in rows:
+                key = (src, tgt)
+                if key in links:
+                    continue  # 以内存热链接为准
+                existing[key] = {
+                    "weight": weight,
+                    "type": ltype,
+                    "last_accessed": last_accessed,
+                    "creation_time": creation_time,
+                }
+            merged = dict(existing)
+            for key, d in links.items():
+                merged[key] = d
+            db.execute("DELETE FROM links")
+            db.executemany(
                 """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (src, tgt, d["weight"], d["type"],
-                 d.get("last_accessed", d.get("creation_time", 0)),
-                 d.get("creation_time", 0))
+                [
+                    (src, tgt, d["weight"], d["type"],
+                     d.get("last_accessed", d.get("creation_time", 0)),
+                     d.get("creation_time", 0))
+                    for (src, tgt), d in merged.items()
+                ]
             )
+            db.commit()
+            _dirty_links.clear()
+            _deleted_links.clear()
+            return len(merged)
+
+        # 删除：先处理删除，再写新增，避免同一主键两侧都命中时顺序相反
+        if _deleted_links:
+            db.executemany(
+                "DELETE FROM links WHERE src = ? AND tgt = ?",
+                [(src, tgt) for (src, tgt) in _deleted_links],
+            )
+        written = 0
+        if _dirty_links:
+            params = []
+            for key in _dirty_links:
+                d = links.get(key)
+                if d is None:
+                    continue  # 期间已被移除，交由删除逻辑处理
+                src, tgt = key
+                params.append((src, tgt, d["weight"], d["type"],
+                               d.get("last_accessed", d.get("creation_time", 0)),
+                               d.get("creation_time", 0)))
+            if params:
+                db.executemany(
+                    """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    params
+                )
+                written = len(params)
         db.commit()
-        return len(merged)
+        _dirty_links.clear()
+        _deleted_links.clear()
+        return written
 
 def _build_word_to_memories():
     """从所有记忆的 content 重建词→记忆ID的倒排索引"""
@@ -619,6 +668,8 @@ def add_link(src_id: str, tgt_id: str, weight: float, link_type: str):
             links[key] = {"weight": weight, "type": link_type, "last_accessed": now, "creation_time": now}
             global _count_link_created
             _count_link_created += 1
+        _dirty_links.add(key)
+        _deleted_links.discard(key)
 
 def decay_link(src_id: str, tgt_id: str) -> float:
     key = (src_id, tgt_id)
@@ -631,9 +682,12 @@ def decay_link(src_id: str, tgt_id: str) -> float:
         new_weight = links[key]["weight"] * decay
         if new_weight < 0.01:
             del links[key]
+            _dirty_links.discard(key)
+            _deleted_links.add(key)
             return 0.0
         links[key]["weight"] = new_weight
         links[key]["last_accessed"] = now
+        _dirty_links.add(key)
         return new_weight
 
 def build_initial_links(new_mem_id: str):
@@ -1031,11 +1085,17 @@ def _purge_expired_memories(expiration_threshold=0.001):
     dead_links = [k for k in list(links.keys()) if k[0] in expired_ids or k[1] in expired_ids]
     for k in dead_links:
         del links[k]
+        _dirty_links.discard(k)
+        _deleted_links.add(k)
     db.execute(
         f"DELETE FROM links WHERE src IN ({placeholders}) OR tgt IN ({placeholders})",
         expired_ids + expired_ids
     )
     db.commit()
+    # 上面已直接从 SQLite 删除，无需再走增量删除
+    expired_set = set(expired_ids)
+    for (src, tgt) in [k for k in _deleted_links if k[0] in expired_set or k[1] in expired_set]:
+        _deleted_links.discard((src, tgt))
 
     # 从内存字典和热数据集合中移除
     for mem_id in expired_ids:
