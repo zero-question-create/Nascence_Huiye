@@ -42,7 +42,12 @@ DEFAULT_CONFIG = {
     "biorhythm_wake_seconds": 18.40 * 3600, # 清醒时睡眠压力上升的指数时间常数（秒）
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）
     "biorhythm_onset_threshold": 0.62,      # 入睡阈值（S 达到 0.62 即精力 0.38 时入睡）
-    "biorhythm_wake_threshold": 0.20        # 醒来阈值（S 低于 0.20 即精力回到 0.80 时醒来）
+    "biorhythm_wake_threshold": 0.20,       # 醒来阈值（S 低于 0.20 即精力回到 0.80 时醒来）
+    # ===== 动作抉择（本能冲动）=====
+    "action_enabled": True,                 # 是否允许每轮末尾做动作抉择
+    "action_max_pages": 4,                  # 单个动作类型的翻页上限
+    "action_page_size": 12,                 # 每页候选数量
+    "action_note_enabled": True             # 是否允许写 txt 笔记
 }
 
 def load_config():

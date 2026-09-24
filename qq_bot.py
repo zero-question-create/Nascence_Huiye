@@ -220,6 +220,11 @@ async def drift_loop():
                 periodic_cold_eviction()
             except Exception as e:
                 logger.error(f"[定时下沉] 执行异常: {e}")
+            try:
+                from core.asset_library import cleanup_pending
+                cleanup_pending()
+            except Exception as e:
+                logger.error(f"[素材暂存] 清理异常: {e}")
 
         await asyncio.sleep(30)
         if BIORHYTHM.is_asleep():
@@ -347,6 +352,15 @@ async def handle_group_message(data: dict):
             media_list.append(("sticker", summary))
             continue
 
+        # NapCat 常直接给出本地文件路径（QQ 缓存目录）。命中时优先复制本地文件，
+        # 不再走网络下载，省掉一次远程取图。
+        local_file = None
+        for key in ("file", "path"):
+            candidate = seg_data.get(key)
+            if candidate and not str(candidate).startswith(("http://", "https://")) and os.path.isfile(str(candidate)):
+                local_file = str(candidate)
+                break
+
         file_url = seg_data.get("url") or seg_data.get("path") or seg_data.get("file")
         if seg_type == "record" and file_url and not str(file_url).startswith(("http://", "https://")):
             # NapCat 有时只回传文件名或本地路径，通过 get_record 获取可下载文件。
@@ -364,20 +378,24 @@ async def handle_group_message(data: dict):
             except Exception as e:
                 logger.warning(f"通过 NapCat 获取语音失败: {e}")
 
-        if not file_url or not str(file_url).startswith(("http://", "https://")):
+        if not local_file and (not file_url or not str(file_url).startswith(("http://", "https://"))):
             if not file_url or not os.path.isfile(str(file_url)):
                 logger.warning(f"媒体没有可下载的 URL 或本地文件，类型={seg_type}")
                 continue
         tmp_path = None
         owns_tmp_path = False
         try:
-            parsed_url = urlparse(str(file_url))
+            parsed_url = urlparse(str(file_url or local_file))
             query_params = parse_qs(parsed_url.query)
-            default_format = os.path.splitext(str(file_url))[1].lstrip(".") or seg_data.get("format", "amr")
+            default_format = os.path.splitext(str(file_url or local_file))[1].lstrip(".") or seg_data.get("format", "amr")
             file_format = query_params.get('format', [default_format])[0]
             file_format = re.sub(r"[^a-zA-Z0-9]", "", file_format).lower() or "amr"
 
-            if str(file_url).startswith(("http://", "https://")):
+            if local_file:
+                # NapCat 已把文件落在本地（QQ 缓存目录），直接读，不复制不下载
+                tmp_path = local_file
+                owns_tmp_path = False
+            elif str(file_url).startswith(("http://", "https://")):
                 async with aiohttp.ClientSession() as session:
                     async with session.get(file_url, timeout=30) as resp:
                         if resp.status != 200:
@@ -412,6 +430,15 @@ async def handle_group_message(data: dict):
                 desc = await describe_video_from_path(tmp_path)
             if desc:
                 media_list.append((media_type, desc))
+                # 图片/表情包登记为暂存，供本轮动作抉择决定是否收藏
+                if media_type in ("image", "sticker"):
+                    try:
+                        from core.asset_library import register_pending
+                        ref = register_pending(media_type, tmp_path, desc)
+                        if ref:
+                            logger.info(f"媒体已登记暂存（{ref}）: {desc[:30]}")
+                    except Exception as e:
+                        logger.warning(f"登记暂存媒体失败: {e}")
         except Exception as e:
             logger.warning(f"处理媒体失败: {e}")
         finally:
@@ -569,6 +596,46 @@ async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
     except Exception as e:
         logger.error(f"通过 NapCat WebSocket 发送消息异常: {e}")
 
+async def send_group_media(group_id: str, file_path: str, caption: str = "") -> bool:
+    """发送本地图片/表情包（消息段数组形式）。成功返回 True。
+
+    NapCat 支持本地绝对路径直发，无需再走 base64，省一次编码与传输。
+    """
+    if is_sleeping():
+        logger.debug("睡眠期间禁止发送媒体，已拦截。")
+        return False
+    global _action_counter
+    websocket = _napcat_websocket
+    if websocket is None:
+        logger.error("媒体发送失败：当前没有连接的 NapCat WebSocket")
+        return False
+    if not file_path or not os.path.isfile(str(file_path)):
+        logger.error(f"媒体发送失败：文件不存在 {file_path}")
+        return False
+
+    segments = []
+    if caption:
+        segments.append({"type": "text", "data": {"text": caption}})
+    segments.append({"type": "image", "data": {"file": Path(str(file_path)).resolve().as_uri()}})
+
+    try:
+        async with _action_lock:
+            _action_counter += 1
+            echo = f"nascence-media-{_action_counter}"
+            payload = {
+                "action": "send_group_msg",
+                "params": {"group_id": int(group_id), "message": segments},
+                "echo": echo,
+            }
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        logger.info(f"已通过 NapCat WebSocket 发送媒体（echo={echo}）: {file_path}")
+        from core.memory_engine import _bump_message_sent
+        _bump_message_sent()
+        return True
+    except Exception as e:
+        logger.error(f"通过 NapCat WebSocket 发送媒体异常: {e}")
+        return False
+
 async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Optional[Tuple[str, str]]:
     """通过 WebSocket 获取引用消息，返回（原发送者名称，消息正文）。"""
     global _action_counter
@@ -673,7 +740,11 @@ async def ws_handler(websocket):
         from core.cognition import request_graceful_stop
         request_graceful_stop()  # 确保旧实例已清理
         _cognitive_task = asyncio.create_task(
-            cognitive_loop(send_func=send_group_msg, target_group_id=get_active_group_id())
+            cognitive_loop(
+                send_func=send_group_msg,
+                target_group_id=get_active_group_id(),
+                media_send_func=send_group_media,
+            )
         )
         logger.info("[认知循环] 已随 NapCat 连接启动")
 

@@ -90,6 +90,11 @@ _inhibited_seeds: dict = {}                         # {种子节点ID: 剩余抑
 _inhibited_edges: dict = {}                         # {(src_id, tgt_id): 剩余抑制轮数}
 _inhibited_keywords: dict = {}                      # {关键词: 剩余抑制轮数}
 
+# ========== 记事本回看通道（一次性）==========
+# 读文件或写文件时，把文件内容留给下一轮作为特供记忆（pinned）呈现。
+# 只在这一轮有效，用过即清；内容不进记忆库（不入库）。
+_pending_note_memory: str = None
+
 # 每轮扩散记录（注入抑制时记录当前轮使用的种子和边）
 _current_round_seeds: list = []
 _current_round_edges: list = []
@@ -426,7 +431,137 @@ def request_graceful_stop():
     _cognitive_running = False  # 阻止在空闲时启动新的一轮
 
 
-async def cognitive_loop(send_func=None, target_group_id: str = None):
+def _select_dialogue_window(history: list, dialogue_count: int) -> list:
+    """按"最近 N 条他人消息"定位起点，返回该起点之后的完整消息段。
+
+    返回的段落里同时包含他人与自己的消息，从而保住一问一答的完整脉络；
+    只按他人消息定位，是为了让"窗口长度"由外部输入量决定，
+    不会被自己频繁插话稀释成一小截。
+    没有他人消息时返回空列表（此时无从定位对话起点）。
+    """
+    other_idx = [i for i, m in enumerate(history) if m.get("sender") != BOT_NAME]
+    if not other_idx:
+        return []
+    # 他人消息足够时取倒数第 dialogue_count 条的起始位置；
+    # 不足时退回到第一条他人消息，保证窗口从对话真正开始处起算。
+    anchor = other_idx[-dialogue_count] if len(other_idx) >= dialogue_count else other_idx[0]
+    return history[anchor:]
+
+
+def _consume_note_memory():
+    """取出并清空记事本回看通道，返回 (内容, 真实时间戳)；无内容时返回 (None, None)。
+
+    一次性：取走即清，保证文件内容只在紧接着的下一轮出现一次，且不进记忆库。
+    """
+    global _pending_note_memory
+    if not _pending_note_memory:
+        return None, None
+    mem = _pending_note_memory
+    _pending_note_memory = None
+    return mem, clock.to_real_time(clock.now())
+
+
+async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
+                               keywords, media_send_func, target_group_id):
+    """执行一次动作抉择并落实动作。返回描述字符串（无动作时返回 None）。
+
+    抉择本身是同步 LLM 调用，放进线程池执行；语义上仍属于本轮的最后一步。
+    """
+    from .action_layer import decide_action, action_enabled
+    from .llm_interface import add_to_history
+    from utils.event_bus import BUS
+
+    global _pending_note_memory
+
+    if not action_enabled():
+        return None
+
+    # 本轮手里有没有可用的东西：收藏、刚收到的媒体，或记事本功能
+    # 记事本允许从零开始写，故开启时即便收藏为空也值得询问一次
+    from . import asset_library as ASSETS
+    from .action_layer import note_enabled
+    if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled()):
+        return None
+
+    # 只在"刚说过话"或"有新消息进来"时给动作机会，避免纯内心轮次也冲动
+    if not (talk_sent or keywords):
+        return None
+
+    result = await loop.run_in_executor(
+        None, lambda: decide_action(
+            thought_text=thought_text,
+            should_speak=should_speak,
+            said_text=thought_text if talk_sent else "",
+            keywords=keywords,
+            context_hint="刚刚有人在群里说话" if keywords else "",
+        )
+    )
+    if not result:
+        return None
+    action = result.get("action")
+    if not action or action == "none":
+        return None
+    detail = result.get("detail") or ""
+
+    # -------- 发送类：把描述直接补进历史记忆 --------
+    if action in ("image", "sticker"):
+        entry = result.get("entry") or {}
+        path = entry.get("path")
+        kind = entry.get("kind") or ASSETS.IMAGE
+        tag = "图片" if kind == ASSETS.IMAGE else "表情包"
+        if not path:
+            return None
+        if media_send_func is None or not target_group_id:
+            append_log("[动作抉择] 没有可用的媒体发送通道，放弃")
+            return None
+        ok = await media_send_func(target_group_id, path)
+        if not ok:
+            append_log("[动作抉择] 媒体发送失败，未记入历史")
+            return None
+        ASSETS.mark_sent(kind, detail)
+        measure = "张" if kind == ASSETS.IMAGE else "个"
+        create_memory(f"我发了{measure}{tag}，内容是：{detail}")
+        add_to_history(None, None, f"（我发了{measure}{tag}，内容是：{detail}）")
+        BUS.message.emit(BOT_NAME, f"[{tag}] {detail}", "QQ")
+        return f"发送{tag}: {detail}"
+
+    # -------- 收藏类 --------
+    if action in ("save_image", "save_sticker"):
+        if not result.get("added"):
+            return None
+        # 以实际入库的类型为准（暂存时可能按真实格式重新归类）
+        saved = result.get("saved") or {}
+        kind = saved.get("kind") or (ASSETS.IMAGE if action == "save_image" else ASSETS.STICKER)
+        tag = "图片" if kind == ASSETS.IMAGE else "表情包"
+        measure = "张" if kind == ASSETS.IMAGE else "个"
+        create_memory(f"我收藏了{measure}{tag}，内容是：{detail}")
+        add_to_history(None, None, f"（我收藏了{measure}{tag}，内容是：{detail}）")
+        BUS.message.emit(BOT_NAME, result.get("reply") or f"（收下了这个{tag}）", "QQ")
+        return f"收藏{tag}: {detail}"
+
+    # -------- 记事本：写入或翻开，内容留给下一轮特供记忆（不入库）--------
+    if action in ("write_txt", "read_txt"):
+        name = result.get("note_name") or ""
+        text = result.get("note_text") or ""
+        if not text:
+            return None
+        tag = "写下了" if action == "write_txt" else "翻开重看"
+        # 形如：[现在]我打开了我写的“xxx”文件，内容是：xxx
+        _pending_note_memory = f"[现在]我打开了我写的“{name}”文件，内容是：{text}"
+        if action == "write_txt":
+            # 写入这个行为本身值得记住，但只记"写过"，不把文件全文灌进记忆库
+            written = result.get("written") or ""
+            create_memory(f"我在记事本「{name}」里写下：{written}")
+            add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}）")
+            BUS.message.emit(BOT_NAME, f"[笔记] {written}", "QQ")
+            return f"写笔记: {name}"
+        append_log(f"[认知循环] 记事本「{name}」内容已载入下一轮特供记忆")
+        return f"翻开笔记: {name}"
+
+    return None
+
+
+async def cognitive_loop(send_func=None, target_group_id: str = None, media_send_func=None):
     """
     永续认知循环 —— 辉夜的"默认模式网络"永远在线。
     无论是否有用户输入，循环始终运行：
@@ -441,6 +576,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     """
     global _keyword_queue, _shallow_pool, _cognitive_running, _graceful_stop
     global _keyword_continuity, _inhibited_seeds, _inhibited_edges, _inhibited_keywords
+    global _pending_note_memory
 
     from .llm_interface import add_to_history
     from .memory_engine import memories, access_memory
@@ -448,6 +584,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
     # 重置停止标志和抑制状态，允许新会话启动
     _graceful_stop = False
     _cognitive_running = True
+    _pending_note_memory = None
     _keyword_continuity.clear()
     _inhibited_seeds.clear()
     _inhibited_edges.clear()
@@ -618,14 +755,16 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             related_ts = [ts for ts, _ in related_pairs]
 
             # ============================
-            # Step 3b: 历史对话作为记忆并入（滑动窗口 4~6，保留最近 10 条取最后 4~6 条）
+            # Step 3b: 历史对话作为记忆并入
+            # 先定位最近 4~6 条他人消息在完整历史中的起点，再取该起点之后的全部消息
+            # （包含自己的），这样窗口内是一段完整的对话往来，而不是只有对方的单方发言。
             # ============================
             from utils.message_history import get_all
             from utils.time_phrases import get_relative_time_phrase
 
             dialogue_count = random.randint(4, 6)
-            recent_msgs = get_all()[-10:]
-            selected_msgs = recent_msgs[-dialogue_count:]
+            selected_msgs = _select_dialogue_window(get_all(), dialogue_count)
+
             dialogue_memories = []
             dialogue_ts = []
             for msg in selected_msgs:
@@ -643,7 +782,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
 
             related_memories = related_memories + dialogue_memories
             related_ts = related_ts + dialogue_ts
-            append_log(f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条（窗口={dialogue_count}）: {dialogue_memories}")
+            append_log(
+                f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条"
+                f"（按最近 {dialogue_count} 条他人消息定位，含自己的消息）: {dialogue_memories}"
+            )
 
             # ============================
             # Step 3c: 上一轮回复并入（无论是否发出消息），带时间标签
@@ -673,12 +815,32 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
                 append_log(f"[认知循环] 附加困倦/刚醒记忆: {drowsy}")
 
             # ============================
+            # Step 3e: 记事本回看附加（一次性）
+            # 上一轮读过或写过文件时，把内容作为特供记忆呈现给这一轮；用过即清，不入库。
+            # ============================
+            note_mem, note_ts = _consume_note_memory()
+            if note_mem:
+                related_memories.append(note_mem)
+                related_ts.append(note_ts)
+                append_log(f"[认知循环] 记事本内容并入本轮特供记忆: {note_mem[:60]}...")
+
+            # ============================
             # Step 4: 拼接层处理
             # ============================
             state = get_state()
 
-            pinned_memories = dialogue_memories + ([prev_mem] if prev_mem else []) + ([drowsy_mem] if drowsy_mem else [])
-            pinned_ts = dialogue_ts + ([prev_ts] if prev_ts is not None else []) + ([drowsy_ts] if drowsy_ts is not None else [])
+            pinned_memories = (
+                dialogue_memories
+                + ([prev_mem] if prev_mem else [])
+                + ([drowsy_mem] if drowsy_mem else [])
+                + ([note_mem] if note_mem else [])
+            )
+            pinned_ts = (
+                dialogue_ts
+                + ([prev_ts] if prev_ts is not None else [])
+                + ([drowsy_ts] if drowsy_ts is not None else [])
+                + ([note_ts] if note_ts is not None else [])
+            )
 
             result = await loop.run_in_executor(
                 None, lambda: verbalize(
@@ -721,11 +883,28 @@ async def cognitive_loop(send_func=None, target_group_id: str = None):
             # ============================
             # Step 6: 发送消息（若应发言）
             # ============================
+            talk_sent = False
             if should_speak and thought_text and send_func and target_group_id:
                 await send_func(target_group_id, thought_text)
+                talk_sent = True
                 add_to_history(None, None, thought_text)
                 from utils.event_bus import BUS
                 BUS.message.emit(BOT_NAME, thought_text, "QQ")
+
+            # ============================
+            # Step 6b: 动作抉择（本能冲动，本轮最后一步）
+            # 本轮必须等抉择完成才继续；实际执行在线程池中，
+            # 以免阻塞事件循环导致 NapCat 收消息与生物钟 tick 停摆。
+            # ============================
+            try:
+                acted = await _run_action_decision(
+                    loop, thought_text, should_speak, talk_sent, current_keywords,
+                    media_send_func, target_group_id
+                )
+                if acted:
+                    append_log(f"[认知循环] 动作抉择已执行: {acted}")
+            except Exception as e:
+                append_log(f"[认知循环] 动作抉择异常: {e}")
 
             # ============================
             # Step 7: 优雅停止检查（不复搜）

@@ -74,6 +74,13 @@ LOG_CAT_QQBOT = "qqbot"
 LOG_CAT_OLLAMA = "ollama"
 LOG_CAT_WORLD = "world_gen"
 
+# 日志页显示上限：只保留最近 N 个文本块，避免长时间运行后控件占用持续膨胀。
+# 注意这是"显示"上限，磁盘日志仍由 RotatingFileHandler 独立轮转。
+LOG_VIEW_MAX_BLOCKS = 500
+CHAT_VIEW_MAX_BLOCKS = 300        # 对话测试页气泡上限
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
+LOG_FILE_BACKUPS = 3
+
 
 class SignalLogHandler(logging.Handler):
     def emit(self, record):
@@ -700,7 +707,9 @@ class ControlPanel(QMainWindow):
         for label, cat in labels:
             view = QPlainTextEdit()
             view.setReadOnly(True)
-            view.setMaximumBlockCount(0)
+            # 显示上限：超出后自动丢弃最旧的块，防止长时间运行内存与重绘开销累积
+            view.setMaximumBlockCount(LOG_VIEW_MAX_BLOCKS)
+            view.setUndoRedoEnabled(False)
             view.setFont(QFont("Monospace", 10))
             self.log_views[cat] = view
             sub_tabs.addTab(view, label)
@@ -856,6 +865,22 @@ class ControlPanel(QMainWindow):
             view.appendPlainText(line)
             scrollbar.setValue(position)
 
+    def _trim_view(self, view, max_blocks):
+        """兜底裁剪：超限时从头部移除多余内容（QTextBrowser 无块数上限，需手动截）。"""
+        try:
+            if view.document().blockCount() <= max_blocks:
+                return
+            cursor = view.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(
+                QTextCursor.NextBlock,
+                QTextCursor.KeepAnchor,
+                view.document().blockCount() - max_blocks,
+            )
+            cursor.removeSelectedText()
+        except Exception:
+            pass
+
     def _apply_speed(self):
         from core.virtual_clock import clock
         if clock.qq_mode:
@@ -927,7 +952,11 @@ class ControlPanel(QMainWindow):
             bubble_color = "#2a5a3a"
         else:
             bubble_color = "#263044"
-        safe = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        # 单条过长时截断显示，避免超长文本把整个对话页撑爆
+        shown = str(text)
+        if len(shown) > 500:
+            shown = shown[:500] + "……（已截断显示）"
+        safe = shown.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
         source_tag = f"<span style='color:#6a7d96;font-size:10px'>[{source}]</span> " if source else ""
         self.chat_view.append(
             f"<div style='text-align:left;margin:10px 4px'>"
@@ -935,6 +964,7 @@ class ControlPanel(QMainWindow):
             f"<span style='display:inline-block;background:{bubble_color};color:#f4f7fb;padding:8px 12px;border-radius:10px;max-width:85%'>{safe}</span>"
             "</div>"
         )
+        self._trim_view(self.chat_view, CHAT_VIEW_MAX_BLOCKS)
         self.chat_view.moveCursor(QTextCursor.End)
 
     def refresh_stats(self):
@@ -1242,7 +1272,11 @@ def configure_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
-    file_handler = logging.FileHandler(SESSION_LOG, encoding="utf-8")
+    # 轮转写盘：单文件超过上限自动切分并保留有限份数，避免长时间运行撑满磁盘
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        SESSION_LOG, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUPS, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
     signal_handler = SignalLogHandler()
