@@ -613,10 +613,12 @@ async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
     except Exception as e:
         logger.error(f"通过 NapCat WebSocket 发送消息异常: {e}")
 
-async def send_group_media(group_id: str, file_path: str, caption: str = "") -> bool:
+async def send_group_media(group_id: str, file_path: str, caption: str = "", as_sticker: bool = False) -> bool:
     """发送本地图片/表情包（消息段数组形式）。成功返回 True。
 
-    NapCat 支持本地绝对路径直发，无需再走 base64，省一次编码与传输。
+    as_sticker=True 时按表情包发送：NapCat 会把该消息段的 sub_type 传给
+    createValidSendPicElement，最终落到 QQ 的 picSubType 字段——这才是 QQ
+    区分"普通图片"与"收藏表情"的开关。只把文件改成 .gif 并不足以让它显示为表情包。
     """
     if is_sleeping():
         logger.debug("睡眠期间禁止发送媒体，已拦截。")
@@ -633,7 +635,11 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "") -> 
     segments = []
     if caption:
         segments.append({"type": "text", "data": {"text": caption}})
-    segments.append({"type": "image", "data": {"file": Path(str(file_path)).resolve().as_uri()}})
+    image_data = {"file": Path(str(file_path)).resolve().as_uri()}
+    if as_sticker:
+        # OneBot 图片子类型 1 = 表情包，NapCat 会映射为 picSubType
+        image_data["sub_type"] = 1
+    segments.append({"type": "image", "data": image_data})
 
     try:
         async with _action_lock:

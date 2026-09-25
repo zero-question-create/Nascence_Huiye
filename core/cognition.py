@@ -532,7 +532,10 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         if media_send_func is None or not target_group_id:
             append_log("[动作抉择] 没有可用的媒体发送通道，放弃")
             return None
-        ok = await media_send_func(target_group_id, path)
+        # 按类型走对应发送方式：表情包需带 sub_type，否则 QQ 会当普通图片显示
+        ok = await media_send_func(
+            target_group_id, path, as_sticker=(kind == ASSETS.STICKER)
+        )
         if not ok:
             append_log("[动作抉择] 媒体发送失败，未记入历史")
             return None
