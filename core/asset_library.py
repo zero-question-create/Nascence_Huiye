@@ -107,8 +107,74 @@ def asset_path(kind: str, filename: str) -> str:
 
 
 # ---------- 收藏写入 ----------
+def _to_gif_frame(im):
+    """把一帧转成带透明索引的调色板图像。
+
+    直接 convert("P") 会把透明区域压成不透明黑块，贴图会糊；
+    这里先量化到 255 色，再把透明像素映射到一个专用索引色。
+    """
+    from PIL import Image
+
+    rgba = im.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    quant = rgba.convert("RGB").quantize(colors=255, method=Image.MEDIANCUT)
+
+    # 透明索引取调色板里未使用的 255 号槽位
+    transparent_index = 255
+    mask = alpha.point(lambda a: 255 if a <= 128 else 0)
+    quant.paste(transparent_index, mask)
+    quant.info["transparency"] = transparent_index
+    return quant
+
+
+def _convert_to_gif(src_path: str, dst_path: str) -> bool:
+    """把图片转成 GIF，交给 QQ 侧自动识别为表情包。
+
+    目前 NapCat 没有可靠的"以表情包形式发送"接口，改走格式这条路：
+    QQ 会把 .gif 当动画表情处理。多帧动图逐帧保留，静态图转单帧 GIF。
+    成功返回 True；任一环节失败返回 False，由调用方回落为直接复制原文件。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with Image.open(src_path) as im:
+            is_animated = getattr(im, "is_animated", False)
+            if is_animated:
+                frames = []
+                durations = []
+                for i in range(getattr(im, "n_frames", 1)):
+                    im.seek(i)
+                    frames.append(_to_gif_frame(im))
+                    durations.append(im.info.get("duration", 100) or 100)
+                if not frames:
+                    return False
+                frames[0].save(
+                    dst_path,
+                    format="GIF",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=im.info.get("loop", 0),
+                    transparency=frames[0].info.get("transparency", 255),
+                    disposal=2,
+                )
+            else:
+                _to_gif_frame(im).save(
+                    dst_path, format="GIF",
+                    transparency=255,
+                )
+        return os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0
+    except Exception:
+        return False
+
+
 def add_asset(kind: str, src_path: str, desc: str) -> dict | None:
-    """把源文件收进素材库；描述重复视为同一素材，返回已存在条目。"""
+    """把源文件收进素材库；描述重复视为同一素材，返回已存在条目。
+
+    kind=sticker 时统一转存为 GIF，让 QQ 自动按表情包识别。
+    """
     if kind not in _KINDS or not desc:
         return None
     desc = str(desc).strip()
@@ -129,11 +195,27 @@ def add_asset(kind: str, src_path: str, desc: str) -> dict | None:
         except OSError:
             return None
 
+        os.makedirs(os.path.join(ASSET_ROOT, kind), exist_ok=True)
+
+        # 表情包：先尝试转 GIF（QQ 据此识别为表情），失败再按原格式存
+        if kind == STICKER:
+            filename = f"{uuid.uuid4().hex[:12]}.gif"
+            if _convert_to_gif(src_path, asset_path(kind, filename)):
+                index[kind][desc] = filename
+                _evict_if_needed(kind)
+                _save()
+                return {"kind": kind, "desc": desc, "file": filename,
+                        "path": asset_path(kind, filename), "added": True}
+            # 转换失败：退回原格式，至少保证素材不丢
+            try:
+                os.remove(asset_path(kind, filename))
+            except OSError:
+                pass
+
         ext = os.path.splitext(src_path)[1].lstrip(".").lower()
         if ext not in _ALLOWED_EXT:
             ext = _FALLBACK_EXT.get(kind, "jpg")
         filename = f"{uuid.uuid4().hex[:12]}.{ext}"
-        os.makedirs(os.path.join(ASSET_ROOT, kind), exist_ok=True)
         try:
             shutil.copy2(src_path, asset_path(kind, filename))
         except OSError:

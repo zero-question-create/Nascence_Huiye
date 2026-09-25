@@ -251,14 +251,17 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
         return {"action": action, "detail": entry["desc"], "entry": entry}
 
     if action in ("save_image", "save_sticker"):
-        kind = ASSETS.IMAGE if action == "save_image" else ASSETS.STICKER
         ref = str(data.get("ref") or "").strip()
         item = ASSETS.get_pending(ref)
         if not item:
             append_log(f"[动作抉择] 找不到对应的暂存媒体（ref={ref!r}），放弃收藏")
             return {"action": "none", "detail": ""}
-        if item["kind"] != kind:
-            # 类型不符时按实际类型收藏，避免因分类偏差丢掉素材
+        # 以抉择的意图为准：模型判断是表情包就存成表情包（会转 GIF）。
+        # NapCat 常把群里的表情包上报为普通 image，若此时按暂存类型回退，
+        # 表情包就永远进不了表情包库、也不会转 GIF。
+        if action == "save_sticker":
+            kind = ASSETS.STICKER
+        else:
             kind = item["kind"]
         saved = ASSETS.add_asset(kind, item["path"], item["desc"])
         if not saved:

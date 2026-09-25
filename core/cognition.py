@@ -112,6 +112,17 @@ def _get_drowsy_memory() -> str:
     """
     return BIORHYTHM.feeling_text()
 
+
+def _strip_trailing_period(text: str) -> str:
+    """去掉句末的一个句号。
+
+    只处理末尾这一个"。"，句中的标点与其他收尾标点（？！）一律保留；
+    放在入库与对话历史之前，保证记忆、历史、发送三者用的是同一份文本。
+    """
+    if text.endswith("。"):
+        return text[:-1]
+    return text
+
 def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
                          inhibited_seeds: set = None,
                          inhibited_edges: set = None) -> list:
@@ -378,6 +389,8 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     if reply:
         reply = reply.strip("“")
         reply = reply.strip("”")
+        # 去掉句末句号（入库之前，只去末尾这一个）
+        reply = _strip_trailing_period(reply)
 
         if current_speaker:
             reply_memory = f"我告诉{current_speaker}，{reply}"
@@ -863,6 +876,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             thought_text = result.get("text", "").strip()
             should_speak = result.get("say", False)
+
+            # 去掉句末句号（在做入库与对话历史之前，只去末尾这一个）
+            thought_text = _strip_trailing_period(thought_text)
 
             if not thought_text:
                 append_log("[认知循环] verbalize 返回空，跳过")

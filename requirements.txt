@@ -24,6 +24,7 @@ multidict==6.7.1
 numpy==1.26.4
 openai==2.44.0
 packaging==26.2
+pillow==12.3.0
 PyQt5==5.15.11
 propcache==0.5.2
 pydantic==2.13.4
