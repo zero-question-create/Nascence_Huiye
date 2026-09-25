@@ -30,10 +30,15 @@ MODEL = config["primary_model"]
 MODEL_ = config["secondary_model"]
 
 
-def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ"):
+def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ", quote=None):
+    """写入对话历史。
+
+    quote: 可选引用信息 {"sender": 被引用者, "text": 被引用的原话}，
+    只随用户消息记录，供短期上下文还原"这句话在回应什么"。
+    """
     from utils.message_history import add_message
     if user_text:
-        add_message(sender_name, user_text, source)
+        add_message(sender_name, user_text, source, quote=quote)
     if bot_reply:
         add_message(BOT_NAME, bot_reply, source)
 

@@ -777,7 +777,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 先定位最近 4~6 条他人消息在完整历史中的起点，再取该起点之后的全部消息
             # （包含自己的），这样窗口内是一段完整的对话往来，而不是只有对方的单方发言。
             # ============================
-            from utils.message_history import get_all
+            from utils.message_history import get_all, quote_suffix
             from utils.time_phrases import get_relative_time_phrase
 
             dialogue_count = random.randint(4, 6)
@@ -786,10 +786,12 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             dialogue_memories = []
             dialogue_ts = []
             for msg in selected_msgs:
+                # 引用后缀还原"这句话在回应什么"，短期上下文才连得上
+                suffix = quote_suffix(msg)
                 if msg["sender"] == BOT_NAME:
-                    d_content = f"我说：{msg['content']}"
+                    d_content = f"我说：{msg['content']}{suffix}"
                 else:
-                    d_content = f"{msg['sender']}说：{msg['content']}"
+                    d_content = f"{msg['sender']}说：{msg['content']}{suffix}"
                 d_msg_time = msg.get("time")
                 if d_msg_time is None:
                     d_msg_time = clock.now()

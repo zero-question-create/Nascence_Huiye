@@ -512,11 +512,14 @@ async def handle_group_message(data: dict):
     # 提取引用消息
     quote_id = extract_quote_message_id(data.get("message", []))
     extra_context = ""
+    quote_info = None
     if quote_id:
         quoted_message = await fetch_quoted_message(quote_id, group_id)
         if quoted_message:
             quoted_sender, quoted_text = quoted_message
             extra_context = f"{sender_name}引用了{quoted_sender}之前的一句话：'{quoted_text}'"
+            # 结构化引用随历史一起保存，供短期上下文还原引用关系
+            quote_info = {"sender": quoted_sender, "text": quoted_text}
 
     logger.info(f"输入: {augmented_input} | 上下文: {extra_context}")
 
@@ -552,7 +555,8 @@ async def handle_group_message(data: dict):
         inject_message_keywords(msg_keywords)
 
     # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
-    add_to_history(sender_name, clean_text.strip(), None, "QQ")
+    # 引用信息以结构化字段随消息保存，短期上下文才能看出这句话在回应什么
+    add_to_history(sender_name, clean_text.strip(), None, "QQ", quote=quote_info)
 
     logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，jieba关键词: {msg_keywords}")
     BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
