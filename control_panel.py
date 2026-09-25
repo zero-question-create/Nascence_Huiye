@@ -495,7 +495,7 @@ class ControlPanel(QMainWindow):
         self._build_ui()
         self._connect_bus()
         if SESSION_LOG.exists():
-            text = SESSION_LOG.read_text(encoding="utf-8")
+            text = SESSION_LOG.read_text(encoding="utf-8-sig")
             self.log_views[LOG_CAT_RUNTIME].setPlainText(text)
         self._load_config()
         self.timer = QTimer(self)
@@ -1010,7 +1010,7 @@ class ControlPanel(QMainWindow):
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
         self.ds_url.setText(cfg.get("primary_base_url", ""))
         self.ds_model.setText(cfg.get("primary_model", ""))
@@ -1027,7 +1027,7 @@ class ControlPanel(QMainWindow):
         if not path.exists():
             cfg = dict(DEFAULT_CONFIG)
         else:
-            with path.open("r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
         cfg.update({
             "primary_base_url": self.ds_url.text().strip(),
@@ -1047,7 +1047,7 @@ class ControlPanel(QMainWindow):
         if not path.exists():
             cfg = dict(DEFAULT_CONFIG)
         else:
-            with path.open("r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
         cfg.update({
             "bot_qq": self.bot_qq_input.text().strip() or "123456",

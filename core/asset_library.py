@@ -60,7 +60,7 @@ def _load() -> dict:
     data = _empty_index()
     if os.path.exists(INDEX_FILE):
         try:
-            with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            with open(INDEX_FILE, "r", encoding="utf-8-sig") as f:
                 loaded = json.load(f)
             for kind in _KINDS:
                 items = loaded.get(kind) or {}
@@ -447,7 +447,8 @@ def read_note(name: str, max_chars: int = MAX_NOTE_READ_CHARS) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        # utf-8-sig：用户手写的笔记可能被记事本加上 BOM，避免读出 \ufeff
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             text = f.read(max_chars + 1)
     except OSError:
         return None

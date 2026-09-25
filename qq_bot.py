@@ -135,7 +135,9 @@ logger = logging.getLogger("QQBot")
 class QQManifest:
     def __init__(self):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            # utf-8-sig：兼容 Windows 记事本等编辑器保存时写入的 UTF-8 BOM，
+            # 否则文件首字符变成 \ufeff，json.load 会直接抛 JSONDecodeError。
+            with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
                 data = json.load(f)
             self.whitelist = set(data.get("whitelist_groups", []))
             self.name_map = data.get("name_mapping", {})
@@ -152,10 +154,21 @@ class QQManifest:
                 logger.info(f"已创建空白的配置文件 {CONFIG_PATH}")
             logger.error("前往qq_manifest.json中修改群聊白名单")
             BUS.task_error.emit("前往qq_manifest.json中修改群聊白名单")
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
                 data = json.load(f)
             self.whitelist = set(data.get("whitelist_groups", []))
             self.name_map = data.get("name_mapping", {})
+        except json.JSONDecodeError as e:
+            # 配置文件语法损坏（多余逗号、缺引号等）。这里不再让整个 QQ 服务崩掉：
+            # 退化为空名单并明确报错，用户改好文件重启即可。
+            self.whitelist = set()
+            self.name_map = {}
+            msg = (
+                f"{CONFIG_PATH} 解析失败（{e.msg}，第 {e.lineno} 行）："
+                f"请检查 JSON 语法，注意不要有多余逗号或未转义的引号"
+            )
+            logger.error(msg)
+            BUS.task_error.emit(msg)
 
 manifest = QQManifest()
 

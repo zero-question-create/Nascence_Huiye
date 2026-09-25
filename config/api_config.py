@@ -52,7 +52,7 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
             for k in DEFAULT_CONFIG:
                 cfg.setdefault(k, DEFAULT_CONFIG[k])

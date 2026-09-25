@@ -109,7 +109,7 @@ def load_all_data():
     with _io_lock:
         if not os.path.exists(MEMORY_FILE):
             return
-        with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+        with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
         memories.clear()
         from core.memory_engine import hot_ids
@@ -137,7 +137,7 @@ def load_all_data():
             # 读取索引
             _faiss_index_global = faiss.read_index(FAISS_INDEX_FILE)
             # 读取映射表
-            with open(FAISS_MAPPING_FILE, 'r', encoding='utf-8') as f:
+            with open(FAISS_MAPPING_FILE, 'r', encoding='utf-8-sig') as f:
                 loaded_mapping = json.load(f)
             # 验证长度一致性
             if len(loaded_mapping) == _faiss_index_global.ntotal:
@@ -156,7 +156,7 @@ def load_all_data():
             _rebuild_faiss_index()
         
         if os.path.exists(METRICS_COUNTERS_FILE):
-            with open(METRICS_COUNTERS_FILE, 'r', encoding='utf-8') as f:
+            with open(METRICS_COUNTERS_FILE, 'r', encoding='utf-8-sig') as f:
                 metrics = json.load(f)
             from core.memory_engine import _import_metrics_counters
             _import_metrics_counters(metrics)
@@ -187,7 +187,7 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         return
     try:
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+        with open(STATE_FILE, 'r', encoding='utf-8-sig') as f:
             loaded = json.load(f)
         # 标准化键名，仅保留在用的状态键；历史遗留的“已知信息”类字段直接丢弃
         normalized = {}
@@ -301,7 +301,7 @@ def migrate_json_to_sqlite():
         return
     from core.memory_engine import _get_db, _faiss_index, _faiss_to_mem, _mem_to_faiss
     import faiss, numpy as np
-    with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+    with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
         data = json.load(f)
     db = _get_db()
     for mem_id, mem in data.get("memories", {}).items():

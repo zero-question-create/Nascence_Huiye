@@ -128,7 +128,7 @@ class WorldState:
             self._init_weather_and_time()
             return
         try:
-            with open(SCENE_FILE, "r", encoding="utf-8") as f:
+            with open(SCENE_FILE, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             self.location = data.get("location", "客厅")
             self.hunger = data.get("hunger", 20.0)

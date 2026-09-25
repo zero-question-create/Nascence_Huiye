@@ -17,7 +17,7 @@ def fix_all():
     if not os.path.exists(MEMORY_FILE):
         print("未找到记忆文件，退出。")
         return
-    with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+    with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
         data = json.load(f)
 
     memories_json = data.get("memories", {})

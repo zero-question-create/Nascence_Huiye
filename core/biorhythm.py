@@ -246,7 +246,7 @@ class Biorhythm:
                 self.last_tick = time.time()
                 return
             try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                 self.s = float(data.get("s", self.s))
                 self.state = data.get("state", "awake")

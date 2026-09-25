@@ -103,7 +103,7 @@ def _write_daily_metrics():
     """每日24点调用：计算今日增量，写入日志，更新基线"""
     # 读取昨日基线
     if os.path.exists(METRICS_BASELINE_FILE):
-        with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8') as f:
+        with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8-sig') as f:
             baseline = json.load(f)
     else:
         baseline = {}
@@ -155,7 +155,7 @@ def _init_metrics_counters():
         return
 
     try:
-        with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8') as f:
+        with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8-sig') as f:
             baseline = json.load(f)
 
         _count_mem_created = baseline.get("mem_created", 0)

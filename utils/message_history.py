@@ -79,7 +79,7 @@ def load_state():
     if not os.path.exists(_STATE_FILE):
         return
     try:
-        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+        with open(_STATE_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError):
         print(f"[消息历史] 状态文件损坏，已重建：{_STATE_FILE}")
