@@ -32,6 +32,7 @@ MAX_ASSETS_PER_KIND = 300      # 单类收藏上限，超出按最久未使用�
 MAX_FILE_BYTES = 8 * 1024 * 1024   # 单个素材体积上限
 PENDING_TTL = 900              # 本轮收到的媒体对动作层可见的时长（秒）
 MAX_PENDING = 20               # 暂存条目上限
+RECENT_SENT_MEMORY = 3         # 记住最近发送的条数，用于去重
 
 # 允许的素材扩展名；未知扩展按类型回落
 _ALLOWED_EXT = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
@@ -49,7 +50,10 @@ MAX_NOTE_READ_CHARS = 3000     # 单次读取字符上限，避免长笔记挤�
 
 # ---------- 索引读写 ----------
 def _empty_index() -> dict:
-    return {kind: {} for kind in _KINDS} | {"last_sent": {kind: "" for kind in _KINDS}}
+    return {kind: {} for kind in _KINDS} | {
+        "last_sent": {kind: "" for kind in _KINDS},
+        "recent_sent": {kind: [] for kind in _KINDS},
+    }
 
 
 def _load() -> dict:
@@ -69,6 +73,14 @@ def _load() -> dict:
             last = loaded.get("last_sent") or {}
             for kind in _KINDS:
                 data["last_sent"][kind] = str(last.get(kind) or "")
+            # 兼容旧索引：没有 recent_sent 时用 last_sent 单条初始化
+            recent = loaded.get("recent_sent") or {}
+            for kind in _KINDS:
+                items = recent.get(kind)
+                if isinstance(items, list):
+                    data["recent_sent"][kind] = [str(x) for x in items if x][-RECENT_SENT_MEMORY:]
+                elif data["last_sent"][kind]:
+                    data["recent_sent"][kind] = [data["last_sent"][kind]]
         except Exception:
             pass
     _index = data
@@ -171,7 +183,7 @@ def _convert_to_gif(src_path: str, dst_path: str) -> bool:
 
 
 def add_asset(kind: str, src_path: str, desc: str) -> dict | None:
-    """把源文件收进素材库；描述重复视为同一素材，返回已存在条目。
+    """把源文件收进素材库；描述相同视为同一素材，返回已存在条目。
 
     kind=sticker 时统一转存为 GIF，让 QQ 自动按表情包识别。
     """
@@ -244,19 +256,19 @@ def _evict_if_needed(kind: str):
 
 # ---------- 候选检索 ----------
 def ordered_pool(kind: str, keywords: list = None) -> list:
-    """返回该类的候选全集（已排除上一条发送记录），按相关性排序。
+    """返回该类的候选全集，按相关性排序。
 
+    不做发送去重：是否重复发同一条由模型结合"最近发过什么"自行判断，
+    硬性排除会挡掉"同一张图在新语境下确实想再发"这类真实需求。
     排序在单次调用内保持稳定，保证翻页时不会看到重复或跳过的条目。
     """
     if kind not in _KINDS:
         return []
     with _lock:
         index = _load()
-        last = index["last_sent"].get(kind) or ""
         entries = [
             {"id": _asset_id(kind, desc), "desc": desc, "file": fn, "path": asset_path(kind, fn)}
             for desc, fn in index[kind].items()
-            if desc != last
         ]
 
     kws = [str(k) for k in (keywords or []) if k]
@@ -284,17 +296,44 @@ def resolve_token(kind: str, token: str) -> dict | None:
     return None
 
 
+def _recent_sent_list(index: dict, kind: str) -> list:
+    """取该类最近发送过的描述列表（新→旧）。"""
+    items = (index.get("recent_sent") or {}).get(kind)
+    if isinstance(items, list):
+        return [str(x) for x in items if x]
+    last = (index.get("last_sent") or {}).get(kind)
+    return [str(last)] if last else []
+
+
 def last_sent(kind: str) -> str:
     with _lock:
         return _load()["last_sent"].get(kind) or ""
 
 
+def recent_sent(kind: str) -> list:
+    """最近发送过的描述（新→旧），供去重与调试查看。"""
+    with _lock:
+        return _recent_sent_list(_load(), kind)
+
+
 def mark_sent(kind: str, desc: str):
-    """记录上一条发送内容，供去重（不做时间冷却）。"""
+    """记录发送内容，供去重（不做时间冷却）。
+
+    保留最近若干条而不只是最后一条：只在两条之间去重时，
+    交替发送 A、B、A、B 也能绕过限制，看起来同样是"反复发同一批"。
+    """
     if kind not in _KINDS:
         return
+    desc = str(desc or "")
+    if not desc:
+        return
     with _lock:
-        _load()["last_sent"][kind] = str(desc or "")
+        index = _load()
+        index["last_sent"][kind] = desc
+        items = _recent_sent_list(index, kind)
+        items = [d for d in items if d != desc]     # 去重后置顶
+        items.insert(0, desc)
+        index["recent_sent"][kind] = items[:RECENT_SENT_MEMORY]
         _save()
 
 
@@ -409,38 +448,30 @@ def _safe_note_base(name: str) -> str | None:
     return base
 
 
-def note_contains(name: str, text: str) -> bool:
-    """判断笔记里是否已经写过同样的内容（用于写入前查重）。
+def recent_note_lines(name: str, limit: int = 8) -> list:
+    """取笔记最近的若干行，供抉择层了解"已经记过什么"。
 
-    比对时忽略首尾空白与常见列表前缀（如 "1. "、"- "），
-    这样"1. 交诗"与"交诗"视为同一条，避免同一件事被反复追加。
+    只读不改，也不做任何去重判定——是否重复记由模型自己判断。
     """
-    content = _normalize_note_line(text)
-    if not content:
-        return False
     note = read_note(name, max_chars=64 * 1024)
     if not note:
-        return False
-    for line in note["text"].splitlines():
-        if _normalize_note_line(line) == content:
-            return True
-    return False
+        return []
+    lines = [l.strip() for l in note["text"].splitlines() if l.strip()]
+    return lines[-limit:]
 
 
-_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.、)）])\s*")
-
-
-def _normalize_note_line(text: str) -> str:
-    """归一化一行笔记：去掉列表前缀、首尾空白与常见收尾标点。"""
-    line = _LIST_PREFIX_RE.sub("", str(text or "").strip())
-    return line.strip().strip("。．.；;：:")
-
+def note_line_count(name: str) -> int:
+    """笔记的条目总数（非空行数），供抉择层了解文件规模。"""
+    note = read_note(name, max_chars=64 * 1024)
+    if not note:
+        return 0
+    return sum(1 for l in note["text"].splitlines() if l.strip())
 
 def write_note(name: str, text: str) -> str | None:
     """只允许在 data/notes/ 下写 .txt；文件名白名单校验，内容追加不覆盖。
 
-    追加前先查重：同样内容已存在则不重复写入（返回路径但不追加），
-    避免同一件事被反复记录。返回写入后的路径；校验失败返回 None。
+    不做内容去重：同一件事在不同时间可能有不同意义，是否重复记由模型
+    结合"记事本里已有什么"自行判断。返回写入后的路径；校验失败返回 None。
     """
     base = _safe_note_base(name)
     if not base:
@@ -452,11 +483,6 @@ def write_note(name: str, text: str) -> str | None:
 
     os.makedirs(NOTE_DIR, exist_ok=True)
     path = os.path.join(NOTE_DIR, f"{base}.txt")
-
-    # 已写过同样内容：不重复追加（与既有列表项比对时忽略 "1. "/"- " 等前缀）
-    if note_contains(base, content):
-        return path
-
     try:
         if os.path.exists(path) and os.path.getsize(path) + len(content.encode("utf-8")) > 64 * 1024:
             return None

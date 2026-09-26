@@ -134,31 +134,29 @@ def _system_prompt() -> str:
         "5. 一次只做一个动作。翻页时不要同时发送。\n"
         "6. 是否发出去要符合你此刻的心情和场合，别打断自己刚说的话。\n"
         "7. 记事本只能写 txt，文件名用中文或字母数字，不要带路径和扩展名。\n"
-        "8. 写记事本前先看【我的记事本】里已记的内容：同一件事只记一次，\n"
-        "   已经写过的不要再写第二遍；确实有新增事项才写，且一次只记一件。\n"
+        "8. 写记事本前先看【我的记事本】里已记的内容：同一件事没必要反复记，\n"
+        "   确实有新增或需要重申的才写；一次只记一件。\n"
+        "9. 发素材前先看【我最近发过的】：刚发过的同一条不要连着再发；\n"
+        "   清单里没有合适的、或此刻并没有想发的，就选 none，不要为了发而发。\n"
     )
 
 
 def _notes_brief(notes: list, max_chars: int = 600) -> str:
     """把记事本现状摘要给模型看：文件名 + 最近记下的几条。
 
-    只给文件名的话，模型不知道里面已经写过什么，会反复把同一件事再写一遍。
-    这里带上最近若干条内容，让它自己看出"这条已经记过了"。
+    只给文件名的话，模型不知道里面已经写过什么，会把同一件事反复再写一遍。
+    这里带上最近若干条内容，让它自己判断哪些已经记过。
     """
-    lines = ["【我的记事本】（写之前先看，已经记过的事不要再写一遍）"]
+    lines = ["【我的记事本】（写之前先看，已经记过的事不必再记一遍）"]
     for name in notes:
-        note = ASSETS.read_note(name, max_chars=64 * 1024)
-        existing = []
-        if note:
-            existing = [l.strip() for l in note["text"].splitlines() if l.strip()]
-        lines.append(f"- {name}（共 {len(existing)} 条）")
+        existing = ASSETS.recent_note_lines(name, limit=8)
+        total = ASSETS.note_line_count(name)
+        lines.append(f"- {name}（共 {total} 条）")
         if existing:
-            # 只给最近几条，避免长文件挤占上下文
-            recent = existing[-8:]
-            for item in recent:
+            for item in existing:
                 lines.append(f"    · {item[:60]}")
-            if len(existing) > len(recent):
-                lines.append(f"    （更早的 {len(existing) - len(recent)} 条已略）")
+            if total > len(existing):
+                lines.append(f"    （更早的 {total - len(existing)} 条已略）")
     text = "\n".join(lines)
     if len(text) > max_chars:
         text = text[:max_chars] + "…（已截断）"
@@ -198,7 +196,23 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
         if notes:
             parts.append(_notes_brief(notes))
     if not images and not stickers and not pending:
-        parts.append("【我的收藏】（空，还没收下过任何图片或表情包）")
+        # 区分"真的没收藏"与"收藏暂时没有合适的"：后者不该说成"还没收下过"
+        has_any = ASSETS.count(ASSETS.IMAGE) + ASSETS.count(ASSETS.STICKER)
+        if has_any:
+            parts.append("【我的收藏】（有几张，但此刻没有特别想发的）")
+        else:
+            parts.append("【我的收藏】（空，还没收下过任何图片或表情包）")
+
+    # 最近发过什么：让模型看得见，避免把同一条反复发出去。
+    # 只提供信息、不做硬性拦截——是否重发由它自己结合语境判断。
+    sent_lines = []
+    for kind in (ASSETS.IMAGE, ASSETS.STICKER):
+        for desc in ASSETS.recent_sent(kind)[:3]:
+            label = "图片" if kind == ASSETS.IMAGE else "表情包"
+            sent_lines.append(f"{label}「{desc}」")
+    if sent_lines:
+        parts.append("【我最近发过的】" + "；".join(sent_lines) + "（刚发过的别再连发，除非此刻确实需要）")
+
     parts.append("请输出此刻的动作 JSON。")
     return "\n\n".join(parts)
 
@@ -272,10 +286,8 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
         if not entry:
             append_log(f"[动作抉择] 编号无法对应到收藏（{kind}: {token!r}），放弃发送")
             return {"action": "none", "detail": ""}
-        # 去重：与上一条发送内容一致则放弃
-        if entry["desc"] == ASSETS.last_sent(kind):
-            append_log("[动作抉择] 与上一条发送内容重复，放弃发送")
-            return {"action": "none", "detail": ""}
+        # 不做硬性拦截：把"最近发过什么"告诉模型，由它自己判断是否重复。
+        # 硬排除会挡掉"同一张图在新语境下确实想再发"这类真实需求。
         return {"action": action, "detail": entry["desc"], "entry": entry}
 
     if action in ("save_image", "save_sticker"):
@@ -305,15 +317,10 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             return {"action": "none", "detail": ""}
         name = str(data.get("name") or "").strip()
         text = str(data.get("text") or "").strip()
-        # 写之前先查重：同一件事只记一次，避免文件里反复出现同一行
-        already = ASSETS.note_contains(name, text)
         path = ASSETS.write_note(name, text)
         if not path:
             append_log(f"[动作抉择] 写笔记被拒绝（name={name!r}）")
             return {"action": "none", "detail": ""}
-        if already:
-            append_log(f"[动作抉择] 记事本已有同样内容，未重复写入：{text[:30]}")
-            return {"action": "none", "detail": "", "duplicate": True}
         # 正在写这个文件时，顺手读回全文，交给下一轮以特供记忆方式回看（不入库）
         note = ASSETS.read_note(name)
         return {
