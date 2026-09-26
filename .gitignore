@@ -20,6 +20,10 @@ data/__pycache__
 data/test
 data/notes
 
+# 测试脚本（仅本地运行，不入库）
+test_*.py
+*_test.py
+
 # 本地 Ollama 部署（大模型二进制）
 ollama/
 
