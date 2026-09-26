@@ -493,6 +493,87 @@ def write_note(name: str, text: str) -> str | None:
     return path
 
 
+def edit_note(name: str, old_text: str, new_text: str = "") -> dict | None:
+    """修改笔记里已有的一行：把匹配 old_text 的行换成 new_text。
+
+    new_text 为空时表示删除该行（划掉做完的事）。
+    匹配时忽略列表前缀与收尾标点，所以"1. 交诗"、"交诗"、"交诗。" 视为同一行——
+    模型改写的是它自己记下的条目，这里的宽匹配是为了让它不必逐字复现。
+    是"修改指定行"而非"覆盖文件"，其余内容原样保留。
+    返回 {"path", "changed", "kept"}；文件名非法或无匹配行时返回 None。
+    """
+    base = _safe_note_base(name)
+    if not base or not str(old_text or "").strip():
+        return None
+    path = os.path.join(NOTE_DIR, f"{base}.txt")
+    if not os.path.isfile(path):
+        return None
+
+    target = _normalize_note_line(old_text)
+    if not target:
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+
+    replacement = str(new_text or "").strip()
+    changed = 0
+    kept = []
+    for line in lines:
+        if _normalize_note_line(line) == target:
+            changed += 1
+            if replacement:
+                # 保留原行的列表前缀风格，避免把有序清单打乱
+                prefix = _list_prefix_of(line)
+                kept.append(f"{prefix}{replacement}")
+            # replacement 为空 -> 该行被删除（不加入 kept）
+        else:
+            kept.append(line)
+
+    if changed == 0:
+        return None
+
+    if not _write_note_lines(path, kept):
+        return None
+    return {"path": path, "changed": changed, "kept": len(kept)}
+
+
+_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.、)）])\s*")
+
+
+def _list_prefix_of(line: str) -> str:
+    m = _LIST_PREFIX_RE.match(str(line or ""))
+    return m.group(0) if m else ""
+
+
+def _normalize_note_line(text: str) -> str:
+    """归一化一行用于匹配：去掉列表前缀、首尾空白与常见收尾标点。"""
+    line = _LIST_PREFIX_RE.sub("", str(text or "").strip())
+    return line.strip().strip("。．.；;：:")
+
+
+def _write_note_lines(path: str, lines: list) -> bool:
+    """原子重写整个文件（先写临时文件再替换），避免中途失败留下半截内容。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(f"{line}\n")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def read_note(name: str, max_chars: int = MAX_NOTE_READ_CHARS) -> dict | None:
     """读取 data/notes/ 下的 txt 笔记。
 

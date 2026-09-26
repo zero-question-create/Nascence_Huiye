@@ -635,15 +635,15 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         BUS.message.emit(BOT_NAME, result.get("reply") or f"（收下了这个{tag}）", "QQ")
         return f"收藏{tag}: {detail}"
 
-    # -------- 记事本：写入或翻开，内容留给下一轮特供记忆（不入库）--------
-    if action in ("write_txt", "read_txt"):
+    # -------- 记事本：写入/修改/翻开，内容留给下一轮特供记忆（不入库）--------
+    if action in ("write_txt", "edit_txt", "read_txt"):
         name = result.get("note_name") or ""
         text = result.get("note_text") or ""
         if not text:
             return None
-        tag = "写下了" if action == "write_txt" else "翻开重看"
         # 形如：[现在]我打开了我写的“xxx”文件，内容是：xxx
         _pending_note_memory = f"[现在]我打开了我写的“{name}”文件，内容是：{text}"
+
         if action == "write_txt":
             # 写入这个行为本身值得记住，但只记"写过"，不把文件全文灌进记忆库
             written = result.get("written") or ""
@@ -651,6 +651,21 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}）")
             BUS.message.emit(BOT_NAME, f"[笔记] {written}", "QQ")
             return f"写笔记: {name}"
+
+        if action == "edit_txt":
+            # 修改既有条目：记下"改了什么"，便于日后追溯（伦理上改动需留痕）
+            old_text = result.get("old_text") or ""
+            new_text = result.get("new_text") or ""
+            if result.get("deleted"):
+                create_memory(f"我把记事本「{name}」里的「{old_text}」划掉了")
+                add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」划掉了）")
+                BUS.message.emit(BOT_NAME, f"[笔记] 划掉了：{old_text}", "QQ")
+                return f"改笔记（删除）: {name}"
+            create_memory(f"我把记事本「{name}」里的「{old_text}」改成了「{new_text}」")
+            add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」改成了「{new_text}」）")
+            BUS.message.emit(BOT_NAME, f"[笔记] {new_text}", "QQ")
+            return f"改笔记: {name}"
+
         append_log(f"[认知循环] 记事本「{name}」内容已载入下一轮特供记忆")
         return f"翻开笔记: {name}"
 

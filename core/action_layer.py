@@ -30,7 +30,7 @@ DEFAULT_PAGE_SIZE = 12   # 每页候选数量
 VALID_ACTIONS = {
     "none", "image", "sticker",
     "image_next_page", "sticker_next_page",
-    "save_image", "save_sticker", "write_txt", "read_txt",
+    "save_image", "save_sticker", "write_txt", "edit_txt", "read_txt",
 }
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
@@ -125,7 +125,9 @@ def _system_prompt() -> str:
         "- {\"action\":\"save_image\",\"ref\":\"m1\"} 把本轮收到的一张图收进自己的收藏\n"
         "- {\"action\":\"save_sticker\",\"ref\":\"m1\"} 把本轮收到的一个表情包收进自己的收藏\n"
         "- {\"action\":\"read_txt\",\"name\":\"文件名\"} 翻开自己以前写的记事本看看\n"
-        "- {\"action\":\"write_txt\",\"name\":\"文件名\",\"text\":\"要写的内容\"} 写进自己的记事本\n\n"
+        "- {\"action\":\"write_txt\",\"name\":\"文件名\",\"text\":\"要写的内容\"} 写进自己的记事本\n"
+        "- {\"action\":\"edit_txt\",\"name\":\"文件名\",\"old_text\":\"原来那条\",\"new_text\":\"改成什么\"}\n"
+        "  修改已经记下的一条（做完的事可以把 new_text 留空表示划掉）\n\n"
         "规则：\n"
         "1. 输出严格只包含 JSON，不要任何解释、不要多余字段。\n"
         "2. 编号必须来自上面给出的收藏清单或本轮收到的媒体，禁止自己编造。\n"
@@ -136,7 +138,9 @@ def _system_prompt() -> str:
         "7. 记事本只能写 txt，文件名用中文或字母数字，不要带路径和扩展名。\n"
         "8. 写记事本前先看【我的记事本】里已记的内容：同一件事没必要反复记，\n"
         "   确实有新增或需要重申的才写；一次只记一件。\n"
-        "9. 发素材前先看【我最近发过的】：刚发过的同一条不要连着再发；\n"
+        "9. 记下的旧条目不合适、或那件事已经做完了，可以用 edit_txt 改写它或把它划掉\n"
+        "   （new_text 留空即删除）；old_text 用你看到的那条内容，不必逐字一模一样。\n"
+        "10. 发素材前先看【我最近发过的】：刚发过的同一条不要连着再发；\n"
         "   清单里没有合适的、或此刻并没有想发的，就选 none，不要为了发而发。\n"
     )
 
@@ -328,6 +332,27 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             "note_name": os.path.splitext(os.path.basename(path))[0],
             "written": text,
             "note_text": (note or {}).get("text", text),
+            "truncated": bool((note or {}).get("truncated")),
+        }
+
+    if action == "edit_txt":
+        if not note_enabled():
+            append_log("[动作抉择] 改笔记已在配置中关闭，忽略")
+            return {"action": "none", "detail": ""}
+        name = str(data.get("name") or "").strip()
+        old_text = str(data.get("old_text") or "").strip()
+        new_text = str(data.get("new_text") or "").strip()
+        result = ASSETS.edit_note(name, old_text, new_text)
+        if not result:
+            append_log(f"[动作抉择] 改笔记未命中（name={name!r}, old_text={old_text[:20]!r}）")
+            return {"action": "none", "detail": ""}
+        note = ASSETS.read_note(name)
+        return {
+            "action": action, "detail": result["path"], "path": result["path"],
+            "note_name": os.path.splitext(os.path.basename(result["path"]))[0],
+            "old_text": old_text, "new_text": new_text,
+            "deleted": not new_text,
+            "note_text": (note or {}).get("text", ""),
             "truncated": bool((note or {}).get("truncated")),
         }
 
