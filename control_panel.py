@@ -491,16 +491,22 @@ RUNTIME = Runtime()
 
 
 class StatCard(QFrame):
-    def __init__(self, title, value="--"):
+    def __init__(self, title, value="--", caption=""):
         super().__init__()
         self.setObjectName("statCard")
         layout = QVBoxLayout(self)
+        layout.setSpacing(2)
         title_label = QLabel(title)
         title_label.setObjectName("muted")
         self.value = QLabel(value)
         self.value.setObjectName("statValue")
+        # 副标题：数值以外的补充信息（字号小，避免撑破卡片）
+        self.caption = QLabel(caption)
+        self.caption.setObjectName("statCaption")
+        self.caption.setWordWrap(True)
         layout.addWidget(title_label)
         layout.addWidget(self.value)
+        layout.addWidget(self.caption)
 
 
 class ControlPanel(QMainWindow):
@@ -1027,17 +1033,18 @@ class ControlPanel(QMainWindow):
             from core.biorhythm import BIORHYTHM
             snap = BIORHYTHM.snapshot()
             label = "睡眠中" if snap["state"] == "asleep" else "清醒"
-            # 附上作息惯性：节律强度 + 已积累晚数，便于核对"她是否学到了作息"
+            # 数值行只放短信息，作息等细节放副标题（大字行放不下长文本）
+            self.energy_card.value.setText(f"{int(snap['energy']*100)}% {label}")
             nights = snap.get("rhythm_nights", 0)
-            circ = snap.get("circadian", 0.0)
             if nights > 0:
-                extra = f"｜节律 {circ:.2f}（{nights}晚）"
                 hours = BIORHYTHM.rhythm_hours()
-                if hours:
-                    extra += f" 常睡 {min(hours)}-{max(hours)}点"
+                # 文案保持简短：卡片宽度有限（6 张并排），长了会换行挤压
+                span = f" 常睡{min(hours)}-{max(hours)}点" if hours else ""
+                self.energy_card.caption.setText(
+                    f"作息{snap.get('circadian', 0):.2f} {nights}晚{span}"
+                )
             else:
-                extra = "｜作息积累中"
-            self.energy_card.value.setText(f"{int(snap['energy']*100)}% {label}{extra}")
+                self.energy_card.caption.setText("作息积累中")
         except Exception:
             pass
 
@@ -1317,6 +1324,7 @@ QLabel#muted { color:#8493aa; }
 QLabel#statusBadge { background:#183a31; color:#77e2bd; border:1px solid #286653; padding:6px 13px; border-radius:12px; }
 QLabel#sectionTitle { font-size:16px; font-weight:700; }
 QLabel#statValue { font-size:26px; font-weight:800; color:#7eb0ff; }
+QLabel#statCaption { font-size:11px; color:#8493aa; }
 QFrame#statCard, QFrame#panel { background:#141d2a; border:1px solid #263247; border-radius:10px; padding:10px; }
 QPushButton { background:#2d6cdf; color:white; border:0; border-radius:7px; padding:10px 18px; font-weight:700; }
 QPushButton:hover { background:#3d7bea; }
