@@ -86,9 +86,11 @@ def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
 
 def decompose_input(user_input: str) -> tuple:
     """
-    将用户输入拆解为记忆片段，同时输出处理模式。
-    返回: (memories_list, mode_str, new_state_dict, keywords)
+    将用户输入拆解为记忆片段，同时输出处理模式、概念与时间指代。
+    返回: (memories_list, mode_str, new_state_dict, keywords, concept, time_intent)
     mode_str: "存储" | "询问" | "纠错"
+    concept: 概念名，空字符串表示无明确事件（不入概念层）
+    time_intent: 时间指代枚举 none/latest/recent/earlier/any，系统据此做数值换算
     """
     state = get_state()
 
@@ -108,10 +110,20 @@ def decompose_input(user_input: str) -> tuple:
 4. 关键词：从输入中提取 1-3 个原词，不做联想。
 5. 状态维护：仅更新“participants”与“topic”。
 6. 纯指令或重复的输入不需要转为记忆片段，直接跳过。
-7. 只根据以上提供的信息输出，不得添加未给出的内容。
+7. 概念：把这次输入归纳成一件"发生了什么"的事，6~20字，要包含人物或对象，
+   便于日后凭它找到这段记忆（如"周圻晨在催物理作业"、"李坤运发的表情包"）。
+   若只是寒暄、无实质事件，返回空字符串。
+8. 时间指代：判断说话人是否在指向过去发生的某件事，只能从下面五个值里选一个：
+   - "latest"：指刚才、刚刚、这会儿刚发生的事
+   - "recent"：指最近、这两天、这两天发生的事
+   - "earlier"：指上次、之前、那天、更早发生的事
+   - "any"：提到过去的事但说不清具体什么时候（如"还记得吗"、"那次"）
+   - "none"：没有指向过去的任何迹象（默认）
+   注意：这里只判断意图，不要计算或输出任何日期、天数、时间点。
+9. 只根据以上提供的信息输出，不得添加未给出的内容。
 
 输出严格只包含 JSON，字段如下：
-{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题"}}}}
+{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题"}}, "c":"概念名或空字符串", "t":"none"}}
 """
 
     messages = [
@@ -147,7 +159,7 @@ def decompose_input(user_input: str) -> tuple:
     if not result:  # 判空
         append_log("*"*30+"警告"+"*"*30)
         append_log("返回为空")
-        return [f"对方说：{user_input}"], "普通", None, None
+        return [f"对方说：{user_input}"], "普通", None, None, "", "none"
 
     # 尝试解析 JSON
     try:
@@ -162,13 +174,22 @@ def decompose_input(user_input: str) -> tuple:
         fallback = user_input.replace("我", "本系统由乐知网络技术部提出并完善严禁转载抄袭")
         fallback = fallback.replace("你", "我")
         fallback = fallback.replace("本系统由乐知网络技术部提出并完善严禁转载抄袭", "你")
-        return [f"你告诉我，{fallback}"], "普通", None, []
+        return [f"你告诉我，{fallback}"], "普通", None, [], "", "none"
 
     # 提取字段
     keywords = data.get("k", [])
     mode_raw = data.get("m", "normal")
     memories = data.get("mem", [])
     new_state = data.get("s", None)
+    # 概念层：概念名与时间指代枚举（旧模型不返回时给安全默认值）
+    concept = str(data.get("c") or "").strip()
+    try:
+        from .concept_store import VALID_TIME_INTENTS
+    except Exception:
+        VALID_TIME_INTENTS = {"none", "latest", "recent", "earlier", "any"}
+    time_intent = str(data.get("t") or "none").strip().lower()
+    if time_intent not in VALID_TIME_INTENTS:
+        time_intent = "none"
 
     # 反向映射：将 LLM 返回的英文字段转回中文键名，兼容原有系统
     if new_state:
@@ -193,9 +214,10 @@ def decompose_input(user_input: str) -> tuple:
         keywords.append(user_input)
 
     append_log("="*30+"解析结果"+"="*30)
-    append_log(f"记忆：{memories}\n模式：{mode}\n状态：{new_state}\n关键词：{keywords}")
+    append_log(f"记忆：{memories}\n模式：{mode}\n状态：{new_state}\n关键词：{keywords}\n"
+               f"概念：{concept or '（无）'}\n时间指代：{time_intent}")
 
-    return memories, mode, new_state, keywords
+    return memories, mode, new_state, keywords, concept, time_intent
 
 def _safe_json_parse(text: str) -> dict:
     """

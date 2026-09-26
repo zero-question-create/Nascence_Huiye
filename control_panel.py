@@ -82,6 +82,26 @@ LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
 
 
+def _check_clock_offset(clock):
+    """启动自检：虚拟时钟换算后应与墙钟一致。
+
+    正常启动路径（enable_qq_mode 的 else 分支）会重锚基准，使
+    to_real_time(now()) == time.time()。若偏差过大，通常是存档被外部脚本
+    以不完整流程写入（未经 enable_qq_mode 重锚），此时相对时间短语会整体失真。
+    这里只告警、不修改时钟，避免掩盖问题。
+    """
+    try:
+        drift = abs(clock.to_real_time(clock.now()) - time.time())
+    except Exception:
+        return
+    if drift > 3600:
+        logging.warning(
+            "虚拟时钟偏移异常：to_real_time(now) 与墙钟相差 %.1f 小时，"
+            "相对时间短语可能失真（若为外部脚本写入的存档，重启一次即可重锚）",
+            drift / 3600,
+        )
+
+
 class SignalLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -255,11 +275,18 @@ class Runtime:
 
             clock.enable_qq_mode()
             clock.set_speed(1)
+            _check_clock_offset(clock)
             get_model()
             load_all_data()
             load_state()
             load_dialogue_history()
             _init_metrics_counters()
+            try:
+                from core.concept_store import reload_from_db, stats as concept_stats
+                reload_from_db()
+                logging.info("概念层已加载：%s", concept_stats())
+            except Exception:
+                logging.exception("概念层初始化失败，本次运行将不启用概念检索")
             if not memories:
                 cold_start_batch_injection()
                 save_all_data()

@@ -84,6 +84,27 @@ def inject_message_keywords(keywords: list):
     if keywords:
         _keyword_queue.append(keywords)
 
+
+# ========== 时间指代通道 ==========
+# 理解层给出的时间枚举（latest/recent/earlier/any），供概念路做时间窗筛选。
+# 只存最近一次：时间指代描述的是"当前这句话"的意图，跨轮沿用会失真。
+_time_intent: str = "none"
+
+
+def inject_time_intent(intent: str):
+    """由消息处理层调用，记录本轮消息的时间指代意图。"""
+    global _time_intent
+    if intent:
+        _time_intent = str(intent).strip().lower()
+
+
+def consume_time_intent() -> str:
+    """取出并重置时间指代（一次性，避免影响后续轮次）。"""
+    global _time_intent
+    intent = _time_intent
+    _time_intent = "none"
+    return intent
+
 # ========== 反刍抑制状态 ==========
 _keyword_continuity: dict = {}                      # {关键词: 连续出现次数}
 _inhibited_seeds: dict = {}                         # {种子节点ID: 剩余抑制轮数}
@@ -219,6 +240,59 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
     return timed_memories
 
 
+def retrieve_by_concept(keywords: list, time_intent: str = "none") -> tuple:
+    """概念定向检索：关键词命中概念 → 取若干事件段 → 段内按时间倒序直读。
+
+    与向量检索的区别在于全程不做相似度排序：概念已经把话题定死，
+    段内记忆又是同一次交互里的连续内容，直接按时间读即可。
+
+    返回 (timed_memories, concept_name, degraded)：
+      timed_memories 形如 [(real_ts, "[时间短语] 内容"), ...]
+      concept_name 为命中的概念名；未命中时为 None
+      degraded 表示时间窗内无记录、已降级为"最近若干段"
+    """
+    if not keywords:
+        return [], None, False
+
+    from .concept_store import match_concept, select_episodes, fetch_members
+    from utils.time_phrases import get_relative_time_phrase
+
+    # 长关键词更具体，优先用它匹配（如"物理作业"优于"作业"）
+    candidates = sorted({str(k) for k in keywords if k}, key=len, reverse=True)
+    cid = cname = None
+    for kw in candidates:
+        cid, cname, how = match_concept(kw)
+        if cid:
+            append_log(f"[概念路] 关键词「{kw}」命中概念「{cname}」（{how}）")
+            break
+    if not cid:
+        return [], None, False
+
+    try:
+        episodes, degraded = select_episodes(cid, time_intent)
+    except Exception as e:
+        append_log(f"[概念路] 事件段选择失败，跳过: {e}")
+        return [], None, False
+    if not episodes:
+        append_log(f"[概念路] 概念「{cname}」下没有事件段，跳过")
+        return [], None, False
+    if degraded:
+        append_log(f"[概念路] 时间窗内无记录（意图={time_intent}），降级为最近 {len(episodes)} 段")
+
+    try:
+        members = fetch_members(episodes)
+    except Exception as e:
+        append_log(f"[概念路] 成员展开失败，跳过: {e}")
+        return [], None, False
+
+    timed = []
+    for mem, real_ts in members:
+        phrase = get_relative_time_phrase(real_ts)
+        timed.append((real_ts, f"[{phrase}] {mem['content']}"))
+    append_log(f"[概念路] 概念「{cname}」带回 {len(timed)} 条（{len(episodes)} 段，意图={time_intent}）")
+    return timed, cname, degraded
+
+
 def mask_brackets(text: str) -> str:
     """
     移除 text 中所有成对括号及其内部内容。
@@ -286,7 +360,8 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     user_input = mask_brackets(user_input)      # 对输入进行预处理，防止污染，必要时可以注释这一行
 
     # 阶段A：LLM 拆解输入，拿到关键词
-    mem_fragments, mode, new_state, keywords = decompose_input(user_input)
+    # （概念与时间指代供 QQ 链路的概念层使用，此路径不消费）
+    mem_fragments, mode, new_state, keywords, _concept, _time_intent = decompose_input(user_input)
 
     # 更新对话状态
     if new_state:
@@ -754,19 +829,26 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                         del _keyword_continuity[kw]
 
             # ============================
-            # Step 3: 检索与扩散（应用抑制过滤）
             # ============================
-            if not current_keywords:
-                append_log("[认知循环] 当前无关键词，跳过本轮")
-                await asyncio.sleep(3)
-                continue
+            # Step 3: 概念定向检索（优先）
+            # 关键词命中概念时，走"概念 → 事件段 → 段内直读"，不做相似度排序。
+            # 这批记忆随后作为 pinned 进入提示词，不参与评分也不被关键词过滤丢弃。
+            # ============================
+            concept_memories, concept_name, concept_degraded = retrieve_by_concept(
+                current_keywords, consume_time_intent()
+            )
+            concept_texts = [text for _, text in concept_memories]
+            concept_ts = [ts for ts, _ in concept_memories]
 
+            # ============================
+            # Step 3': 向量检索与扩散（概念未命中时为主，命中时保留少量做跨概念联想）
+            # ============================
             related_pairs = retrieve_and_diffuse(
-                current_keywords, max_memories=10,
+                current_keywords, max_memories=3 if concept_memories else 10,
                 inhibited_seeds=set(_inhibited_seeds.keys()),
                 inhibited_edges=set(_inhibited_edges.keys())
             )
-            if not related_pairs:
+            if not related_pairs and not concept_memories:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
                 current_keywords = []
                 await asyncio.sleep(3)
@@ -857,12 +939,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 + ([prev_mem] if prev_mem else [])
                 + ([drowsy_mem] if drowsy_mem else [])
                 + ([note_mem] if note_mem else [])
+                # 概念路带回的记忆作为特供：不参与评分、不被关键词过滤丢弃
+                + concept_texts
             )
             pinned_ts = (
                 dialogue_ts
                 + ([prev_ts] if prev_ts is not None else [])
                 + ([drowsy_ts] if drowsy_ts is not None else [])
                 + ([note_ts] if note_ts is not None else [])
+                + concept_ts
             )
 
             result = await loop.run_in_executor(

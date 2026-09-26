@@ -547,7 +547,7 @@ async def handle_group_message(data: dict):
         full_input = f"{extra_context}\n{augmented_input}"
 
     # ========== 理解层：将用户输入拆解为记忆片段（关键词改用 jieba）==========
-    mem_fragments, mode, new_state, _keywords = decompose_input(full_input)
+    mem_fragments, mode, new_state, _keywords, concept, time_intent = decompose_input(full_input)
 
     # 更新对话状态
     if new_state:
@@ -561,6 +561,23 @@ async def handle_group_message(data: dict):
     for frag in mem_fragments:
         mid = create_memory(frag, half_life=half_life)
         user_mem_ids.append(mid)
+
+    # 归入概念层：把本轮记忆挂到概念下，供日后定向检索与时间回溯。
+    # 概念抽不出来时不建概念，该批记忆仍走原有向量检索。
+    if concept and user_mem_ids:
+        try:
+            from core.concept_store import record_concept
+            record_concept(concept, user_mem_ids)
+        except Exception as e:
+            logger.warning(f"概念层写入失败: {e}")
+
+    # 时间指代：交给认知循环，供概念路做时间窗筛选（不做词表解析）
+    if time_intent and time_intent != "none":
+        try:
+            from core.cognition import inject_time_intent
+            inject_time_intent(time_intent)
+        except Exception as e:
+            logger.warning(f"时间指代注入失败: {e}")
 
     # 将关键词注入认知循环：直接对收到的消息 jieba 分词（搜索引擎模式）
     msg_keywords = extract_keywords_jieba(clean_text)
