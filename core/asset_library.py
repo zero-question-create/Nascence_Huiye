@@ -409,10 +409,38 @@ def _safe_note_base(name: str) -> str | None:
     return base
 
 
+def note_contains(name: str, text: str) -> bool:
+    """判断笔记里是否已经写过同样的内容（用于写入前查重）。
+
+    比对时忽略首尾空白与常见列表前缀（如 "1. "、"- "），
+    这样"1. 交诗"与"交诗"视为同一条，避免同一件事被反复追加。
+    """
+    content = _normalize_note_line(text)
+    if not content:
+        return False
+    note = read_note(name, max_chars=64 * 1024)
+    if not note:
+        return False
+    for line in note["text"].splitlines():
+        if _normalize_note_line(line) == content:
+            return True
+    return False
+
+
+_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.、)）])\s*")
+
+
+def _normalize_note_line(text: str) -> str:
+    """归一化一行笔记：去掉列表前缀、首尾空白与常见收尾标点。"""
+    line = _LIST_PREFIX_RE.sub("", str(text or "").strip())
+    return line.strip().strip("。．.；;：:")
+
+
 def write_note(name: str, text: str) -> str | None:
     """只允许在 data/notes/ 下写 .txt；文件名白名单校验，内容追加不覆盖。
 
-    返回写入后的路径；校验失败返回 None（由调用方视为动作失败）。
+    追加前先查重：同样内容已存在则不重复写入（返回路径但不追加），
+    避免同一件事被反复记录。返回写入后的路径；校验失败返回 None。
     """
     base = _safe_note_base(name)
     if not base:
@@ -424,6 +452,11 @@ def write_note(name: str, text: str) -> str | None:
 
     os.makedirs(NOTE_DIR, exist_ok=True)
     path = os.path.join(NOTE_DIR, f"{base}.txt")
+
+    # 已写过同样内容：不重复追加（与既有列表项比对时忽略 "1. "/"- " 等前缀）
+    if note_contains(base, content):
+        return path
+
     try:
         if os.path.exists(path) and os.path.getsize(path) + len(content.encode("utf-8")) > 64 * 1024:
             return None

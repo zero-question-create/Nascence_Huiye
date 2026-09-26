@@ -134,7 +134,35 @@ def _system_prompt() -> str:
         "5. 一次只做一个动作。翻页时不要同时发送。\n"
         "6. 是否发出去要符合你此刻的心情和场合，别打断自己刚说的话。\n"
         "7. 记事本只能写 txt，文件名用中文或字母数字，不要带路径和扩展名。\n"
+        "8. 写记事本前先看【我的记事本】里已记的内容：同一件事只记一次，\n"
+        "   已经写过的不要再写第二遍；确实有新增事项才写，且一次只记一件。\n"
     )
+
+
+def _notes_brief(notes: list, max_chars: int = 600) -> str:
+    """把记事本现状摘要给模型看：文件名 + 最近记下的几条。
+
+    只给文件名的话，模型不知道里面已经写过什么，会反复把同一件事再写一遍。
+    这里带上最近若干条内容，让它自己看出"这条已经记过了"。
+    """
+    lines = ["【我的记事本】（写之前先看，已经记过的事不要再写一遍）"]
+    for name in notes:
+        note = ASSETS.read_note(name, max_chars=64 * 1024)
+        existing = []
+        if note:
+            existing = [l.strip() for l in note["text"].splitlines() if l.strip()]
+        lines.append(f"- {name}（共 {len(existing)} 条）")
+        if existing:
+            # 只给最近几条，避免长文件挤占上下文
+            recent = existing[-8:]
+            for item in recent:
+                lines.append(f"    · {item[:60]}")
+            if len(existing) > len(recent):
+                lines.append(f"    （更早的 {len(existing) - len(recent)} 条已略）")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…（已截断）"
+    return text
 
 
 def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
@@ -168,7 +196,7 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
     if note_enabled():
         notes = ASSETS.list_notes()
         if notes:
-            parts.append("【我的记事本】" + "、".join(notes) + "（想看就 read_txt）")
+            parts.append(_notes_brief(notes))
     if not images and not stickers and not pending:
         parts.append("【我的收藏】（空，还没收下过任何图片或表情包）")
     parts.append("请输出此刻的动作 JSON。")
@@ -277,10 +305,15 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             return {"action": "none", "detail": ""}
         name = str(data.get("name") or "").strip()
         text = str(data.get("text") or "").strip()
+        # 写之前先查重：同一件事只记一次，避免文件里反复出现同一行
+        already = ASSETS.note_contains(name, text)
         path = ASSETS.write_note(name, text)
         if not path:
             append_log(f"[动作抉择] 写笔记被拒绝（name={name!r}）")
             return {"action": "none", "detail": ""}
+        if already:
+            append_log(f"[动作抉择] 记事本已有同样内容，未重复写入：{text[:30]}")
+            return {"action": "none", "detail": "", "duplicate": True}
         # 正在写这个文件时，顺手读回全文，交给下一轮以特供记忆方式回看（不入库）
         note = ASSETS.read_note(name)
         return {
