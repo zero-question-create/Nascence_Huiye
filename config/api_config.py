@@ -43,6 +43,11 @@ DEFAULT_CONFIG = {
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）
     "biorhythm_onset_threshold": 0.62,      # 入睡阈值（S 达到 0.62 即精力 0.38 时入睡）
     "biorhythm_wake_threshold": 0.20,       # 醒来阈值（S 低于 0.20 即精力回到 0.80 时醒来）
+    # ===== 作息惯性（学得的昼夜节律，非硬编码钟点）=====
+    "biorhythm_rhythm_weight": 0.25,        # 作息窗口内最大睡意抬升量（峰值时 S≥0.37 即可入睡）
+    "biorhythm_idle_to_sleep": 300,         # 靠作息入睡所需的安静时长（秒），即"没人发消息"多久
+    "biorhythm_rhythm_min_nights": 5,       # 积累多少晚后作息开始生效
+    "biorhythm_rhythm_full_nights": 10,     # 积累多少晚后作息强度完全生效
     # ===== 动作抉择（本能冲动）=====
     "action_enabled": True,                 # 是否允许每轮末尾做动作抉择
     "action_max_pages": 4,                  # 单个动作类型的翻页上限

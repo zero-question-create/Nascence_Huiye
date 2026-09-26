@@ -4,20 +4,24 @@
 
 设计原则
 --------
-1. 不硬编码任何"睡觉时刻"：入睡/醒来都是睡眠压力越过阈值后**涌现**的结果。
-2. 不预设节律周期：没有 24 小时振荡器，也没有固定周期常数。
-   节律长度由睡眠压力动力学与**实际经历**共同决定——被提前叫醒时压力仍高，
-   于是下次会更早犯困；睡到自然醒则作息规律。周期因此随经历变化。
-3. 只有动力学"速率"是人为设定的量纲（任何模型都无法消除），
-   但这些速率是"压力多久积满/排空"，不是某个钟点。
+1. 不硬编码任何"睡觉时刻"：入睡/醒来都是动力学结果，而非某个钟点。
+2. 不预设节律周期：周期由睡眠压力动力学与**实际经历**共同决定。
+3. 只有动力学"速率"是人为设定的量纲（任何模型都无法消除）。
+4. 作息惯性是**学出来的**，不是配置出来的：从她自己"什么时候真的睡着了"
+   的覆盖时段累积成直方图，因此"到点就困"是她自己经历塑造的，不是外部钟表。
 
-模型（睡眠稳态）
-----------------
+模型（睡眠稳态 + 学得的作息节律）
+--------------------------------
 - 睡眠压力 S ∈ [0,1]：清醒时按 T_WAKE 向 1 上升，睡眠时按 T_SLEEP 向 0 回落。
   精力 energy = 1 - S。
-- 判定：清醒且 S >= ONSET_THRESHOLD 入睡；睡眠且 S <= WAKE_THRESHOLD 醒来。
-- 没有"睡眠债"等额外状态：被叫醒后 S 依然偏高，自然导致下次更早犯困，
-  "经历塑造节律"由这一条动力学直接涌现，无需附加机制（避免正反馈螺旋）。
+- 睡意 sleep_drive = S + RHYTHM_WEIGHT × circadian(当前时刻)。
+  circadian ∈ [0,1] 由作息直方图得出：她历史上在此时段入睡的比例。
+- 判定：
+    纯疲劳：S >= ONSET_THRESHOLD            → 入睡（不需要安静，和以前一致）
+    作息助力：sleep_drive >= ONSET_THRESHOLD → 且需安静 IDLE_TO_SLEEP 秒才入睡
+  数据不足时 circadian = 0，公式退化为原式，行为与此前完全一致。
+- 醒来：sleep_drive <= WAKE_THRESHOLD。由作息助攻而入睡的那一觉，在作息窗口内
+  不易醒（睡满整段），但设了最长时长与深度下限作安全阀，避免长睡不醒。
 
 时间基准：真实时间（time.time()）。倍速已停用，离线时间在 load() 时按真实流逝补算。
 """
@@ -49,14 +53,39 @@ AWAKE_LOCK = 20 * 60
 # 单次 tick 最大推进步长（秒），用于离线补算时的数值稳定
 MAX_STEP = 300.0
 
+# ========== 作息惯性（学得的昼夜节律）==========
+# 作息窗口内的最大睡意抬升量：峰值时 S>=0.37 即可入睡（原为 0.62）
+RHYTHM_WEIGHT = 0.25
+# 作息助攻入睡所需的安静时长（秒）：群里没人说话这么久才容易睡着
+IDLE_TO_SLEEP = 300.0
+# 数据不足多少晚时不启用作息（避免刚上线就改变行为）
+RHYTHM_MIN_NIGHTS = 5
+# 达到多少晚时作息强度完全生效（此前按比例渐强）
+RHYTHM_FULL_NIGHTS = 10
+# 睡眠期间按此间隔采样"此刻处于睡眠"，用于累积作息直方图
+RHYTHM_SAMPLE_INTERVAL = 900.0
+# 每次入睡前直方图的衰减系数：让作息能跟随生活变化
+RHYTHM_DECAY = 0.95
+# 作息窗口内维持睡眠所需的最低节律强度（低于此值即视为窗口结束，可以醒）
+RHYTHM_WAKE_HOLD = 0.5
+# 作息助攻那一觉的最长时长（秒）：安全阀，防止长睡不醒。
+# 说明：不需要额外的"深度下限"——醒来判定第一条就是 s <= WAKE_THRESHOLD，
+# 压力低到一定程度必然醒，再设一个更低的深度阈值是永不触发的死代码。
+MAX_RHYTHM_SLEEP = 14 * 3600
+
 
 def _load_params():
     """从全局 config 读取可调参数（缺键时回落到本模块默认值）。"""
     global T_WAKE, T_SLEEP, ONSET_THRESHOLD, WAKE_THRESHOLD
+    global RHYTHM_WEIGHT, IDLE_TO_SLEEP, RHYTHM_MIN_NIGHTS, RHYTHM_FULL_NIGHTS
     T_WAKE = float(config.get("biorhythm_wake_seconds", T_WAKE))
     T_SLEEP = float(config.get("biorhythm_sleep_seconds", T_SLEEP))
     ONSET_THRESHOLD = float(config.get("biorhythm_onset_threshold", ONSET_THRESHOLD))
     WAKE_THRESHOLD = float(config.get("biorhythm_wake_threshold", WAKE_THRESHOLD))
+    RHYTHM_WEIGHT = float(config.get("biorhythm_rhythm_weight", RHYTHM_WEIGHT))
+    IDLE_TO_SLEEP = float(config.get("biorhythm_idle_to_sleep", IDLE_TO_SLEEP))
+    RHYTHM_MIN_NIGHTS = int(config.get("biorhythm_rhythm_min_nights", RHYTHM_MIN_NIGHTS))
+    RHYTHM_FULL_NIGHTS = int(config.get("biorhythm_rhythm_full_nights", RHYTHM_FULL_NIGHTS))
 
 
 class Biorhythm:
@@ -75,6 +104,15 @@ class Biorhythm:
         self.awake_until = 0.0      # 清醒锁定到此时刻（被点名唤醒后）
         self.last_feeling_time = 0.0 # 上次注入身体感受的时刻（防每轮轰炸）
         self._replaying = False     # 离线补算中（跳过重量级睡眠维护）
+        # ---- 作息惯性（学得的昼夜节律）----
+        self.rhythm_hist = [0.0] * 24   # 24 小时直方图：她历史上在这些时段睡着的累积量
+        self.rhythm_nights = 0          # 已积累的睡眠次数（用于置信度渐变）
+        self.rhythm_total = 0.0         # 直方图累计总量（用于归一化，抗取整误差）
+        self._last_rhythm_sample = None # 上次作息采样时刻（睡眠期间按间隔采样）
+        self._by_rhythm = False         # 本次睡眠是否由作息助攻而入（决定醒来规则）
+        self._late_sleep_guard = False  # 作息入睡但节律已弱时，交回自然醒判定
+        self.last_guard_wake = False    # 上一次醒来是否由安全阀触发（供观测）
+        self.last_activity = time.time() # 最近一次外部活动（群消息）时刻，用于安静检测
         _load_params()
         self.load()
 
@@ -102,28 +140,155 @@ class Biorhythm:
         """推进 dt 秒（dt <= MAX_STEP），期间可能发生入睡/醒来转换。"""
         if self.state == "awake":
             self.s = 1.0 - (1.0 - self.s) * math.exp(-dt / T_WAKE)
-            # 被点名唤醒后的清醒锁定期内不重新入睡，以便完成回应
-            if now >= self.awake_until and self.s >= ONSET_THRESHOLD:
-                self._sleep(now)
+            self._maybe_sleep(now)
         else:
             self.s = self.s * math.exp(-dt / T_SLEEP)
-            if self.s <= WAKE_THRESHOLD:
-                self._wake_internal(now)
+            self._sample_rhythm(now)
+            self._maybe_wake(now)
+
+    # ---------- 作息惯性 ----------
+    def circadian(self, ts: float = None) -> float:
+        """当前时刻的作息强度 ∈ [0,1]：她历史上在这个时段睡着的比例。
+
+        数据不足时返回 0，公式退化为纯稳态，行为与加入本机制前一致。
+        """
+        if self.rhythm_nights < RHYTHM_MIN_NIGHTS or self.rhythm_total <= 0:
+            return 0.0
+        if ts is None:
+            ts = time.time()
+        hour = int((ts % 86400) / 3600) % 24
+        peak = max(self.rhythm_hist)
+        if peak <= 0:
+            return 0.0
+        return max(0.0, min(1.0, self.rhythm_hist[hour] / peak))
+
+    def rhythm_confidence(self) -> float:
+        """作息可信度 ∈ [0,1]：数据越多越强，攒够 RHYTHM_FULL_NIGHTS 晚后完全生效。"""
+        if self.rhythm_nights < RHYTHM_MIN_NIGHTS:
+            return 0.0
+        span = max(1, RHYTHM_FULL_NIGHTS - RHYTHM_MIN_NIGHTS)
+        return max(0.0, min(1.0, (self.rhythm_nights - RHYTHM_MIN_NIGHTS) / span))
+
+    def sleep_drive(self, ts: float = None) -> float:
+        """睡前总驱力 = 睡眠压力 + 作息助力。纯诊断用，判定走 _maybe_sleep。"""
+        return self.s + RHYTHM_WEIGHT * self.circadian(ts) * self.rhythm_confidence()
+
+    def rhythm_hours(self, threshold: float = 0.5) -> list:
+        """返回节律强度达到阈值的时段（小时列表），供观测"她学到了什么"。"""
+        if self.rhythm_nights < RHYTHM_MIN_NIGHTS or self.rhythm_total <= 0:
+            return []
+        peak = max(self.rhythm_hist)
+        if peak <= 0:
+            return []
+        return [h for h in range(24) if self.rhythm_hist[h] / peak >= threshold]
+
+    def _rhythm_boost(self, ts: float) -> float:
+        return RHYTHM_WEIGHT * self.circadian(ts) * self.rhythm_confidence()
+
+    def _maybe_sleep(self, now: float):
+        """入睡判定。
+
+        两条路径都要求"安静"：群里正聊得热闹时她不会自顾自睡过去，
+        既保证在线参与，也让学到的作息反映"环境安静 + 她困了"的时段
+        （实测若允许疲劳直睡，会把下午被逼睡的时间学成作息）。
+        """
+        # 被点名唤醒后的锁定期内不重新入睡，以便完成回应
+        if now < self.awake_until:
+            return
+        if now - self.last_activity < IDLE_TO_SLEEP:
+            return
+        # 1) 纯疲劳入睡：压力已越过阈值（不需要作息助攻）
+        if self.s >= ONSET_THRESHOLD:
+            self._sleep(now, by_rhythm=False)
+            return
+        # 2) 作息助攻入睡：睡意被节律抬到阈值
+        if self._rhythm_boost(now) <= 0:
+            return
+        if self.sleep_drive(now) >= ONSET_THRESHOLD:
+            self._sleep(now, by_rhythm=True)
+
+    def _maybe_wake(self, now: float):
+        """醒来判定。由作息助攻入睡的那一觉，在窗口内不易醒。"""
+        if self.s <= WAKE_THRESHOLD:
+            self._wake_internal(now)
+            return
+        if not self._by_rhythm:
+            return
+        # 安全阀：睡太久说明节律保护该结束了。
+        # 这里不只是打标记——必须真的放行，否则会一直睡下去。
+        dur = (now - self.sleep_started_at) if self.sleep_started_at else 0
+        if dur >= MAX_RHYTHM_SLEEP:
+            self._late_sleep_guard = True
+            self._wake_internal(now)
+            return
+        # 仍处于作息窗口内（节律够强）就继续睡；窗口结束则醒
+        if not self._replaying:
+            boost = self._rhythm_boost(now)
+            if boost >= RHYTHM_WAKE_HOLD * RHYTHM_WEIGHT * self.rhythm_confidence():
+                return
+        self._wake_internal(now)
+
+    def _sample_rhythm(self, now: float):
+        """睡眠期间按固定间隔采样"此刻处于睡眠"，累积作息直方图。
+
+        因为入睡的两条路径都要求环境安静，这里统计到的每一觉都是
+        "安静时她真的睡着了"，可以直接作为作息信号。作息因此是自塑造的：
+        她的实际睡眠经历反过来塑造"到点就困"。
+
+        按采样累积而非只记入睡时刻：这样得到的是"她通常睡着的时段"，
+        而不是一个单点尖峰。
+        """
+        if self._replaying:
+            return
+        if self._last_rhythm_sample is not None and (now - self._last_rhythm_sample) < RHYTHM_SAMPLE_INTERVAL:
+            return
+        self._last_rhythm_sample = now
+        hour = int((now % 86400) / 3600) % 24
+        self.rhythm_hist[hour] += 1.0
+        self.rhythm_total += 1.0
+
+    def _decay_rhythm(self):
+        """入睡前衰减直方图，使作息能跟随生活变化（老数据逐渐淡出）。"""
+        self.rhythm_hist = [v * RHYTHM_DECAY for v in self.rhythm_hist]
+        self.rhythm_total *= RHYTHM_DECAY
+
+    def note_activity(self, now: float = None):
+        """记录一次外部活动（群消息）。用于"安静多久了"的判定。
+
+        只应由外部消息调用：认知循环每几秒就自转一次，把自己的念头算作活动
+        会导致永远无法入睡。
+        """
+        with self._lock:
+            self.last_activity = time.time() if now is None else now
+
+    def idle_seconds(self, now: float = None) -> float:
+        """距上次外部活动的秒数。"""
+        ts = time.time() if now is None else now
+        return max(0.0, ts - self.last_activity)
 
     # ---------- 状态转换 ----------
-    def _sleep(self, now: float = None):
+    def _sleep(self, now: float = None, by_rhythm: bool = False):
         if now is None:
             now = time.time()
+        why = "（作息）" if by_rhythm else ""
         if self.last_onset is not None:
             interval = now - self.last_onset
-            append_log(f"[生物钟] 入睡（距上次入睡 {interval/3600:.2f}h，压力={self.s:.2f}）")
+            append_log(f"[生物钟] 入睡{why}（距上次入睡 {interval/3600:.2f}h，压力={self.s:.2f}，"
+                       f"节律={self.circadian(now):.2f}，安静={self.idle_seconds(now)/60:.1f}min）")
         else:
-            append_log(f"[生物钟] 入睡（压力={self.s:.2f}）")
+            append_log(f"[生物钟] 入睡{why}（压力={self.s:.2f}，节律={self.circadian(now):.2f}）")
         self.last_onset = now
         self.onset_count += 1
         self.state = "asleep"
         self.sleep_started_at = now
         self.woke_by_user = False
+        self._by_rhythm = bool(by_rhythm)
+        self._late_sleep_guard = False
+        self._last_rhythm_sample = None   # 新的一觉，采样从入睡后开始
+        # 衰减旧作息后开始累积本次，使作息能跟随生活变化
+        if not self._replaying:
+            self._decay_rhythm()
+            self.rhythm_nights += 1
         # 沿用现有睡眠全量维护（离线补算时不执行，避免启动开销与副作用）
         if not self._replaying:
             try:
@@ -140,7 +305,13 @@ class Biorhythm:
         self.wake_count += 1
         self.sleep_started_at = None
         self.last_wake = now
-        append_log(f"[生物钟] 自然醒来（睡了 {dur/3600:.2f}h，压力={self.s:.2f}）")
+        guard = "（安全阀）" if self._late_sleep_guard else ""
+        append_log(f"[生物钟] 自然醒来{guard}（睡了 {dur/3600:.2f}h，压力={self.s:.2f}，"
+                   f"作息入睡={self._by_rhythm}）")
+        self.last_guard_wake = self._late_sleep_guard   # 留痕供观测/测试，_by_rhythm 清空
+        self._by_rhythm = False
+        self._late_sleep_guard = False
+        self._last_rhythm_sample = None
 
     def wake(self, reason: str = "user"):
         """外部强制唤醒（如被 @）。被叫醒时压力仍高，之后会更快再次犯困。"""
@@ -156,6 +327,9 @@ class Biorhythm:
             self.woke_by_user = True
             # 清醒锁定：给足时间完成这次回应，不会话说到一半又睡回去
             self.awake_until = now + AWAKE_LOCK
+            self._by_rhythm = False
+            self._late_sleep_guard = False
+            self._last_rhythm_sample = None
             append_log(f"[生物钟] 被唤醒（{reason}，仅睡 {dur/3600:.2f}h，压力仍 {self.s:.2f}）")
             try:
                 self.save()
@@ -218,6 +392,12 @@ class Biorhythm:
             "sleep_pressure": round(self.s, 3),
             "onset_count": self.onset_count,
             "wake_count": self.wake_count,
+            "circadian": round(self.circadian(), 3),
+            "rhythm_nights": self.rhythm_nights,
+            "rhythm_conf": round(self.rhythm_confidence(), 3),
+            "sleep_drive": round(self.sleep_drive(), 3),
+            "idle_min": round(self.idle_seconds() / 60, 1),
+            "by_rhythm": self._by_rhythm,
         }
 
     # ---------- 持久化 ----------
@@ -234,6 +414,11 @@ class Biorhythm:
                 "wake_count": self.wake_count,
                 "sleep_started_at": self.sleep_started_at,
                 "awake_until": self.awake_until,
+                # 作息惯性：直方图与统计量需要持久化，否则重启就忘了作息
+                "rhythm_hist": self.rhythm_hist,
+                "rhythm_nights": self.rhythm_nights,
+                "rhythm_total": self.rhythm_total,
+                "by_rhythm": self._by_rhythm,
             }
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -256,16 +441,28 @@ class Biorhythm:
                 self.wake_count = int(data.get("wake_count", 0))
                 self.sleep_started_at = data.get("sleep_started_at", None)
                 self.awake_until = float(data.get("awake_until", 0.0))
+                # 作息惯性（旧存档没有这些字段，用默认值即可平滑过渡）
+                hist = data.get("rhythm_hist")
+                if isinstance(hist, list) and len(hist) == 24:
+                    self.rhythm_hist = [float(v) for v in hist]
+                self.rhythm_nights = int(data.get("rhythm_nights", 0))
+                self.rhythm_total = float(data.get("rhythm_total", sum(self.rhythm_hist)))
+                self._by_rhythm = bool(data.get("by_rhythm", False))
                 saved_at = float(data.get("last_tick", time.time()))
                 # 离线时长按真实流逝补算（重启后生物钟继续走）；
                 # 补算期间跳过睡眠维护，避免启动时执行重量级全量清理。
                 self.last_tick = saved_at
+                # 重启后重新计安静时间：避免"离线几天→一启动就立刻入睡"
+                self.last_activity = time.time()
                 self._replaying = True
                 try:
                     self.tick(time.time())
                 finally:
                     self._replaying = False
-                append_log(f"[生物钟] 已加载：{self.state}，精力={self.energy:.2f}")
+                hours = self.rhythm_hours()
+                append_log(f"[生物钟] 已加载：{self.state}，精力={self.energy:.2f}，"
+                           f"作息数据={self.rhythm_nights}晚"
+                           + (f"，常睡时段={hours}" if hours else ""))
             except Exception as e:
                 append_log(f"[生物钟] 加载失败，使用默认值: {e}")
                 self.last_tick = time.time()

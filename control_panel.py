@@ -1027,7 +1027,17 @@ class ControlPanel(QMainWindow):
             from core.biorhythm import BIORHYTHM
             snap = BIORHYTHM.snapshot()
             label = "睡眠中" if snap["state"] == "asleep" else "清醒"
-            self.energy_card.value.setText(f"{int(snap['energy']*100)}% {label}")
+            # 附上作息惯性：节律强度 + 已积累晚数，便于核对"她是否学到了作息"
+            nights = snap.get("rhythm_nights", 0)
+            circ = snap.get("circadian", 0.0)
+            if nights > 0:
+                extra = f"｜节律 {circ:.2f}（{nights}晚）"
+                hours = BIORHYTHM.rhythm_hours()
+                if hours:
+                    extra += f" 常睡 {min(hours)}-{max(hours)}点"
+            else:
+                extra = "｜作息积累中"
+            self.energy_card.value.setText(f"{int(snap['energy']*100)}% {label}{extra}")
         except Exception:
             pass
 

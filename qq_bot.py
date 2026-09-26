@@ -295,6 +295,14 @@ async def handle_group_message(data: dict):
         logger.debug(f"群 {group_id} 不在白名单，忽略")
         return
 
+    # 记录外部活动：作息惯性靠"安静多久"判断是否容易入睡。
+    # 只认群消息，不认她自己的发言——认知循环每几秒就自转一次，
+    # 若把自己的念头算作活动，她永远睡不着。
+    try:
+        BIORHYTHM.note_activity()
+    except Exception:
+        pass
+
     sender_id = str(data.get("user_id"))
     # 发送人判定：优先配置映射名 → 群昵称(card) → QQ昵称(nickname)
     sender_name = manifest.name_map.get(group_id, {}).get(sender_id)
