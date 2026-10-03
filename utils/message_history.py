@@ -64,17 +64,23 @@ def mark_delivery_failed(seq) -> bool:
 
     发送失败的内容不应被后续轮次当成"已经说出口的话"，
     因此在历史里显式留痕。返回是否命中。
+
+    注意：改完必须**先释放锁再保存**——save_state() 自己会取 _lock，
+    而 threading.Lock 不可重入，在锁内调用会直接死锁（实测会静默挂住进程）。
     """
     if seq is None:
         return False
+    hit = False
     with _lock:
         for msg in reversed(_message_history):
             if msg.get("seq") == seq:
                 if "（消息发送失败）" not in msg["content"]:
                     msg["content"] = f"{msg['content']}（消息发送失败）"
-                save_state()
-                return True
-    return False
+                hit = True
+                break
+    if hit:
+        save_state()
+    return hit
 
 
 def quote_suffix(msg) -> str:

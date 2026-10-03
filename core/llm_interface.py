@@ -31,16 +31,19 @@ MODEL_ = config["secondary_model"]
 
 
 def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ", quote=None):
-    """写入对话历史。
+    """写入对话历史，返回最后写入条目的序号（无写入时返回 None）。
 
+    返回 seq 是为了让调用方能在发送失败时回填"（消息发送失败）"标记（F20）。
     quote: 可选引用信息 {"sender": 被引用者, "text": 被引用的原话}，
     只随用户消息记录，供短期上下文还原"这句话在回应什么"。
     """
     from utils.message_history import add_message
+    seq = None
     if user_text:
-        add_message(sender_name, user_text, source, quote=quote)
+        seq = add_message(sender_name, user_text, source, quote=quote)
     if bot_reply:
-        add_message(BOT_NAME, bot_reply, source)
+        seq = add_message(BOT_NAME, bot_reply, source)
+    return seq
 
 
 def load_dialogue_history():

@@ -7,6 +7,7 @@
 import asyncio
 import json
 import re
+import threading
 import websockets
 import logging
 import aiohttp
@@ -128,6 +129,28 @@ _pending_actions = {}                 # echo -> Future，用于匹配 NapCat Act
 # ========== 睡眠配置 ==========
 # 睡眠由 core.biorhythm 的睡眠压力动力学 + 学得的作息决定（不硬编码钟点）
 _sleeping = False               # 是否处于强制睡眠状态
+
+# F09：最近一条待回复消息来自哪个群。认知循环据此把回复路由回来源群，
+# 而不是固定发往配置的主动发言群。加锁保护（可能在多任务间竞争）。
+_pending_reply_group = None
+_pending_reply_lock = threading.Lock()
+
+
+def take_pending_reply_group():
+    """取出并清空"待回复来源群"。无待回复消息时返回 None。"""
+    global _pending_reply_group
+    with _pending_reply_lock:
+        group = _pending_reply_group
+        _pending_reply_group = None
+        return group
+
+
+def _set_pending_reply_group(group_id):
+    """登记"有待回复的消息来自哪个群"（仅在没有待回复时设置，保持先进先出）。"""
+    global _pending_reply_group
+    with _pending_reply_lock:
+        if _pending_reply_group is None:
+            _pending_reply_group = str(group_id)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("QQBot")
@@ -332,7 +355,23 @@ def _sleep_maintenance_bg():
 
 # ---------- 消息处理核心 ----------
 async def handle_group_message(data: dict):
-    """处理单条群消息
+    """处理单条群消息（外层包装）。
+
+    在这里设置"当前群"上下文（F09），使本函数调用链中所有
+    get_state / set_state 自动落到对应群，从而让短期上下文（对话状态、
+    关键词、待回复来源群）按群隔离——此前它们是全局单例，多群互相污染。
+    """
+    group_id = data.get("group_id")
+    from utils.dialogue_state import set_group, reset_group
+    token = set_group(group_id)
+    try:
+        await _handle_group_message(data)
+    finally:
+        reset_group(token)
+
+
+async def _handle_group_message(data: dict):
+    """处理单条群消息的主体。
 
     睡眠期间的策略：未被 @ 的消息直接忽略；被 @ 则唤醒后正常回应。
     """
@@ -488,15 +527,23 @@ async def handle_group_message(data: dict):
                 chk_subtype = str(seg_data.get("sub_type")) == "1"
                 is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
                 media_type = "sticker" if is_sticker else "image"
-                desc = await describe_image_from_path(tmp_path)
+                # F08：这些函数虽是 async，内部却用**同步** OpenAI client 发请求，
+                # 直接 await 仍会阻塞事件循环。放到线程里执行真正的网络调用。
+                desc = await asyncio.to_thread(
+                    lambda: asyncio.run(describe_image_from_path(tmp_path))
+                )
                 if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
                     desc = seg_data.get("summary") or "表情包"
             elif seg_type == "record":
                 media_type = "record"
-                desc = await describe_audio_from_path(tmp_path)
+                desc = await asyncio.to_thread(
+                    lambda: asyncio.run(describe_audio_from_path(tmp_path))
+                )
             else:
                 media_type = "video"
-                desc = await describe_video_from_path(tmp_path)
+                desc = await asyncio.to_thread(
+                    lambda: asyncio.run(describe_video_from_path(tmp_path))
+                )
             if desc:
                 media_list.append((media_type, desc))
                 # 图片/表情包登记为暂存，供本轮动作抉择决定是否收藏
@@ -603,29 +650,37 @@ async def handle_group_message(data: dict):
         full_input = f"{extra_context}\n{augmented_input}"
 
     # ========== 理解层：将用户输入拆解为记忆片段（关键词改用 jieba）==========
-    mem_fragments, mode, new_state, _keywords, concept, time_intent = decompose_input(full_input)
+    #
+    # F08：decompose_input 是同步阻塞的（走同步 LLM HTTP），直接在协程里跑会
+    # 卡住整个事件循环——期间收不到新消息、处理不了引用回包、生物钟 tick 与
+    # 停服信号都会延迟。放进线程池：await 只挂起当前协程，循环继续服务其他任务。
+    loop = asyncio.get_running_loop()
+    mem_fragments, mode, new_state, _keywords, concept, time_intent = await loop.run_in_executor(
+        None, decompose_input, full_input
+    )
 
-    # 更新对话状态
+    # 更新对话状态（写 JSON，轻量，保持原位）
     if new_state:
         set_state(new_state)
         save_state()
 
-    # 记忆入库（不去重）
+    # 记忆入库 + 概念归入：都涉及同步 HTTP（ollama 嵌入）与数据库写入，
+    # 一并放进线程池，避免阻塞事件循环（F08）。create_memory / record_concept
+    # 内部有 _data_lock 保护，跨线程调用安全。
     from core.cognition import MODE_HALF_LIFE
     half_life = MODE_HALF_LIFE.get(mode, 2 * 24 * 3600)
-    user_mem_ids = []
-    for frag in mem_fragments:
-        mid = create_memory(frag, half_life=half_life)
-        user_mem_ids.append(mid)
 
-    # 归入概念层：把本轮记忆挂到概念下，供日后定向检索与时间回溯。
-    # 概念抽不出来时不建概念，该批记忆仍走原有向量检索。
-    if concept and user_mem_ids:
-        try:
-            from core.concept_store import record_concept
-            record_concept(concept, user_mem_ids)
-        except Exception as e:
-            logger.warning(f"概念层写入失败: {e}")
+    def _blocking_store():
+        ids = [create_memory(frag, half_life=half_life) for frag in mem_fragments]
+        if concept and ids:
+            try:
+                from core.concept_store import record_concept
+                record_concept(concept, ids)
+            except Exception as e:
+                logger.warning(f"概念层写入失败: {e}")
+        return ids
+
+    user_mem_ids = await loop.run_in_executor(None, _blocking_store)
 
     # 时间指代：交给认知循环，供概念路做时间窗筛选（不做词表解析）
     if time_intent and time_intent != "none":
@@ -636,55 +691,97 @@ async def handle_group_message(data: dict):
             logger.warning(f"时间指代注入失败: {e}")
 
     # 将关键词注入认知循环：直接对收到的消息 jieba 分词（搜索引擎模式）
+    # 显式带上来源群，供回复路由（F09）
     msg_keywords = extract_keywords_jieba(clean_text)
     if msg_keywords:
-        inject_message_keywords(msg_keywords)
+        inject_message_keywords(msg_keywords, group_id=group_id)
 
     # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
     # 引用信息以结构化字段随消息保存，短期上下文才能看出这句话在回应什么
     add_to_history(sender_name, clean_text.strip(), None, "QQ", quote=quote_info)
 
+    # F09：记下"有待回复的消息来自哪个群"。认知循环产出回复时优先回这里，
+    # 而不是固定发往配置里的主动发言群——否则群 B 的消息会引出一句发到群 A 的回复。
+    _set_pending_reply_group(group_id)
+    logger.debug(f"已记录待回复来源群: {group_id}")
+
     logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，jieba关键词: {msg_keywords}")
     BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
 
-async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None):
+SEND_ACK_TIMEOUT = 5.0   # 等待 NapCat 回执的秒数；超时即视为未送达
+
+
+async def _send_action_and_wait(websocket, payload: dict, echo: str) -> bool:
+    """发送 OneBot Action 并等待 NapCat 回执，返回是否确认成功。
+
+    与 fetch_quoted_message 复用同一套 echo→Future 机制（ws_handler 主循环
+    已在认领所有带 echo 的响应），因此不需要另开子进程或额外连接。
+    仅挂起当前协程，事件循环与其他消息处理照常运行。
+
+    判定标准：response['status'] == 'ok'。超时/断线/异常一律视为未送达。
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    try:
+        async with _action_lock:
+            _pending_actions[echo] = future
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        response = await asyncio.wait_for(future, timeout=SEND_ACK_TIMEOUT)
+        return str(response.get("status") or "").lower() == "ok"
+    except asyncio.TimeoutError:
+        logger.warning(f"发送未收到回执（echo={echo}，超时 {SEND_ACK_TIMEOUT}s），按未送达处理")
+        return False
+    except Exception as e:
+        logger.error(f"发送等待回执异常（echo={echo}）: {e}")
+        return False
+    finally:
+        _pending_actions.pop(echo, None)
+
+
+async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None) -> bool:
     """
     发送群消息，支持引用回复。
+
     reply_msg_id: 被引用消息的 message_id（整数）
+    返回：是否确认送达（NapCat 回执 status=ok 才算成功）
+
+    调用方必须依据返回值决定是否记入历史：此前无条件记"我说"，
+    发送失败时会造成"说过但其实没说出口"的虚假记忆（F20）。
     """
     if is_sleeping():
         logger.debug("睡眠期间禁止发送消息，已拦截。")
-        return
-    global _action_counter
+        return False
     websocket = _napcat_websocket
     if websocket is None:
         logger.error("消息发送失败：当前没有连接的 NapCat WebSocket")
-        return
+        return False
 
-    try:
-        message_content = text
-        if reply_msg_id is not None:
-            message_content = f"[CQ:reply,id={reply_msg_id}]{text}"
+    message_content = text
+    if reply_msg_id is not None:
+        message_content = f"[CQ:reply,id={reply_msg_id}]{text}"
 
-        async with _action_lock:
-            _action_counter += 1
-            echo = f"nascence-send-{_action_counter}"
-            payload = {
-                "action": "send_group_msg",
-                "params": {
-                    "group_id": int(group_id),
-                    "message": message_content,
-                },
-                "echo": echo,
-            }
-            await websocket.send(json.dumps(payload, ensure_ascii=False))
-        logger.info(f"已通过 NapCat WebSocket 发送消息（echo={echo}，引用={reply_msg_id}）: {text}")
+    global _action_counter
+    _action_counter += 1
+    echo = f"nascence-send-{_action_counter}"
+    payload = {
+        "action": "send_group_msg",
+        "params": {
+            "group_id": int(group_id),
+            "message": message_content,
+        },
+        "echo": echo,
+    }
+
+    ok = await _send_action_and_wait(websocket, payload, echo)
+    if ok:
+        logger.info(f"已发送并确认送达（echo={echo}，引用={reply_msg_id}）: {text}")
         from core.memory_engine import _bump_message_sent, _bump_self_ref
         _bump_message_sent()
         if "我" in text:
             _bump_self_ref()
-    except Exception as e:
-        logger.error(f"通过 NapCat WebSocket 发送消息异常: {e}")
+    else:
+        logger.warning(f"消息未确认送达（echo={echo}）: {text}")
+    return ok
 
 async def send_group_media(group_id: str, file_path: str, caption: str = "", as_sticker: bool = False) -> bool:
     """发送本地图片/表情包（消息段数组形式）。成功返回 True。
@@ -714,23 +811,23 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "", as_
         image_data["sub_type"] = 1
     segments.append({"type": "image", "data": image_data})
 
-    try:
-        async with _action_lock:
-            _action_counter += 1
-            echo = f"nascence-media-{_action_counter}"
-            payload = {
-                "action": "send_group_msg",
-                "params": {"group_id": int(group_id), "message": segments},
-                "echo": echo,
-            }
-            await websocket.send(json.dumps(payload, ensure_ascii=False))
-        logger.info(f"已通过 NapCat WebSocket 发送媒体（echo={echo}）: {file_path}")
+    _action_counter += 1
+    echo = f"nascence-media-{_action_counter}"
+    payload = {
+        "action": "send_group_msg",
+        "params": {"group_id": int(group_id), "message": segments},
+        "echo": echo,
+    }
+    # 与文本发送一样等待回执：此前只判断"本地 send 未抛异常"就返回 True，
+    # NapCat 拒绝时也会被记为发送成功（F20）。
+    ok = await _send_action_and_wait(websocket, payload, echo)
+    if ok:
+        logger.info(f"已发送并确认送达媒体（echo={echo}）: {file_path}")
         from core.memory_engine import _bump_message_sent
         _bump_message_sent()
-        return True
-    except Exception as e:
-        logger.error(f"通过 NapCat WebSocket 发送媒体异常: {e}")
-        return False
+    else:
+        logger.warning(f"媒体未确认送达（echo={echo}）: {file_path}")
+    return ok
 
 async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Optional[Tuple[str, str]]:
     """通过 WebSocket 获取引用消息，返回（原发送者名称，消息正文）。"""

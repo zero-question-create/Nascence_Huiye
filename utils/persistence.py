@@ -260,12 +260,12 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
 # ========== 对话状态持久化 ==========
 
 def save_state():
-    """保存对话状态到 JSON 文件"""
+    """保存对话状态到 JSON 文件（按群隔离后的全部状态）"""
     with _io_lock:
         os.makedirs("data/test", exist_ok=True)
+        from utils.dialogue_state import all_states
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            from utils.dialogue_state import current_state
-            json.dump(current_state, f, ensure_ascii=False, indent=2)
+            json.dump(all_states(), f, ensure_ascii=False, indent=2)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -273,16 +273,29 @@ def load_state():
     try:
         with open(STATE_FILE, 'r', encoding='utf-8-sig') as f:
             loaded = json.load(f)
-        # 标准化键名，仅保留在用的状态键；历史遗留的“已知信息”类字段直接丢弃
-        normalized = {}
-        for key, value in loaded.items():
-            if key in ("参与者", "最近话题"):
-                normalized[key] = value
-        # 更新状态，不清空，防止空覆盖
-        if normalized:
-            from utils.dialogue_state import current_state
-            current_state.update(normalized)
-        print(f"[状态加载] 加载内容: {normalized}")
+        # 标准化键名，仅保留在用的状态键；历史遗留的"已知信息"类字段直接丢弃
+        def _normalize(state: dict) -> dict:
+            return {k: v for k, v in state.items() if k in ("参与者", "最近话题")}
+
+        from utils.dialogue_state import load_states
+        if isinstance(loaded, dict) and "参与者" in loaded:
+            # 旧格式：一份全局状态 → 归入默认会话，保证首次升级不丢状态
+            normalized = _normalize(loaded)
+            load_states(normalized if normalized else None)
+            print(f"[状态加载] 旧格式已迁移到默认会话：{normalized}")
+            return
+
+        cleaned = {}
+        if isinstance(loaded, dict):
+            for group_key, state in loaded.items():
+                if not isinstance(state, dict):
+                    continue
+                norm = _normalize(state)
+                if norm:
+                    # JSON 的键都是字符串，None 会被写成 "null"，还原回来
+                    cleaned[None if group_key == "null" else group_key] = norm
+        load_states(cleaned)
+        print(f"[状态加载] 已加载 {len(cleaned)} 个群的状态")
     except Exception as e:
         print(f"[状态加载] 加载失败: {e}")
 

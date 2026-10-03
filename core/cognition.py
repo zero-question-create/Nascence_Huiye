@@ -42,7 +42,9 @@ EDGE_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3      # 路径抑制轮数
 KEYWORD_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3   # 关键词抑制轮数，触发的关键词在此轮数内跳过检索
 
 # ========== 永续认知循环全局 ==========
-_keyword_queue = deque(maxlen=100)           # 关键词消费队列（每轮取空处理）
+# 关键词消费队列：元素为 (keywords, group_id)。携带来源群是为了让回复
+# 能路由回触发它的那个群（F09）——此前是纯关键词列表，无从判断来源。
+_keyword_queue = deque(maxlen=100)
 _shallow_pool = deque(maxlen=20)             # 浅层意识池
 _cognitive_running = False                   # 循环运行状态
 _graceful_stop = False                       # 优雅停止标志（完成当前轮，不复搜）
@@ -79,10 +81,20 @@ def extract_keywords_jieba(text: str, max_keywords: int = 8) -> list:
             break
     return result
 
-def inject_message_keywords(keywords: list):
-    """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列"""
-    if keywords:
-        _keyword_queue.append(keywords)
+def inject_message_keywords(keywords: list, group_id: str = None):
+    """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列。
+
+    group_id 用于让后续回复路由回来源群（F09）。不传时从当前上下文取。
+    """
+    if not keywords:
+        return
+    if group_id is None:
+        try:
+            from utils.dialogue_state import current_group
+            group_id = current_group()
+        except Exception:
+            group_id = None
+    _keyword_queue.append((keywords, group_id))
 
 
 # ========== 时间指代通道 ==========
@@ -532,6 +544,33 @@ def _select_dialogue_window(history: list, dialogue_count: int) -> list:
     return history[anchor:]
 
 
+def _resolve_target_group(fallback: str, reply_group: str = None) -> str:
+    """解析本轮发送的目标群（F09 + F28）。
+
+    优先级：
+      1. 有待回复的消息时，回它所在的群（修复"群 B 的消息引出一句发到群 A 的回复"）。
+         来源群有两个渠道，取自关键词队列的 round_group，或 qq_bot 登记的待回复群；
+      2. 当前配置的主动发言群 —— 每轮重新读取，支持热更新（F28）；
+      3. 启动时捕获的 fallback。
+    """
+    if not reply_group:
+        try:
+            import qq_bot
+            reply_group = qq_bot.take_pending_reply_group()
+        except Exception:
+            reply_group = None
+    if reply_group:
+        return str(reply_group)
+    try:
+        import qq_bot
+        current = qq_bot.get_active_group_id()
+        if current:
+            return current
+    except Exception:
+        pass
+    return fallback
+
+
 def _consume_note_memory():
     """取出并清空记事本回看通道，返回 (内容, 真实时间戳)；无内容时返回 (None, None)。
 
@@ -600,12 +639,14 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         tag = "图片" if kind == ASSETS.IMAGE else "表情包"
         if not path:
             return None
-        if media_send_func is None or not target_group_id:
+        # 目标群同样动态解析（F28）
+        target_group = _resolve_target_group(target_group_id)
+        if media_send_func is None or not target_group:
             append_log("[动作抉择] 没有可用的媒体发送通道，放弃")
             return None
         # 按类型走对应发送方式：表情包需带 sub_type，否则 QQ 会当普通图片显示
         ok = await media_send_func(
-            target_group_id, path, as_sticker=(kind == ASSETS.STICKER)
+            target_group, path, as_sticker=(kind == ASSETS.STICKER)
         )
         if not ok:
             append_log("[动作抉择] 媒体发送失败，未记入历史")
@@ -635,10 +676,16 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     if action in ("write_txt", "edit_txt", "read_txt"):
         name = result.get("note_name") or ""
         text = result.get("note_text") or ""
-        if not text:
+        # F22：行为记录与"全文回看"解耦。
+        # 此前 `if not text: return None` 会在删除最后一行（文件变空、read_note
+        # 返回 None）时提前退出，文件已被修改却没有留下任何行为记忆——
+        # 违背"改动需留痕"。现在空文件只表示"没有可回看的内容"，
+        # 行为本身照常记录；只有 read_txt 在无内容时才无事可做。
+        if text:
+            # 形如：[现在]我打开了我写的“xxx”文件，内容是：xxx
+            _pending_note_memory = f"[现在]我打开了我写的“{name}”文件，内容是：{text}"
+        elif action == "read_txt":
             return None
-        # 形如：[现在]我打开了我写的“xxx”文件，内容是：xxx
-        _pending_note_memory = f"[现在]我打开了我写的“{name}”文件，内容是：{text}"
 
         if action == "write_txt":
             # 写入这个行为本身值得记住，但只记"写过"，不把文件全文灌进记忆库
@@ -723,15 +770,21 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             # ============================
             # Step 1: 消费队列中的全部关键词（取空即清空队列）
+            # 队列元素为 (keywords, group_id)，同时记下本轮的来源群，
+            # 供发送时路由（F09：回复回来源群而非固定主动群）。
             # ============================
             new_kws_batch = []
+            round_group = None
             while _keyword_queue:
-                kws = _keyword_queue.popleft()
+                kws, src_group = _keyword_queue.popleft()
                 new_kws_batch.extend(kws)
+                if src_group and not round_group:
+                    round_group = src_group
 
             if new_kws_batch:
                 current_keywords = list(dict.fromkeys(new_kws_batch))
-                append_log(f"[认知循环] 消费队列关键词: {current_keywords}")
+                append_log(f"[认知循环] 消费队列关键词: {current_keywords}"
+                           f"{f'（来源群 {round_group}）' if round_group else ''}")
 
             # ============================
             # Step 2: 若无关键词，从记忆库取种子（线程安全）
@@ -844,9 +897,13 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # Step 3: 概念定向检索（优先）
             # 关键词命中概念时，走"概念 → 事件段 → 段内直读"，不做相似度排序。
             # 这批记忆随后作为 pinned 进入提示词，不参与评分也不被关键词过滤丢弃。
+            #
+            # F08：概念匹配与向量检索内部都会发同步 HTTP（ollama 嵌入），
+            # 放进线程池执行，避免卡住事件循环。
             # ============================
-            concept_memories, concept_name, concept_degraded = retrieve_by_concept(
-                current_keywords, consume_time_intent()
+            time_intent_now = consume_time_intent()
+            concept_memories, concept_name, concept_degraded = await loop.run_in_executor(
+                None, lambda: retrieve_by_concept(current_keywords, time_intent_now)
             )
             concept_texts = [text for _, text in concept_memories]
             concept_ts = [ts for ts, _ in concept_memories]
@@ -854,10 +911,12 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             # Step 3': 向量检索与扩散（概念未命中时为主，命中时保留少量做跨概念联想）
             # ============================
-            related_pairs = retrieve_and_diffuse(
-                current_keywords, max_memories=3 if concept_memories else 10,
-                inhibited_seeds=set(_inhibited_seeds.keys()),
-                inhibited_edges=set(_inhibited_edges.keys())
+            related_pairs = await loop.run_in_executor(
+                None, lambda: retrieve_and_diffuse(
+                    current_keywords, max_memories=3 if concept_memories else 10,
+                    inhibited_seeds=set(_inhibited_seeds.keys()),
+                    inhibited_edges=set(_inhibited_edges.keys())
+                )
             )
             if not related_pairs and not concept_memories:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
@@ -997,19 +1056,37 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             else:
                 memory_text = f"我想：{thought_text}"
 
-            mem_id = create_memory(memory_text)
+            # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环
+            mem_id = await loop.run_in_executor(None, create_memory, memory_text)
             _shallow_pool.append(mem_id)
 
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
 
             # ============================
             # Step 6: 发送消息（若应发言）
+            # 先发、再按**实际送达结果**决定怎么记历史：
+            #   送达成功 → 记为"我说"，下一轮正常并入；
+            #   未送达   → 仍记入历史但追加"（消息发送失败）"后缀，
+            #              下一轮读到的是带标记的文本，不会被误当成"已经说出口"。
+            # 此前不看返回值就无条件 talk_sent=True 并记历史，
+            # 发送失败时会产生虚假的"说过"记忆（F20）。
             # ============================
             talk_sent = False
-            if should_speak and thought_text and send_func and target_group_id:
-                await send_func(target_group_id, thought_text)
-                talk_sent = True
-                add_to_history(None, None, thought_text)
+            # F09：有待回复的来源群时优先回它；F28：否则每轮重读配置（热更新）。
+            # 从关键词队列取到的 round_group 是本轮关键词的来源群。
+            target_group = _resolve_target_group(target_group_id, reply_group=round_group)
+            if should_speak and thought_text and send_func and target_group:
+                delivered = await send_func(target_group, thought_text)
+                talk_sent = delivered is not False     # 兼容未返回值的旧签名
+                if delivered is False:
+                    append_log(f"[认知循环] 消息发送失败，历史标记为未送达: {thought_text[:30]}")
+                seq = add_to_history(None, None, thought_text)
+                if delivered is False:
+                    try:
+                        from utils.message_history import mark_delivery_failed
+                        mark_delivery_failed(seq)
+                    except Exception as e:
+                        append_log(f"[认知循环] 标记发送失败时出错: {e}")
                 from utils.event_bus import BUS
                 BUS.message.emit(BOT_NAME, thought_text, "QQ")
 
@@ -1040,7 +1117,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             reply_keywords = extract_keywords_jieba(thought_text)
             if reply_keywords:
-                _keyword_queue.append(reply_keywords)
+                # 保持来源群，使后续轮次的回复仍能回到同一群
+                _keyword_queue.append((reply_keywords, round_group))
                 append_log(f"[认知循环] 回复分词入队: {reply_keywords}")
 
             # 本轮队列关键词已消费完毕，清空本轮的 current_keywords
