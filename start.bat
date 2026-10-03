@@ -93,11 +93,10 @@ echo ==========================================
 echo  Select mode:
 echo    1) CLI Interactive (main.py)
 echo    2) QQ Bot (qq_bot.py)
-echo    3) Self Training (self_training.py)
 echo ==========================================
 echo.
 
-set /p MODE_CHOICE="Choice (1/2/3, default 1): "
+set /p MODE_CHOICE="Choice (1/2, default 1): "
 if "!MODE_CHOICE!"=="" set MODE_CHOICE=1
 
 call "%PROJECT_DIR%venv\Scripts\activate.bat"
@@ -108,9 +107,6 @@ if "!MODE_CHOICE!"=="1" (
 ) else if "!MODE_CHOICE!"=="2" (
     echo [*] Starting QQ Bot mode...
     python qq_bot.py
-) else if "!MODE_CHOICE!"=="3" (
-    echo [*] Starting Self Training mode...
-    python self_training.py
 ) else (
     echo [*] Invalid choice, starting CLI mode...
     python main.py

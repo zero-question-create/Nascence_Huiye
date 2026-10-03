@@ -38,8 +38,10 @@ OLLAMA_PID=""
 
 start_ollama() {
     if [ -f "$OLLAMA_BIN" ]; then
-        export OLLAMA_HOME="$PROJECT_DIR/ollama/home"
-        mkdir -p "$OLLAMA_HOME"
+        # 与 setup.sh / 控制面板统一模型目录，避免装好的模型运行时找不到
+        export OLLAMA_HOME="${OLLAMA_HOME:-$PROJECT_DIR/ollama/home}"
+        export OLLAMA_MODELS="${OLLAMA_MODELS:-$PROJECT_DIR/ollama/home/models}"
+        mkdir -p "$OLLAMA_MODELS"
         
         # 检查是否已有 Ollama 在运行
         if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
@@ -99,10 +101,9 @@ echo "=========================================="
 echo "  请选择启动模式:"
 echo "    1) CLI 命令行交互模式 (main.py)"
 echo "    2) QQ Bot 模式 (qq_bot.py)"
-echo "    3) 自我训练模式 (self_training.py)"
 echo "=========================================="
 echo ""
-read -p "输入选择 (1/2/3，默认 1): " MODE_CHOICE
+read -p "输入选择 (1/2，默认 1): " MODE_CHOICE
 MODE_CHOICE=${MODE_CHOICE:-1}
 
 case "$MODE_CHOICE" in
@@ -113,10 +114,6 @@ case "$MODE_CHOICE" in
     2)
         echo "[*] 启动 QQ Bot 模式..."
         python3 qq_bot.py
-        ;;
-    3)
-        echo "[*] 启动自我训练模式..."
-        python3 self_training.py
         ;;
     *)
         echo "[!] 无效选择，启动 CLI 模式..."

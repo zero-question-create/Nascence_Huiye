@@ -12,18 +12,6 @@ fi
 
 cd "$PROJECT_DIR"
 
-# PySide6 的 X11 插件需要 libxcb-cursor；使用项目内副本，不修改系统库。
-LOCAL_LIB="$PROJECT_DIR/run/lib/usr/lib/x86_64-linux-gnu"
-if [ -d "$LOCAL_LIB" ]; then
-    export LD_LIBRARY_PATH="$LOCAL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-
-# 使用项目内 Fcitx Qt6 插件连接系统正在运行的搜狗输入法。
-export QT_IM_MODULE=fcitx
-export GTK_IM_MODULE=fcitx
-export XMODIFIERS=@im=fcitx
-export QT_PLUGIN_PATH="$PROJECT_DIR/run/qt-plugins"
-
 cleanup() {
     if [ -n "${PANEL_PID:-}" ]; then
         kill -TERM "$PANEL_PID" 2>/dev/null || true
@@ -33,7 +21,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 echo "=========================================="
-echo " Nascence 辉夜控制面板"
+echo " Nascence 辉夜 Web 控制面板"
 echo " 项目目录: $PROJECT_DIR"
 echo " 关闭此终端即停止全部项目服务"
 echo "=========================================="
@@ -43,7 +31,8 @@ if [ ! -x "$PROJECT_DIR/venv/bin/python" ]; then
     bash "$PROJECT_DIR/setup.sh"
 fi
 
-"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/control_panel.py" &
+echo "[*] 正在启动 Web 控制面板（http://127.0.0.1:8080）..."
+"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/web_panel.py" --port 8080 --open &
 PANEL_PID=$!
 wait "$PANEL_PID"
 PANEL_PID=""

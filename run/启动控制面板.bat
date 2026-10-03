@@ -26,11 +26,8 @@ if not defined PYTHON_OK (
 )
 echo [OK] Python found
 
-rem --- Qt plugin path (fix "could not find platform plugin" error) ---
-set "QT_PLUGIN_PATH=%PROJECT_DIR%\venv\Lib\site-packages\PyQt5\Qt5\plugins"
-
 echo ==========================================
-echo  Nascence Huiye Control Panel
+echo  Nascence Huiye Web Control Panel
 echo ==========================================
 
 rem --- ensure virtual env ---
@@ -53,7 +50,9 @@ if not exist "%PROJECT_DIR%\ollama\bin\ollama.exe" (
     )
 )
 
-"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\control_panel.py"
+echo [*] Starting web panel on http://127.0.0.1:8080 ...
+echo [*] Press Ctrl+C to stop the panel and all services.
+"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\web_panel.py" --port 8080 --open
 if %errorlevel% neq 0 (
     powershell -Command "Write-Host '[ERROR] Program exited abnormally, code: %errorlevel%' -ForegroundColor Red"
 )
