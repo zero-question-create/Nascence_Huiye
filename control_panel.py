@@ -395,8 +395,10 @@ class Runtime:
 
             augmented = f"我（{BOT_NAME}）自己想着：{text}"
             # 调用核心思考流程（LLM 拆解→检索→扩散→拼接）
-            # 返回 (reply, user_input, new_mem_ids)
-            reply, _, _new_mem_ids = generate_response(augmented)
+            # 返回 (reply, user_input, new_mem_ids, should_speak)
+            # "伪造思考"本身就是模拟内部想法，不区分 say（generate_response
+            # 内部已按 say 决定记为"我说"还是"我想"）
+            reply, _, _new_mem_ids, _should_speak = generate_response(augmented)
             reply = str(reply or "（静默）").strip()
             memory_text = f"我想：{reply}"
             add_message(BOT_NAME, memory_text, "伪造思考")

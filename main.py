@@ -91,9 +91,13 @@ def main():
             elif user_input.lower() == "move":
                 from utils.persistence import migrate_json_to_sqlite
                 migrate_json_to_sqlite()
-            reply, user_input, _new_mem_ids = generate_response(user_input)
+            reply, user_input, _new_mem_ids, should_speak = generate_response(user_input)
             append_dialogue(user_input, reply)
-            print(f"{BOT_NAME}: {reply}")
+            # 尊重 say 决策：内心话不当作公开回复显示（F10）
+            if should_speak:
+                print(f"{BOT_NAME}: {reply}")
+            else:
+                print(f"（{BOT_NAME}没有说话，只是心里想：{reply}）")
     except (EOFError, KeyboardInterrupt):
         print("发生错误！")
     finally:

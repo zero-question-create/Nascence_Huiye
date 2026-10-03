@@ -168,7 +168,8 @@ def _notes_brief(notes: list, max_chars: int = 600) -> str:
 
 
 def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
-                 keywords: list, context_hint: str) -> str:
+                 keywords: list, context_hint: str,
+                 images: list = None, stickers: list = None) -> str:
     parts = []
     if context_hint:
         parts.append(f"【此刻的情况】{context_hint}")
@@ -186,8 +187,13 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
         if kws:
             parts.append(f"【此刻萦绕的词】{kws}")
 
-    images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords)
-    stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords)
+    # 候选列表由调用方传入并**固定**。此前这里每次重新调 ordered_pool()，
+    # 而它内部含随机排序，导致提示词里展示的候选与翻页时用的列表不是同一份，
+    # 翻页会重复或跳过条目（F18）。
+    if images is None:
+        images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords)
+    if stickers is None:
+        stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords)
     if images:
         parts.append(_page_text(ASSETS.IMAGE, images, 0))
     if stickers:
@@ -242,7 +248,8 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
 
     messages = [
         {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords, context_hint)},
+        {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords,
+                                                 context_hint, images=images, stickers=stickers)},
     ]
 
     for turn in range(max_pages + 1):
@@ -253,15 +260,19 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
 
         if action in ("image_next_page", "sticker_next_page"):
             kind = ASSETS.IMAGE if action.startswith("image") else ASSETS.STICKER
-            pages[kind] += 1
             total_pages = max(1, (counts[kind] + page_size - 1) // page_size)
-            if pages[kind] >= total_pages or turn >= max_pages - 1:
-                # 已到末页或翻页次数用尽：把结论直接告知，不再继续翻
+            next_page = pages[kind] + 1
+            # 越界判断只在**确实超过**总页数时成立。
+            # 此前写成 pages[kind] >= total_pages（先自增再比较），于是
+            # 只有 2 页时翻到第 2 页就被判定"已到末页"，最后一页永远看不到（F18）。
+            if next_page > total_pages or turn >= max_pages - 1:
                 messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
                 messages.append({"role": "user", "content": "已经翻到最后一页了，请现在做决定，不要再翻页。"})
                 continue
+            pages[kind] = next_page
             messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
-            messages.append({"role": "user", "content": _page_text(kind, images if kind == ASSETS.IMAGE else stickers, pages[kind] - 1) + "\n\n请继续决定动作。"})
+            messages.append({"role": "user", "content": _page_text(
+                kind, images if kind == ASSETS.IMAGE else stickers, next_page - 1) + "\n\n请继续决定动作。"})
             continue
 
         if action in VALID_ACTIONS:

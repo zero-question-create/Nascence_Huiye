@@ -203,15 +203,21 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
     _current_round_seeds = list(seed_ids)
 
     # 合并扩散结果 + 检索结果
+    # 抑制过滤必须在这最后一关也生效：此前 inhibited_seeds 只剔除 BFS 种子，
+    # 被抑制的记忆仍能经 faiss / 精确关键词两路回到结果里（F25）。
     combined = {}
     for mem, score in activated_memories:
         mem_id = mem["id"]
+        if mem_id in inhibited_seeds:
+            continue
         content = mem["content"]
         if mem_id not in combined or score > combined[mem_id][0]:
             combined[mem_id] = (score, content, mem)
 
     for score, mem in faiss_results + exact_results:
         mem_id = mem["id"]
+        if mem_id in inhibited_seeds:
+            continue
         content = mem["content"]
         if mem_id not in combined or score > combined[mem_id][0]:
             combined[mem_id] = (score, content, mem)
@@ -354,10 +360,12 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
     4、体力行走扩散
     5、LLM拼接
 
-    返回 (reply, user_input, new_mem_ids)：
-      reply        —— 生成的回复文本
+    返回 (reply, user_input, new_mem_ids, should_speak)：
+      reply        —— 生成的文本（可能是内心独白）
       user_input   —— 原始输入（保持既有调用方兼容）
       new_mem_ids  —— **本轮**新建的记忆 ID 列表（按轮次返回，不依赖全局累加器）
+      should_speak —— 本轮是否应把 reply 公开说出口；False 表示这是内心话，
+                      调用方不应显示/发送，记忆里也已记为"我想"而非"我说"
     """
     # 预处理
     #clear_log()     # 可选择不清空，不清空的话直接把这行注释掉
@@ -400,34 +408,27 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
             if mem["id"] not in seed_ids:
                 seed_ids.append(mem["id"])
 
-    # 合并两路检索结果（用于后续兜底）
-    all_retrieved = faiss_results + [(score, mem) for score, mem in exact_results]
-
     # 阶段C：体力行走式扩散（从种子出发，沿有向图走）
     activated_memories = []  # 扩散激活的记忆
     if seed_ids:
         activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8)
         activated_memories = [(mem["content"], score, mem["id"]) for mem, score in activated]
 
-    # 收集检索阶段的所有高分结果（不去重，作为兜底）
-    all_retrieved = []
-    if keywords:
-        for kw in keywords:
-            similar = retrieve_similar(kw, k=5)
-            for score, mem in similar:
-                all_retrieved.append((mem["content"], score, mem["id"]))
-
-    # 合并：扩散结果 + 检索结果
+    # 合并：扩散结果 + 两路检索结果
+    #
+    # 注意不要像此前那样把 all_retrieved 清空后只重跑一次 faiss 检索——
+    # 那会丢掉精确关键词命中的结果，使"只被精确命中、BFS 又无邻居"的孤立记忆
+    # 完全进不了生成上下文，同时还白跑一遍 embedding（F17）。
     combined = {}
     for content, score, mem_id in activated_memories:
         mem = memories.get(mem_id) or _load_memory_from_db(mem_id)
         if mem and (mem_id not in combined or score > combined[mem_id][0]):
             combined[mem_id] = (score, content, mem)
 
-    for content, score, mem_id in all_retrieved:
-        mem = memories.get(mem_id) or _load_memory_from_db(mem_id)
-        if mem and (mem_id not in combined or score > combined[mem_id][0]):
-            combined[mem_id] = (score, content, mem)
+    for score, mem in faiss_results + list(exact_results):
+        mem_id = mem["id"]
+        if mem_id not in combined or score > combined[mem_id][0]:
+            combined[mem_id] = (score, mem["content"], mem)
 
     # 排序、去重、截断
     sorted_mems = sorted(combined.values(), key=lambda x: x[0], reverse=True)
@@ -461,10 +462,13 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
     # 阶段D：LLM 拼接回复（传入关键词作为指引）
     result = verbalize(timed_memories, keywords, new_state, user_input, timestamps=timestamps)
     reply = ""
+    should_speak = False
     if isinstance(result, dict):
         reply = result.get("text", "")
+        should_speak = bool(result.get("say", False))
     elif result:
         reply = str(result)
+        should_speak = True
 
     if reply:
         reply = reply.strip("“")
@@ -472,17 +476,22 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
         # 去掉句末句号（入库之前，只去末尾这一个）
         reply = _strip_trailing_period(reply)
 
-        if current_speaker:
-            reply_memory = f"我告诉{current_speaker}，{reply}"
+        # 尊重 say 决策：此前只读 text、忽略 say，把"内心话"也当成公开回复
+        # 返回并记成"我说"，导致 CLI 会把纯内心独白显示出来（F10）。
+        if should_speak:
+            if current_speaker:
+                reply_memory = f"我告诉{current_speaker}，{reply}"
+            else:
+                reply_memory = f"我说，{reply}"
         else:
-            reply_memory = f"我说，{reply}"
+            # 未发言：记为"我想"，调用方据此决定不公开显示
+            reply_memory = f"我想：{reply}"
 
-        # 存储回复（不去重）
         bot_mem_id = create_memory(reply_memory)
         user_mem_ids.append(bot_mem_id)
         if len(user_mem_ids) > 1:
             add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
-    return reply, user_input, user_mem_ids
+    return reply, user_input, user_mem_ids, should_speak
 
 def reset_dialogue():
     reset_state()

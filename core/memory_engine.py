@@ -1066,8 +1066,13 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                 sim = float(score)
                 if sim < SIMILARITY_THRESHOLD:
                     continue
-                adj.setdefault(seed, []).append((neighbor_id, sim, "semantic_fast"))
-                adj.setdefault(neighbor_id, []).append((seed, sim, "semantic_fast"))
+                # 抑制检查必须同样作用于 FAISS 弱边：此前只过滤 links 边，
+                # 被禁止的边能从 semantic_fast 通道绕回来（F25）。
+                # 弱边是双向添加的，因此逐方向判断，只跳过被禁的那个方向。
+                if (seed, neighbor_id) not in inhibited_edges:
+                    adj.setdefault(seed, []).append((neighbor_id, sim, "semantic_fast"))
+                if (neighbor_id, seed) not in inhibited_edges:
+                    adj.setdefault(neighbor_id, []).append((seed, sim, "semantic_fast"))
 
         activation = {}
         visited_edges = set()
@@ -1085,6 +1090,10 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                 if steps >= max_steps:
                     continue
                 for tgt, current_weight, edge_type in adj.get(cur, []):
+                    # 二次抑制检查：作为建图阶段的兜底，保证任何来源的边
+                    # （links 或 semantic_fast）都不能绕过抑制（F25）
+                    if (cur, tgt) in inhibited_edges:
+                        continue
                     if tgt not in memories:
                         loaded = _load_memory_from_db(tgt)
                         if loaded is None:

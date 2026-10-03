@@ -176,31 +176,54 @@ def decompose_input(user_input: str) -> tuple:
         fallback = fallback.replace("本系统由乐知网络技术部提出并完善严禁转载抄袭", "你")
         return [f"你告诉我，{fallback}"], "普通", None, [], "", "none"
 
+    # 类型校验：模型可能返回 null / 字符串 / 数组等畸形结构，
+    # 此前直接 data.get 后按假设使用，会 AttributeError 或在字符串上按字符迭代
+    # 产生垃圾记忆（F19）。这里逐字段归一化，非法值一律退回安全默认。
+    if not isinstance(data, dict):
+        append_log("*"*30+"警告：LLM 返回的顶层不是对象，降级处理"+"*"*30)
+        fallback = user_input.replace("我", "本系统由乐知网络技术部提出并完善严禁转载抄袭")
+        fallback = fallback.replace("你", "我")
+        fallback = fallback.replace("本系统由乐知网络技术部提出并完善严禁转载抄袭", "你")
+        return [f"你告诉我，{fallback}"], "普通", None, [], "", "none"
+
+    def _as_str_list(value):
+        """只接受 list[str]；其余（None/str/dict/数字）一律丢弃。"""
+        if not isinstance(value, list):
+            return []
+        return [str(v) for v in value if isinstance(v, str) and v.strip()]
+
     # 提取字段
-    keywords = data.get("k", [])
+    keywords = _as_str_list(data.get("k", []))
     mode_raw = data.get("m", "normal")
-    memories = data.get("mem", [])
+    memories = _as_str_list(data.get("mem", []))
     new_state = data.get("s", None)
     # 概念层：概念名与时间指代枚举（旧模型不返回时给安全默认值）
-    concept = str(data.get("c") or "").strip()
+    concept = str(data.get("c") or "").strip() if isinstance(data.get("c"), str) else ""
     try:
         from .concept_store import VALID_TIME_INTENTS
     except Exception:
         VALID_TIME_INTENTS = {"none", "latest", "recent", "earlier", "any"}
-    time_intent = str(data.get("t") or "none").strip().lower()
+    time_intent = data.get("t")
+    time_intent = time_intent.strip().lower() if isinstance(time_intent, str) else "none"
     if time_intent not in VALID_TIME_INTENTS:
         time_intent = "none"
 
     # 反向映射：将 LLM 返回的英文字段转回中文键名，兼容原有系统
-    if new_state:
+    if isinstance(new_state, dict):
+        participants = new_state.get("participants", [])
+        topic = new_state.get("topic", "")
         new_state = {
-            "参与者": new_state.get("participants", []),
-            "最近话题": new_state.get("topic", "")
+            "参与者": _as_str_list(participants),
+            "最近话题": topic if isinstance(topic, str) else "",
         }
+    else:
+        # 不是 dict（None/str/list）时忽略状态更新，避免 AttributeError
+        new_state = None
 
     # 模式映射：store -> 存储, ask -> 询问, 其他 -> 普通
+    # mode_raw 可能是 list/dict 等不可哈希类型，用类型检查兜住（原实现会 TypeError）
     mode_map = {"store": "存储", "ask": "询问", "normal": "普通"}
-    mode = mode_map.get(mode_raw, "普通")
+    mode = mode_map.get(mode_raw, "普通") if isinstance(mode_raw, str) else "普通"
 
     # 如果 memories 为空，则使用兜底逻辑
     if not memories:
@@ -218,6 +241,26 @@ def decompose_input(user_input: str) -> tuple:
                f"概念：{concept or '（无）'}\n时间指代：{time_intent}")
 
     return memories, mode, new_state, keywords, concept, time_intent
+
+def _coerce_bool(value) -> bool:
+    """把模型给出的松散值严格转成布尔。
+
+    不能直接用 bool()——字符串 "false" 是非空字符串，bool("false") 会得到 True，
+    于是模型明确表示"不要说出口"时反而被当成要发言（F19）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1"):
+            return True
+        if v in ("false", "no", "0", ""):
+            return False
+        return False      # 无法识别时保守取 False（不发言更安全）
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return False
+
 
 def _safe_json_parse(text: str) -> dict:
     """
@@ -390,7 +433,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     data = _safe_json_parse(reply)
     if "say" in data or "text" in data:
         return {
-            "say": bool(data.get("say", False)),
+            "say": _coerce_bool(data.get("say", False)),
             "text": str(data.get("text", "")),
         }
 
