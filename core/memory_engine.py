@@ -57,7 +57,8 @@ _faiss_to_mem = []                  # faiss_id → memory_id
 _mem_to_faiss = {}                  # memory_id → faiss_id
 _db_conn = None                     # 全局数据库实例
 hot_ids = set()                     # 当前在内存中的记忆 ID
-_last_created_ids = []              # 存储本轮新增的记忆 ID（QQ接口：用于追踪本轮对话新创建的记忆（供 QQ bot 获取））
+# 注：曾用 _last_created_ids 全局累加新建记忆 ID，但 QQ 链路与认知循环都绕过清理点，
+# 导致长跑中无限增长。现改为 create_memory 直接返回 id、由调用方按轮次收集（F29）。
 word_to_memories = {}               # {词: set(memory_id)}
 
 # ========== 链接增量同步标记 ==========
@@ -143,7 +144,18 @@ def _write_daily_metrics():
         json.dump(new_baseline, f, ensure_ascii=False)
 
 def _init_metrics_counters():
-    """启动时调用：从基线文件恢复上次保存的计数器累计值"""
+    """启动时调用：用基线文件为计数器取**下界**。
+
+    职责分离（这是此前的 bug 所在）：
+      - metrics_counters.json 是**实时累计快照**，由 save_all_data 写入，
+        启动时已由 load_all_data → _import_metrics_counters 恢复；
+      - metrics_baseline.json 是**上次日切时的水位**，只用于计算每日增量。
+
+    原实现用基线**无条件覆盖**当前累计值，于是两次日切之间重启时，
+    较新的快照会被较旧的基线冲掉（实测 mem_created 从 20 退回 5）。
+    改为只在基线更大时取值——即把基线当作"至少有过这么多"的下界，
+    既不会让计数倒退，也不会覆盖更新的快照。
+    """
     global _count_mem_created, _count_mem_deleted
     global _count_link_created, _count_link_deleted
     global _count_wordweb_created
@@ -151,29 +163,37 @@ def _init_metrics_counters():
     global _count_active_attempt, _count_active_success
 
     if not os.path.exists(METRICS_BASELINE_FILE):
-        # 首次运行，没有基线文件，所有计数器保持为 0
+        # 首次运行，没有基线文件，保持当前值（可能已由快照恢复）
         return
 
     try:
         with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8-sig') as f:
             baseline = json.load(f)
 
-        _count_mem_created = baseline.get("mem_created", 0)
-        _count_mem_deleted = baseline.get("mem_deleted", 0)
-        _count_link_created = baseline.get("link_created", 0)
-        _count_link_deleted = baseline.get("link_deleted", 0)
-        _count_wordweb_created = baseline.get("wordweb_created", 0)
-        _count_message_sent = baseline.get("msg_sent", 0)
-        _count_self_ref = baseline.get("self_ref", 0)
-        _count_active_attempt = baseline.get("active_attempt", 0)
-        _count_active_success = baseline.get("active_success", 0)
+        def _floor(current, key):
+            """取 max(当前值, 基线值)：基线只补低，不覆盖高的最新值。"""
+            try:
+                base_val = baseline.get(key, 0)
+                return max(current, base_val)
+            except TypeError:
+                return current
 
-        print(f"[指标] 计数器已从基线恢复，累计值："
+        _count_mem_created = _floor(_count_mem_created, "mem_created")
+        _count_mem_deleted = _floor(_count_mem_deleted, "mem_deleted")
+        _count_link_created = _floor(_count_link_created, "link_created")
+        _count_link_deleted = _floor(_count_link_deleted, "link_deleted")
+        _count_wordweb_created = _floor(_count_wordweb_created, "wordweb_created")
+        _count_message_sent = _floor(_count_message_sent, "msg_sent")
+        _count_self_ref = _floor(_count_self_ref, "self_ref")
+        _count_active_attempt = _floor(_count_active_attempt, "active_attempt")
+        _count_active_success = _floor(_count_active_success, "active_success")
+
+        print(f"[指标] 计数器已就绪（基线取下界），累计值："
               f"记忆+{_count_mem_created}/-{_count_mem_deleted}，"
               f"链接+{_count_link_created}/-{_count_link_deleted}，"
               f"消息{_count_message_sent}")
     except Exception as e:
-        print(f"[指标] 基线文件读取失败，计数器保持为0: {e}")
+        print(f"[指标] 基线文件读取失败，保留当前计数器值: {e}")
 
 def _export_metrics_counters() -> dict:
     """导出所有当前计数器值，供持久化使用"""
@@ -246,14 +266,15 @@ def _get_db():
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
     return _db_conn
 
-def _load_memory_from_db(mem_id: str) -> dict:
-    """从 SQLite 加载一条记忆到内存，并标记为热数据"""
-    db = _get_db()
-    row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
+def _row_to_memory(row) -> dict | None:
+    """把 memories 表的一行转成内存字典。行结构见建表语句。"""
     if row is None:
         return None
-    # 构造 memory_dict
-    mem = {
+    try:
+        concept_tags = json.loads(row[7]) if row[7] else []
+    except (json.JSONDecodeError, TypeError):
+        concept_tags = []
+    return {
         "id": row[0],
         "content": row[1],
         "vector": np.frombuffer(row[2], dtype=np.float32).tolist(),
@@ -261,8 +282,27 @@ def _load_memory_from_db(mem_id: str) -> dict:
         "last_accessed": row[4],
         "creation_time": row[5],
         "last_strengthen_time": row[6],
-        "concept_tag_ids": json.loads(row[7]) if row[7] else []
+        "concept_tag_ids": concept_tags,
     }
+
+
+def _load_wordweb_from_db():
+    """从 SQLite 恢复字词共现网络到内存（调用方需持有 _data_lock）。
+
+    注意：wordweb 目前**没有**独立的 SQLite 表，权威副本在 JSON 缓存里。
+    本函数保留为占位：若将来为其建表，在此实现恢复逻辑即可；
+    当前直接返回，字词网络由 JSON 恢复、缺失时从记忆内容重建。
+    """
+    return
+
+
+def _load_memory_from_db(mem_id: str) -> dict:
+    """从 SQLite 加载一条记忆到内存，并标记为热数据"""
+    db = _get_db()
+    row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
+    mem = _row_to_memory(row)
+    if mem is None:
+        return None
     memories[mem_id] = mem
     hot_ids.add(mem_id)
     _load_links_for_memory(mem_id)
@@ -280,16 +320,9 @@ def _batch_load_memories(mem_ids: list):
         mem_id = row[0]
         if mem_id in memories:
             continue
-        mem = {
-            "id": mem_id,
-            "content": row[1],
-            "vector": np.frombuffer(row[2], dtype=np.float32).tolist(),
-            "half_life": row[3],
-            "last_accessed": row[4],
-            "creation_time": row[5],
-            "last_strengthen_time": row[6],
-            "concept_tag_ids": json.loads(row[7]) if row[7] else []
-        }
+        mem = _row_to_memory(row)
+        if mem is None:
+            continue
         memories[mem_id] = mem
         hot_ids.add(mem_id)
     for mem_id in mem_ids:
@@ -495,17 +528,48 @@ def _sync_all_links_to_sqlite(full: bool = False):
         _deleted_links.clear()
         return written
 
+def _index_tokens(content: str) -> set:
+    """把文本切成倒排索引用的词元。
+
+    只保留长度 >= 2 的词：jieba 会切出「的」「不」「了」这类单字虚词，
+    它们几乎出现在每一条记忆里，一旦入索引就会让任意查询都能命中大量无关记忆
+    （实测查询"不存在的词"会因「的」命中"暴雨前的乌云"）。
+    """
+    result = set()
+    for w in jieba.cut(str(content or "")):
+        w = w.strip()
+        if len(w) >= 2:
+            result.add(w)
+    return result
+
+
 def _build_word_to_memories():
-    """从所有记忆的 content 重建词→记忆ID的倒排索引"""
+    """重建词→记忆ID倒排索引，**数据源为 SQLite 全量**。
+
+    此前只遍历内存中的热记忆（上限 1500 条），导致仅存于 SQLite 的冷记忆
+    在重启后完全无法被精确关键词检索命中。改为以 SQLite 为权威源，
+    分批读取避免一次性载入过多。
+    """
     global word_to_memories
-    word_to_memories.clear()
-    for mem_id, mem in memories.items():
-        words = set(jieba.cut(mem["content"]))
-        for word in words:
-            if word not in word_to_memories:
-                word_to_memories[word] = set()
-            word_to_memories[word].add(mem_id)
-    print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词")
+    db = _get_db()
+    new_index = {}
+    cursor = db.execute("SELECT id, content FROM memories")
+    count = 0
+    while True:
+        rows = cursor.fetchmany(500)
+        if not rows:
+            break
+        for mem_id, content in rows:
+            if not content:
+                continue
+            count += 1
+            for word in _index_tokens(content):
+                bucket = new_index.get(word)
+                if bucket is None:
+                    bucket = new_index[word] = set()
+                bucket.add(mem_id)
+    word_to_memories = new_index
+    print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词（覆盖 {count} 条记忆）")
 
 
 # ========== 模型加载 ==========
@@ -620,10 +684,12 @@ def _grow_wordweb(content: str, mem_id: str):
                 }
                 global _count_wordweb_created
                 _count_wordweb_created += 1
-    for word in set(words):  # 每个词只记录一次
-        if word not in word_to_memories:
-            word_to_memories[word] = set()
-        word_to_memories[word].add(mem_id)
+    # 增量写入倒排索引（与全量重建共用同一套分词规则，见 _index_tokens）
+    for word in _index_tokens(content):
+        bucket = word_to_memories.get(word)
+        if bucket is None:
+            bucket = word_to_memories[word] = set()
+        bucket.add(mem_id)
 
 # ========== faiss索引操作 ==========
 def _init_faiss_index():
@@ -743,8 +809,32 @@ def get_memory_content(mem_id: str) -> str | None:
             return loaded.get("content")
         return None
 
+def validate_vector(vec) -> np.ndarray:
+    """校验并归一化记忆向量。不合法时抛 ValueError。
+
+    为什么必须在写入前校验：原实现先 INSERT 提交、后 faiss.add()，
+    一旦维度不符或含 NaN/全零，add() 抛异常但坏向量已经落库，
+    之后连全量重建索引都会失败，库被污染且难以自愈。
+    """
+    if vec is None:
+        raise ValueError("向量为空")
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("向量为空")
+    if arr.size != EMBED_DIM:
+        raise ValueError(f"向量维度错误：期望 {EMBED_DIM}，实际 {arr.size}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("向量包含 NaN/Inf")
+    norm = float(np.linalg.norm(arr))
+    if norm <= 0:
+        raise ValueError("向量全零")
+    return arr
+
+
 def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
     vec = text_to_vector(content)
+    # 先校验（维度/有限值/非零），不合法直接拒绝写入，避免污染数据库与索引
+    vec_arr = validate_vector(vec).reshape(1, -1)
     mem_id = generate_memory_id()
     now = clock.now()
     memory_dict = {
@@ -764,12 +854,11 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
             """INSERT INTO memories (id, content, vector, half_life, last_accessed,
                creation_time, last_strengthen_time, concept_tag_ids)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mem_id, content, np.array(vec, dtype=np.float32).tobytes(),
+            (mem_id, content, vec_arr.tobytes(),
              half_life, now, now, now, json.dumps([]))
         )
         db.commit()
 
-        vec_arr = np.array(vec, dtype=np.float32).reshape(1, -1)
         faiss.normalize_L2(vec_arr)
         _faiss_index.add(vec_arr)
         faiss_id = _faiss_index.ntotal - 1
@@ -782,7 +871,6 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
         build_initial_links(mem_id)
         _grow_wordweb(content, mem_id)
 
-    _last_created_ids.append(mem_id)
     global _count_mem_created
     _count_mem_created += 1
     return mem_id
@@ -884,26 +972,30 @@ def retrieve_similar(query_text: str, k: int = K_RETRIEVAL) -> list:
 
     return deduped[:k]
 
+def _keyword_tokens(keyword: str) -> set:
+    """把查询词切成与建索引时一致的最小单元。
+
+    索引按 _index_tokens 建（只收长度 >= 2 的词），查询侧必须用同一规则：
+    否则"物理作业"整串去匹配分词后的索引永远不命中，而单字虚词又会带来假匹配。
+    """
+    return _index_tokens(keyword)
+
+
 def retrieve_by_exact_keywords(keywords: list, k: int = 5) -> list:
     """
     通过词网倒排索引，精确查找包含任意关键词的记忆。
     返回: [(score, memory_dict), ...]
     """
     matched_ids = set()
-    MAX_IDS_PER_KEYWORD = 50   # 每个关键词最多取 50 个记忆ID
     for kw in keywords:
-        if kw in word_to_memories:
-            ids = word_to_memories[kw]
-            if len(ids) > MAX_IDS_PER_KEYWORD:
-                # 如果太多，随机取一部分（或按最近访问时间排序，这里简单用 set 迭代截断）
-                ids = set(list(ids)[:MAX_IDS_PER_KEYWORD])
-            matched_ids.update(ids)
-    
-    # 限制总数
-    MAX_TOTAL_IDS = 100
-    if len(matched_ids) > MAX_TOTAL_IDS:
-        matched_ids = set(list(matched_ids)[:MAX_TOTAL_IDS])
-    
+        for token in _keyword_tokens(kw):
+            ids = word_to_memories.get(token)
+            if ids:
+                matched_ids.update(ids)
+
+    if not matched_ids:
+        return []
+
     # 收集需要从 SQLite 加载的 ID
     cold_ids = [mid for mid in matched_ids if mid not in memories]
     if cold_ids:
@@ -1057,13 +1149,45 @@ def provide_for_monitor() -> int:
 # 模块加载时初始化 faiss 索引
 _init_faiss_index()
 
+def _flush_hot_memory_timestamps(db):
+    """把热记忆的内存时间字段同步到 SQLite（调用方需持有 _data_lock）。
+
+    为什么必须做：access_memory() 只改内存，SQLite 里的 last_accessed/half_life
+    仍是旧值。而过期判定读的是 SQLite——若不在判定前同步，刚被召回强化的热记忆
+    会按陈旧值被判定过期，随即被物理删除（实测可复现）。
+    """
+    params = []
+    for mid in list(hot_ids):
+        mem = memories.get(mid)
+        if not mem:
+            continue
+        creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
+        params.append((
+            mem.get("last_accessed", 0.0),
+            mem.get("half_life", DEFAULT_HALF_LIFE),
+            mem.get("last_strengthen_time", creation),
+            mid,
+        ))
+    if params:
+        db.executemany(
+            "UPDATE memories SET last_accessed=?, half_life=?, last_strengthen_time=? WHERE id=?",
+            params
+        )
+        db.commit()
+
+
 def _purge_expired_memories(expiration_threshold=0.001):
     """
     物理删除衰减到极低水平的记忆。
     返回：被删除的记忆ID列表。
+
+    判定前先把热记忆的强化结果同步入库（见 _flush_hot_memory_timestamps），
+    否则刚被召回的旧记忆会被误删。
     """
     db = _get_db()
     now = clock.now()
+    # 先把内存里最新的访问/强化结果落库，保证过期判定用的是最新值
+    _flush_hot_memory_timestamps(db)
     # 从 SQLite 中查询所有记忆的ID、last_accessed、half_life
     rows = db.execute("SELECT id, last_accessed, half_life FROM memories").fetchall()
     expired_ids = []
@@ -1103,8 +1227,26 @@ def _purge_expired_memories(expiration_threshold=0.001):
             del memories[mem_id]
         hot_ids.discard(mem_id)
 
+    # 倒排索引同步清理：否则已删记忆仍会通过关键词检索被"召回"（F11）
+    _remove_from_word_index(expired_ids)
+
     global _count_mem_deleted
     _count_mem_deleted += len(expired_ids)
 
     # faiss 索引无法直接删除，稍后由调用者全量重建
     return expired_ids
+
+
+def _remove_from_word_index(mem_ids):
+    """从词→记忆倒排索引中移除指定记忆（调用方需持有 _data_lock）。
+
+    索引此前只增不减，会导致已删除记忆继续出现在精确关键词检索里。
+    """
+    if not mem_ids:
+        return
+    targets = set(mem_ids)
+    for word in list(word_to_memories.keys()):
+        ids = word_to_memories[word]
+        ids.difference_update(targets)
+        if not ids:
+            del word_to_memories[word]

@@ -345,7 +345,7 @@ def mask_brackets(text: str) -> str:
 
     return ''.join(result)
 
-def generate_response(user_input: str, current_speaker: str = None) -> str:
+def generate_response(user_input: str, current_speaker: str = None) -> tuple:
     """
     核心回复逻辑：
     1、预处理输入
@@ -353,6 +353,11 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
     3、语义查找
     4、体力行走扩散
     5、LLM拼接
+
+    返回 (reply, user_input, new_mem_ids)：
+      reply        —— 生成的回复文本
+      user_input   —— 原始输入（保持既有调用方兼容）
+      new_mem_ids  —— **本轮**新建的记忆 ID 列表（按轮次返回，不依赖全局累加器）
     """
     # 预处理
     #clear_log()     # 可选择不清空，不清空的话直接把这行注释掉
@@ -474,9 +479,10 @@ def generate_response(user_input: str, current_speaker: str = None) -> str:
 
         # 存储回复（不去重）
         bot_mem_id = create_memory(reply_memory)
-        if user_mem_ids:
+        user_mem_ids.append(bot_mem_id)
+        if len(user_mem_ids) > 1:
             add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
-    return reply, user_input
+    return reply, user_input, user_mem_ids
 
 def reset_dialogue():
     reset_state()
@@ -498,14 +504,11 @@ async def process_dialogue(augmented_input: str, extra_context: str = "") -> Tup
         current_speaker = match.group(1)
 
     loop = asyncio.get_event_loop()
-    reply, user_input = await loop.run_in_executor(
+    reply, user_input, new_mem_ids = await loop.run_in_executor(
         None, generate_response, full_input, current_speaker
     )
-
-    from core.memory_engine import _last_created_ids
-    new_mem_ids = _last_created_ids.copy()
-    _last_created_ids.clear()
-
+    # 本轮新建记忆的 ID 由 generate_response 按轮次返回，
+    # 不再使用全局累加器——那会在长跑中无限增长且无法区分轮次（F29）。
     return reply, new_mem_ids
 
 

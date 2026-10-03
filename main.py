@@ -93,7 +93,7 @@ def main():
                 from utils.persistence import migrate_json_to_sqlite
                 migrate_json_to_sqlite()
             clock.on_user_input()
-            reply, user_input = generate_response(user_input)
+            reply, user_input, _new_mem_ids = generate_response(user_input)
             append_dialogue(user_input, reply)
             print(f"{BOT_NAME}: {reply}")
     except (EOFError, KeyboardInterrupt):
