@@ -144,18 +144,7 @@ def _write_daily_metrics():
         json.dump(new_baseline, f, ensure_ascii=False)
 
 def _init_metrics_counters():
-    """启动时调用：用基线文件为计数器取**下界**。
-
-    职责分离（这是此前的 bug 所在）：
-      - metrics_counters.json 是**实时累计快照**，由 save_all_data 写入，
-        启动时已由 load_all_data → _import_metrics_counters 恢复；
-      - metrics_baseline.json 是**上次日切时的水位**，只用于计算每日增量。
-
-    原实现用基线**无条件覆盖**当前累计值，于是两次日切之间重启时，
-    较新的快照会被较旧的基线冲掉（实测 mem_created 从 20 退回 5）。
-    改为只在基线更大时取值——即把基线当作"至少有过这么多"的下界，
-    既不会让计数倒退，也不会覆盖更新的快照。
-    """
+    """启动时调用：从基线文件恢复上次保存的计数器累计值"""
     global _count_mem_created, _count_mem_deleted
     global _count_link_created, _count_link_deleted
     global _count_wordweb_created
@@ -163,37 +152,29 @@ def _init_metrics_counters():
     global _count_active_attempt, _count_active_success
 
     if not os.path.exists(METRICS_BASELINE_FILE):
-        # 首次运行，没有基线文件，保持当前值（可能已由快照恢复）
+        # 首次运行，没有基线文件，所有计数器保持为 0
         return
 
     try:
         with open(METRICS_BASELINE_FILE, 'r', encoding='utf-8-sig') as f:
             baseline = json.load(f)
 
-        def _floor(current, key):
-            """取 max(当前值, 基线值)：基线只补低，不覆盖高的最新值。"""
-            try:
-                base_val = baseline.get(key, 0)
-                return max(current, base_val)
-            except TypeError:
-                return current
+        _count_mem_created = baseline.get("mem_created", 0)
+        _count_mem_deleted = baseline.get("mem_deleted", 0)
+        _count_link_created = baseline.get("link_created", 0)
+        _count_link_deleted = baseline.get("link_deleted", 0)
+        _count_wordweb_created = baseline.get("wordweb_created", 0)
+        _count_message_sent = baseline.get("msg_sent", 0)
+        _count_self_ref = baseline.get("self_ref", 0)
+        _count_active_attempt = baseline.get("active_attempt", 0)
+        _count_active_success = baseline.get("active_success", 0)
 
-        _count_mem_created = _floor(_count_mem_created, "mem_created")
-        _count_mem_deleted = _floor(_count_mem_deleted, "mem_deleted")
-        _count_link_created = _floor(_count_link_created, "link_created")
-        _count_link_deleted = _floor(_count_link_deleted, "link_deleted")
-        _count_wordweb_created = _floor(_count_wordweb_created, "wordweb_created")
-        _count_message_sent = _floor(_count_message_sent, "msg_sent")
-        _count_self_ref = _floor(_count_self_ref, "self_ref")
-        _count_active_attempt = _floor(_count_active_attempt, "active_attempt")
-        _count_active_success = _floor(_count_active_success, "active_success")
-
-        print(f"[指标] 计数器已就绪（基线取下界），累计值："
+        print(f"[指标] 计数器已从基线恢复，累计值："
               f"记忆+{_count_mem_created}/-{_count_mem_deleted}，"
               f"链接+{_count_link_created}/-{_count_link_deleted}，"
               f"消息{_count_message_sent}")
     except Exception as e:
-        print(f"[指标] 基线文件读取失败，保留当前计数器值: {e}")
+        print(f"[指标] 基线文件读取失败，计数器保持为0: {e}")
 
 def _export_metrics_counters() -> dict:
     """导出所有当前计数器值，供持久化使用"""
@@ -529,47 +510,21 @@ def _sync_all_links_to_sqlite(full: bool = False):
         return written
 
 def _index_tokens(content: str) -> set:
-    """把文本切成倒排索引用的词元。
-
-    只保留长度 >= 2 的词：jieba 会切出「的」「不」「了」这类单字虚词，
-    它们几乎出现在每一条记忆里，一旦入索引就会让任意查询都能命中大量无关记忆
-    （实测查询"不存在的词"会因「的」命中"暴雨前的乌云"）。
-    """
-    result = set()
-    for w in jieba.cut(str(content or "")):
-        w = w.strip()
-        if len(w) >= 2:
-            result.add(w)
-    return result
+    """把文本切成倒排索引用的词元（保留原实现：直接 jieba 分词）。"""
+    return set(jieba.cut(str(content or "")))
 
 
 def _build_word_to_memories():
-    """重建词→记忆ID倒排索引，**数据源为 SQLite 全量**。
-
-    此前只遍历内存中的热记忆（上限 1500 条），导致仅存于 SQLite 的冷记忆
-    在重启后完全无法被精确关键词检索命中。改为以 SQLite 为权威源，
-    分批读取避免一次性载入过多。
-    """
+    """从所有记忆的 content 重建词→记忆ID的倒排索引"""
     global word_to_memories
-    db = _get_db()
-    new_index = {}
-    cursor = db.execute("SELECT id, content FROM memories")
-    count = 0
-    while True:
-        rows = cursor.fetchmany(500)
-        if not rows:
-            break
-        for mem_id, content in rows:
-            if not content:
-                continue
-            count += 1
-            for word in _index_tokens(content):
-                bucket = new_index.get(word)
-                if bucket is None:
-                    bucket = new_index[word] = set()
-                bucket.add(mem_id)
-    word_to_memories = new_index
-    print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词（覆盖 {count} 条记忆）")
+    word_to_memories.clear()
+    for mem_id, mem in memories.items():
+        words = set(jieba.cut(mem["content"]))
+        for word in words:
+            if word not in word_to_memories:
+                word_to_memories[word] = set()
+            word_to_memories[word].add(mem_id)
+    print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词")
 
 
 # ========== 模型加载 ==========
@@ -684,12 +639,10 @@ def _grow_wordweb(content: str, mem_id: str):
                 }
                 global _count_wordweb_created
                 _count_wordweb_created += 1
-    # 增量写入倒排索引（与全量重建共用同一套分词规则，见 _index_tokens）
-    for word in _index_tokens(content):
-        bucket = word_to_memories.get(word)
-        if bucket is None:
-            bucket = word_to_memories[word] = set()
-        bucket.add(mem_id)
+    for word in set(words):  # 每个词只记录一次
+        if word not in word_to_memories:
+            word_to_memories[word] = set()
+        word_to_memories[word].add(mem_id)
 
 # ========== faiss索引操作 ==========
 def _init_faiss_index():
@@ -972,29 +925,25 @@ def retrieve_similar(query_text: str, k: int = K_RETRIEVAL) -> list:
 
     return deduped[:k]
 
-def _keyword_tokens(keyword: str) -> set:
-    """把查询词切成与建索引时一致的最小单元。
-
-    索引按 _index_tokens 建（只收长度 >= 2 的词），查询侧必须用同一规则：
-    否则"物理作业"整串去匹配分词后的索引永远不命中，而单字虚词又会带来假匹配。
-    """
-    return _index_tokens(keyword)
-
-
 def retrieve_by_exact_keywords(keywords: list, k: int = 5) -> list:
     """
     通过词网倒排索引，精确查找包含任意关键词的记忆。
     返回: [(score, memory_dict), ...]
     """
     matched_ids = set()
+    MAX_IDS_PER_KEYWORD = 50   # 每个关键词最多取 50 个记忆ID
     for kw in keywords:
-        for token in _keyword_tokens(kw):
-            ids = word_to_memories.get(token)
-            if ids:
-                matched_ids.update(ids)
+        if kw in word_to_memories:
+            ids = word_to_memories[kw]
+            if len(ids) > MAX_IDS_PER_KEYWORD:
+                # 如果太多，随机取一部分（或按最近访问时间排序，这里简单用 set 迭代截断）
+                ids = set(list(ids)[:MAX_IDS_PER_KEYWORD])
+            matched_ids.update(ids)
 
-    if not matched_ids:
-        return []
+    # 限制总数
+    MAX_TOTAL_IDS = 100
+    if len(matched_ids) > MAX_TOTAL_IDS:
+        matched_ids = set(list(matched_ids)[:MAX_TOTAL_IDS])
 
     # 收集需要从 SQLite 加载的 ID
     cold_ids = [mid for mid in matched_ids if mid not in memories]
@@ -1066,13 +1015,8 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                 sim = float(score)
                 if sim < SIMILARITY_THRESHOLD:
                     continue
-                # 抑制检查必须同样作用于 FAISS 弱边：此前只过滤 links 边，
-                # 被禁止的边能从 semantic_fast 通道绕回来（F25）。
-                # 弱边是双向添加的，因此逐方向判断，只跳过被禁的那个方向。
-                if (seed, neighbor_id) not in inhibited_edges:
-                    adj.setdefault(seed, []).append((neighbor_id, sim, "semantic_fast"))
-                if (neighbor_id, seed) not in inhibited_edges:
-                    adj.setdefault(neighbor_id, []).append((seed, sim, "semantic_fast"))
+                adj.setdefault(seed, []).append((neighbor_id, sim, "semantic_fast"))
+                adj.setdefault(neighbor_id, []).append((seed, sim, "semantic_fast"))
 
         activation = {}
         visited_edges = set()
@@ -1090,10 +1034,6 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                 if steps >= max_steps:
                     continue
                 for tgt, current_weight, edge_type in adj.get(cur, []):
-                    # 二次抑制检查：作为建图阶段的兜底，保证任何来源的边
-                    # （links 或 semantic_fast）都不能绕过抑制（F25）
-                    if (cur, tgt) in inhibited_edges:
-                        continue
                     if tgt not in memories:
                         loaded = _load_memory_from_db(tgt)
                         if loaded is None:
@@ -1237,25 +1177,8 @@ def _purge_expired_memories(expiration_threshold=0.001):
         hot_ids.discard(mem_id)
 
     # 倒排索引同步清理：否则已删记忆仍会通过关键词检索被"召回"（F11）
-    _remove_from_word_index(expired_ids)
-
     global _count_mem_deleted
     _count_mem_deleted += len(expired_ids)
 
     # faiss 索引无法直接删除，稍后由调用者全量重建
     return expired_ids
-
-
-def _remove_from_word_index(mem_ids):
-    """从词→记忆倒排索引中移除指定记忆（调用方需持有 _data_lock）。
-
-    索引此前只增不减，会导致已删除记忆继续出现在精确关键词检索里。
-    """
-    if not mem_ids:
-        return
-    targets = set(mem_ids)
-    for word in list(word_to_memories.keys()):
-        ids = word_to_memories[word]
-        ids.difference_update(targets)
-        if not ids:
-            del word_to_memories[word]

@@ -42,9 +42,7 @@ EDGE_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3      # 路径抑制轮数
 KEYWORD_INHIBIT_ROUNDS = RUMINATION_THRESHOLD * 3   # 关键词抑制轮数，触发的关键词在此轮数内跳过检索
 
 # ========== 永续认知循环全局 ==========
-# 关键词消费队列：元素为 (keywords, group_id)。携带来源群是为了让回复
-# 能路由回触发它的那个群（F09）——此前是纯关键词列表，无从判断来源。
-_keyword_queue = deque(maxlen=100)
+_keyword_queue = deque(maxlen=100)           # 关键词消费队列（每轮取空处理）
 _shallow_pool = deque(maxlen=20)             # 浅层意识池
 _cognitive_running = False                   # 循环运行状态
 _graceful_stop = False                       # 优雅停止标志（完成当前轮，不复搜）
@@ -81,20 +79,10 @@ def extract_keywords_jieba(text: str, max_keywords: int = 8) -> list:
             break
     return result
 
-def inject_message_keywords(keywords: list, group_id: str = None):
-    """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列。
-
-    group_id 用于让后续回复路由回来源群（F09）。不传时从当前上下文取。
-    """
-    if not keywords:
-        return
-    if group_id is None:
-        try:
-            from utils.dialogue_state import current_group
-            group_id = current_group()
-        except Exception:
-            group_id = None
-    _keyword_queue.append((keywords, group_id))
+def inject_message_keywords(keywords: list):
+    """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列"""
+    if keywords:
+        _keyword_queue.append(keywords)
 
 
 # ========== 时间指代通道 ==========
@@ -215,21 +203,15 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
     _current_round_seeds = list(seed_ids)
 
     # 合并扩散结果 + 检索结果
-    # 抑制过滤必须在这最后一关也生效：此前 inhibited_seeds 只剔除 BFS 种子，
-    # 被抑制的记忆仍能经 faiss / 精确关键词两路回到结果里（F25）。
     combined = {}
     for mem, score in activated_memories:
         mem_id = mem["id"]
-        if mem_id in inhibited_seeds:
-            continue
         content = mem["content"]
         if mem_id not in combined or score > combined[mem_id][0]:
             combined[mem_id] = (score, content, mem)
 
     for score, mem in faiss_results + exact_results:
         mem_id = mem["id"]
-        if mem_id in inhibited_seeds:
-            continue
         content = mem["content"]
         if mem_id not in combined or score > combined[mem_id][0]:
             combined[mem_id] = (score, content, mem)
@@ -426,21 +408,34 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
         activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8)
         activated_memories = [(mem["content"], score, mem["id"]) for mem, score in activated]
 
-    # 合并：扩散结果 + 两路检索结果
-    #
-    # 注意不要像此前那样把 all_retrieved 清空后只重跑一次 faiss 检索——
-    # 那会丢掉精确关键词命中的结果，使"只被精确命中、BFS 又无邻居"的孤立记忆
-    # 完全进不了生成上下文，同时还白跑一遍 embedding（F17）。
+    # 合并两路检索结果（用于后续兜底）
+    all_retrieved = faiss_results + [(score, mem) for score, mem in exact_results]
+
+    # 阶段C：体力行走式扩散（从种子出发，沿有向图走）
+    activated_memories = []  # 扩散激活的记忆
+    if seed_ids:
+        activated = pathfind_activation(seed_ids, max_stamina=3, top_k=8)
+        activated_memories = [(mem["content"], score, mem["id"]) for mem, score in activated]
+
+    # 收集检索阶段的所有高分结果（不去重，作为兜底）
+    all_retrieved = []
+    if keywords:
+        for kw in keywords:
+            similar = retrieve_similar(kw, k=5)
+            for score, mem in similar:
+                all_retrieved.append((mem["content"], score, mem["id"]))
+
+    # 合并：扩散结果 + 检索结果
     combined = {}
     for content, score, mem_id in activated_memories:
         mem = memories.get(mem_id) or _load_memory_from_db(mem_id)
         if mem and (mem_id not in combined or score > combined[mem_id][0]):
             combined[mem_id] = (score, content, mem)
 
-    for score, mem in faiss_results + list(exact_results):
-        mem_id = mem["id"]
-        if mem_id not in combined or score > combined[mem_id][0]:
-            combined[mem_id] = (score, mem["content"], mem)
+    for content, score, mem_id in all_retrieved:
+        mem = memories.get(mem_id) or _load_memory_from_db(mem_id)
+        if mem and (mem_id not in combined or score > combined[mem_id][0]):
+            combined[mem_id] = (score, content, mem)
 
     # 排序、去重、截断
     sorted_mems = sorted(combined.values(), key=lambda x: x[0], reverse=True)
@@ -544,23 +539,12 @@ def _select_dialogue_window(history: list, dialogue_count: int) -> list:
     return history[anchor:]
 
 
-def _resolve_target_group(fallback: str, reply_group: str = None) -> str:
-    """解析本轮发送的目标群（F09 + F28）。
+def _resolve_target_group(fallback: str) -> str:
+    """解析本轮主动发言的目标群：优先取当前配置（支持热更新），失败回落到启动值。
 
-    优先级：
-      1. 有待回复的消息时，回它所在的群（修复"群 B 的消息引出一句发到群 A 的回复"）。
-         来源群有两个渠道，取自关键词队列的 round_group，或 qq_bot 登记的待回复群；
-      2. 当前配置的主动发言群 —— 每轮重新读取，支持热更新（F28）；
-      3. 启动时捕获的 fallback。
+    F28：cognitive_loop 启动时把 get_active_group_id() 的结果固化成了局部参数，
+    之后在控制面板改目标群，运行中的循环仍往旧群发送。改为每轮重新解析。
     """
-    if not reply_group:
-        try:
-            import qq_bot
-            reply_group = qq_bot.take_pending_reply_group()
-        except Exception:
-            reply_group = None
-    if reply_group:
-        return str(reply_group)
     try:
         import qq_bot
         current = qq_bot.get_active_group_id()
@@ -770,21 +754,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             # ============================
             # Step 1: 消费队列中的全部关键词（取空即清空队列）
-            # 队列元素为 (keywords, group_id)，同时记下本轮的来源群，
-            # 供发送时路由（F09：回复回来源群而非固定主动群）。
             # ============================
             new_kws_batch = []
-            round_group = None
             while _keyword_queue:
-                kws, src_group = _keyword_queue.popleft()
+                kws = _keyword_queue.popleft()
                 new_kws_batch.extend(kws)
-                if src_group and not round_group:
-                    round_group = src_group
 
             if new_kws_batch:
                 current_keywords = list(dict.fromkeys(new_kws_batch))
-                append_log(f"[认知循环] 消费队列关键词: {current_keywords}"
-                           f"{f'（来源群 {round_group}）' if round_group else ''}")
+                append_log(f"[认知循环] 消费队列关键词: {current_keywords}")
 
             # ============================
             # Step 2: 若无关键词，从记忆库取种子（线程安全）
@@ -897,13 +875,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # Step 3: 概念定向检索（优先）
             # 关键词命中概念时，走"概念 → 事件段 → 段内直读"，不做相似度排序。
             # 这批记忆随后作为 pinned 进入提示词，不参与评分也不被关键词过滤丢弃。
-            #
-            # F08：概念匹配与向量检索内部都会发同步 HTTP（ollama 嵌入），
-            # 放进线程池执行，避免卡住事件循环。
             # ============================
-            time_intent_now = consume_time_intent()
-            concept_memories, concept_name, concept_degraded = await loop.run_in_executor(
-                None, lambda: retrieve_by_concept(current_keywords, time_intent_now)
+            concept_memories, concept_name, concept_degraded = retrieve_by_concept(
+                current_keywords, consume_time_intent()
             )
             concept_texts = [text for _, text in concept_memories]
             concept_ts = [ts for ts, _ in concept_memories]
@@ -911,12 +885,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             # Step 3': 向量检索与扩散（概念未命中时为主，命中时保留少量做跨概念联想）
             # ============================
-            related_pairs = await loop.run_in_executor(
-                None, lambda: retrieve_and_diffuse(
-                    current_keywords, max_memories=3 if concept_memories else 10,
-                    inhibited_seeds=set(_inhibited_seeds.keys()),
-                    inhibited_edges=set(_inhibited_edges.keys())
-                )
+            related_pairs = retrieve_and_diffuse(
+                current_keywords, max_memories=3 if concept_memories else 10,
+                inhibited_seeds=set(_inhibited_seeds.keys()),
+                inhibited_edges=set(_inhibited_edges.keys())
             )
             if not related_pairs and not concept_memories:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
@@ -1057,7 +1029,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 memory_text = f"我想：{thought_text}"
 
             # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环
-            mem_id = await loop.run_in_executor(None, create_memory, memory_text)
+            mem_id = create_memory(memory_text)
             _shallow_pool.append(mem_id)
 
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
@@ -1072,9 +1044,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 发送失败时会产生虚假的"说过"记忆（F20）。
             # ============================
             talk_sent = False
-            # F09：有待回复的来源群时优先回它；F28：否则每轮重读配置（热更新）。
-            # 从关键词队列取到的 round_group 是本轮关键词的来源群。
-            target_group = _resolve_target_group(target_group_id, reply_group=round_group)
+            # F28：目标群动态解析。cognitive_loop 的 target_group_id 是启动时
+            # 捕获的局部参数，改配置后运行中的循环仍发旧群（而 UI 提示"已生效"）。
+            # 这里每轮重新向发送方要一次当前目标群，实现真正的热更新。
+            target_group = _resolve_target_group(target_group_id)
             if should_speak and thought_text and send_func and target_group:
                 delivered = await send_func(target_group, thought_text)
                 talk_sent = delivered is not False     # 兼容未返回值的旧签名
@@ -1117,8 +1090,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             reply_keywords = extract_keywords_jieba(thought_text)
             if reply_keywords:
-                # 保持来源群，使后续轮次的回复仍能回到同一群
-                _keyword_queue.append((reply_keywords, round_group))
+                _keyword_queue.append(reply_keywords)
                 append_log(f"[认知循环] 回复分词入队: {reply_keywords}")
 
             # 本轮队列关键词已消费完毕，清空本轮的 current_keywords
