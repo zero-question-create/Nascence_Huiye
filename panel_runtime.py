@@ -288,38 +288,112 @@ class Runtime:
             for line in process.stdout:
                 logging.info("[%s] %s", name, line.rstrip("\n"))
 
+    # 初始化阶段进度（供面板显示；值为中文阶段名）
+    init_stage = "未开始"
+    init_started_at = None
+    initialized = False
+    # 关停请求标志：面板收到关闭指令后置位，供请求处理器拒绝新操作
+    shutdown_requested = False
+
+    def request_shutdown(self):
+        """由面板调用：置位关停标志，后续操作请求会被拒绝。"""
+        self.shutdown_requested = True
+
+    def _set_stage(self, text: str, done: bool = False):
+        self.init_stage = text
+        if done:
+            self.init_started_at = None
+        try:
+            from utils.event_bus import BUS
+            # 用独立 stage 信号：面板据此更新"正在初始化"提示，
+            # 不占用 status（后者用于服务状态与弹窗提醒）
+            BUS.stage.emit(text, done)
+        except Exception:
+            pass
+
+    def init_elapsed(self) -> float:
+        """初始化已耗时（秒）；已结束或未开始返回 0。"""
+        if self.init_started_at is None:
+            return 0.0
+        return time.time() - self.init_started_at
+
     def initialize(self):
         with self._lock:
             if self.initialized:
                 return
+            t_start = time.time()
+            last = [t_start]
+
+            def stage(text: str, done: bool = False):
+                now = time.time()
+                if done:
+                    logging.info("初始化阶段：%s（本阶段 %.1fs，累计 %.1fs）",
+                                 text, now - last[0], now - t_start)
+                else:
+                    logging.info("初始化阶段：%s（+%.1fs）", text, now - last[0])
+                last[0] = now
+                self._set_stage(text, done)
+
             logging.info("开始初始化 Nascence 运行环境")
-            self.start_ollama()
+            self.init_started_at = time.time()
+            stage("加载核心模块")
+
+            # 重型模块的导入全部收敛在初始化线程里完成。
+            # 这样面板线程（事件循环）不会在轮询时撞上导入锁而卡住——
+            # 曾经的"卡在加载核心"就是两侧同时在事件循环上做秒级导入造成的。
             from core.memory_engine import get_model, memories, _init_metrics_counters
             from core.virtual_clock import clock
             from main import cold_start_batch_injection
             from utils.persistence import load_all_data, load_state, save_all_data, save_state
             from core.llm_interface import load_dialogue_history
 
+            stage("启动 Ollama")
+            self.start_ollama()
+
+            # 模型预热与记忆加载互不依赖：并行执行以缩短总时长
+            #（Ollama 首次 embedding 调用需要几秒加载模型权重）。
+            stage("预热模型与加载记忆")
+            warm_error = []
+
+            def _warm():
+                try:
+                    get_model()
+                except Exception as e:
+                    warm_error.append(e)
+
+            warm_thread = threading.Thread(target=_warm, name="ModelWarmup", daemon=True)
+            warm_thread.start()
+
             clock.enable_qq_mode()
             clock.set_speed(1)
             _check_clock_offset(clock)
-            get_model()
             load_all_data()
             load_state()
             load_dialogue_history()
             _init_metrics_counters()
+            # 预热失败不能拖住初始化：给足冷加载时间（首次拉取模型另计），
+            # 超时后照常放行，后续首次向量化会自行重试。
+            warm_thread.join(timeout=120)
+            if warm_error:
+                logging.warning("语义模型预热失败（不影响面板与服务启动）：%s", warm_error[0])
+
+            stage("加载概念层")
             try:
                 from core.concept_store import reload_from_db, stats as concept_stats
                 reload_from_db()
                 logging.info("概念层已加载：%s", concept_stats())
             except Exception:
                 logging.exception("概念层初始化失败，本次运行将不启用概念检索")
+
             if not memories:
+                stage("注入冷启动记忆")
                 cold_start_batch_injection()
                 save_all_data()
                 save_state()
             self.initialized = True
-            logging.info("运行环境初始化完成，记忆数=%d", len(memories))
+            stage("就绪", done=True)
+            logging.info("运行环境初始化完成，记忆数=%d，总耗时 %.1fs",
+                         len(memories), time.time() - t_start)
 
     def start_qq(self):
         self.initialize()

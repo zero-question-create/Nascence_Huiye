@@ -27,6 +27,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .badge{padding:5px 12px;border-radius:12px;font-size:12px;background:#183a31;color:var(--ok);border:1px solid #286653}
   .badge.off{background:#3a1e1e;color:var(--err);border-color:#653232}
   .badge.wait{background:#3a3320;color:var(--warn);border-color:#655a32}
+  #shutdownBtn{margin-left:auto;background:#3a1e1e;color:#ffb3b3;border:1px solid #653232;
+               border-radius:8px;padding:8px 16px;cursor:pointer;font-weight:700}
+  #shutdownBtn:hover{background:#4d2626}
+  #shutdownBtn:disabled{opacity:.5;cursor:not-allowed}
   nav{display:flex;gap:6px;padding:12px 24px 0;flex-wrap:wrap}
   nav button{background:var(--panel);color:var(--muted);border:1px solid var(--border);
              padding:9px 18px;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px}
@@ -67,6 +71,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <h1>Nascence · {{BOT_NAME}}</h1>
   <span id="qqBadge" class="badge off">QQ 服务：未运行</span>
   <span id="stateBadge" class="badge wait">加载中</span>
+  <button id="shutdownBtn" title="停止 QQ 服务、保存全部数据并退出面板">关闭面板</button>
 </header>
 
 <nav>
@@ -233,6 +238,7 @@ document.querySelectorAll('nav button').forEach(btn=>{
 
 // 总览与配置刷新
 let sysState = '';
+let shuttingDown = false;
 async function refreshStats(){
   try{
     const d = await getJSON('/api/stats');
@@ -253,10 +259,19 @@ async function refreshStats(){
       $('c-rhythm').textContent = cap;
       const b = $('stateBadge');
       sysState = d.state === 'asleep' ? '睡眠中' : '清醒';
-      b.textContent = d.core_ready ? sysState : (sysState + '（核心加载中）');
+      // 核心初始化期间显示具体阶段与已用时长，而不是笼统的"加载中"
+      if(d.core_ready){
+        b.textContent = sysState;
+      }else if(d.init_stage && d.init_stage !== '未开始'){
+        const el = d.init_elapsed ? `（${d.init_elapsed}s）` : '';
+        b.textContent = '核心加载：' + d.init_stage + el;
+      }else{
+        b.textContent = '核心加载中';
+      }
       b.className = 'badge' + (d.state === 'asleep' ? ' wait' : '');
     } else if(d.biorhythm_error){
-      $('stateBadge').textContent = '生物钟未就绪';
+      $('stateBadge').textContent = d.init_stage && d.init_stage !== '未开始'
+        ? ('核心加载：' + d.init_stage) : '生物钟未就绪';
       $('stateBadge').className = 'badge wait';
     }
     const qb = $('qqBadge');
@@ -310,6 +325,7 @@ function addFeed(sender, content, source){
 }
 
 function connectWS(){
+  if(shuttingDown) return;   // 面板关闭中，不再重连
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   // 连接（含重连）时清空日志窗：服务端会补发本次会话日志尾部，避免重复堆叠
@@ -320,14 +336,38 @@ function connectWS(){
     else if(m.type === 'status') toast(m.text);
     else if(m.type === 'error') toast('错误：' + m.text);
     else if(m.type === 'message') addFeed(m.sender, m.content, m.source);
+    else if(m.type === 'stage'){
+      const b = $('stateBadge');
+      if(m.done){ b.textContent = sysState || '就绪'; b.className = 'badge'; toast('核心已就绪'); }
+      else { b.textContent = '核心加载：' + m.text; b.className = 'badge wait'; }
+    }    else if(m.type === 'shutdown'){
+      shuttingDown = true;
+      toast('面板正在关闭…');
+      document.body.style.opacity = '0.6';
+    }
   };
-  ws.onclose = () => setTimeout(connectWS, 3000);   // 断线自动重连
+  ws.onclose = () => { if(!shuttingDown) setTimeout(connectWS, 3000); };   // 断线自动重连（关闭中除外）
 }
 
 // 按钮绑定
 $('btnSave').onclick = async () => {
   try{ await post('/api/save'); toast('已强制保存全部数据'); }
   catch(e){ toast('保存失败：'+e.message); }
+};
+$('shutdownBtn').onclick = async () => {
+  if(!confirm('确定要关闭面板吗？\n将停止 QQ 服务、保存全部数据并退出。')) return;
+  const btn = $('shutdownBtn');
+  btn.disabled = true; btn.textContent = '正在关闭…';
+  shuttingDown = true;
+  try{
+    await post('/api/shutdown');
+    toast('正在停止服务并保存数据，页面稍后失效即可关闭');
+    setTimeout(()=>{ document.body.style.opacity = '0.5'; }, 500);
+  }catch(e){
+    shuttingDown = false;
+    btn.disabled = false; btn.textContent = '关闭面板';
+    toast('关闭请求失败：'+e.message);
+  }
 };
 $('btnQQStart').onclick = async () => {
   toast('QQ 服务启动中（首次需初始化，请稍候）');

@@ -30,7 +30,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 os.chdir(PROJECT_DIR)
 
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSMsgType, WSCloseCode
 
 import panel_runtime as panel
 from config.constants import BOT_NAME
@@ -58,6 +58,8 @@ class EventHub:
         # 订阅 EventBus：核心侧无需知道 Web 面板存在
         BUS.log.connect(lambda cat, line: self._publish({"type": "log", "cat": cat, "line": line}))
         BUS.status.connect(lambda text: self._publish({"type": "status", "text": text}))
+        BUS.stage.connect(lambda text, done: self._publish(
+            {"type": "stage", "text": text, "done": bool(done)}))
         BUS.message.connect(lambda s, c, src: self._publish(
             {"type": "message", "sender": s, "content": c, "source": src}))
         BUS.task_error.connect(lambda text: self._publish({"type": "error", "text": text}))
@@ -109,6 +111,44 @@ class EventHub:
         with self._lock:
             self._subscribers.discard(ws)
 
+    def notify(self, payload: dict):
+        """向全部浏览器直推一条事件（关停通知等，不经 EventBus）。"""
+        with self._lock:
+            subs = list(self._subscribers)
+            loop = self._loop
+        if loop is None:
+            return
+        for ws in subs:
+            try:
+                asyncio.run_coroutine_threadsafe(_safe_send(ws, payload), loop)
+            except Exception:
+                pass
+
+    def close_all(self):
+        """关停时主动断开所有浏览器连接。
+
+        不做这一步，aiohttp 的 runner.cleanup() 会等 WebSocket 长连接
+        自然超时（两个 60s 超时叠加 = 实测 120 秒），而浏览器每 3 秒还在
+        自动重连，于是"关闭面板"看起来像死机。这里由面板主动发关闭帧。
+        """
+        with self._lock:
+            subs, self._subscribers = list(self._subscribers), set()
+            loop = self._loop
+        if loop is None:
+            return
+        for ws in subs:
+            try:
+                asyncio.run_coroutine_threadsafe(_close_ws(ws), loop)
+            except Exception:
+                pass
+
+
+async def _close_ws(ws):
+    try:
+        await ws.close(code=WSCloseCode.GOING_AWAY, message=b"panel shutting down")
+    except Exception:
+        pass
+
 
 async def _safe_send(ws, payload: dict):
     try:
@@ -152,8 +192,14 @@ async def handle_index(request):
                         content_type="text/html", charset="utf-8")
 
 
-async def handle_stats(request):
-    """总览数据：记忆/链接/词网、运行时长、虚拟时间、精力与作息。"""
+def _collect_stats() -> dict:
+    """在工作线程里收集统计信息。
+
+    这里的导入（core.memory_engine / core.biorhythm / qq_bot）绝不能放在
+    事件循环线程上执行：首次导入是秒级操作，且会与核心初始化线程争抢
+    模块导入锁——这正是"启动卡在加载核心"的成因。统一丢进线程池后，
+    事件循环始终可以及时响应 HTTP/WebSocket。
+    """
     data = {}
     try:
         from core.memory_engine import provide_for_monitor
@@ -196,11 +242,21 @@ async def handle_stats(request):
         data["biorhythm_error"] = str(e)
     data["qq_running"] = bool(panel.RUNTIME.qq_thread and panel.RUNTIME.qq_thread.is_alive())
     data["core_ready"] = panel.RUNTIME.initialized
+    data["init_stage"] = panel.RUNTIME.init_stage
+    data["init_elapsed"] = round(panel.RUNTIME.init_elapsed(), 1)
+    data["shutting_down"] = panel.RUNTIME.shutdown_requested
     try:
         import qq_bot
         data["napcat_connected"] = qq_bot._napcat_websocket is not None
     except Exception:
         data["napcat_connected"] = False
+    return data
+
+
+async def handle_stats(request):
+    """总览数据（重型导入都在线程池执行，不阻塞事件循环）。"""
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, _collect_stats)
     return web.json_response(data)
 
 
@@ -318,6 +374,20 @@ async def handle_maintenance(request):
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
 
 
+async def handle_shutdown(request):
+    """面板"关闭"按钮：优雅停止全部服务并退出。
+
+    只负责置位停止信号；真正的关停顺序（先断 WebSocket → 停服务 →
+    落盘 → 清理 HTTP）在主循环里统一执行，避免重入。
+    """
+    if request.app["stop_event"].is_set():
+        return web.json_response({"ok": True, "detail": "已在关闭中"})
+    panel.RUNTIME.request_shutdown()
+    request.app["stop_event"].set()
+    logging.info("收到面板关闭请求，正在停止全部服务…")
+    return web.json_response({"ok": True})
+
+
 async def _replay_log_tail(ws, max_lines: int = 200):
     """连接建立时补发本次会话日志的尾部，避免刷新页面后日志页空白。
 
@@ -363,6 +433,7 @@ def _build_app():
     app.router.add_post("/api/qq/start", handle_qq_start)
     app.router.add_post("/api/qq/stop", handle_qq_stop)
     app.router.add_post("/api/save", handle_save)
+    app.router.add_post("/api/shutdown", handle_shutdown)
     app.router.add_post("/api/maintenance", handle_maintenance)
     app.router.add_get("/ws", handle_ws)
     return app
@@ -382,6 +453,8 @@ def run(host="127.0.0.1", port=8080, open_browser=False):
 
     app = _build_app()
     stop_event = threading.Event()
+    # 让 /api/shutdown 处理器能触达同一个停止信号
+    app["stop_event"] = stop_event
 
     def _on_signal(*_):
         stop_event.set()
@@ -413,7 +486,10 @@ def run(host="127.0.0.1", port=8080, open_browser=False):
 
     async def _main():
         _install_graceful_exception_handler(asyncio.get_running_loop())
-        runner = web.AppRunner(app)
+        # shutdown_timeout 默认 60s：aiohttp 会为尚未关闭的长连接等满超时，
+        # 多条叠加后正是实测的 120 秒"关不掉"。真正断开由下面主动 close_all 完成，
+        # 这里把兜底超时压到 3 秒，确保任何残余连接都不会再拖住退出。
+        runner = web.AppRunner(app, shutdown_timeout=3)
         await runner.setup()
         site = web.TCPSite(runner, host, port)
         await site.start()
@@ -433,6 +509,19 @@ def run(host="127.0.0.1", port=8080, open_browser=False):
             await asyncio.sleep(0.3)
 
         logging.info("收到退出信号，正在停止服务并保存数据…")
+        # 关停顺序很重要：
+        #   1) 通知浏览器停止重连（否则它会每 3 秒重连、把清理拖住）
+        #   2) 停止监听新连接
+        #   3) 主动断开既有 WebSocket
+        #   4) 停服务并落盘（可能较慢，放线程池）
+        #   5) HTTP runner 清理（此时已无长连接，秒级完成）
+        HUB.notify({"type": "shutdown"})
+        try:
+            await site.stop()
+        except Exception:
+            pass
+        HUB.close_all()
+        await asyncio.sleep(0.2)   # 让关闭帧发出
         await asyncio.get_running_loop().run_in_executor(None, panel.RUNTIME.shutdown)
         await runner.cleanup()
         logging.info("Web 控制面板已退出")

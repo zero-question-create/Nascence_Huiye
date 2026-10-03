@@ -529,9 +529,15 @@ class Biorhythm:
                 self._by_rhythm = bool(data.get("by_rhythm", False))
                 # 时区迁移：v0.7.3 之前的直方图按 UTC 小时索引累积，需整体
                 # 平移 offset 小时到本地。用存档标记避免重复平移。
+                # 迁移后**立刻落盘**（见下方 pending_migration_save）：此前标记
+                # 只在 save_all_data 时写入，若进程在首次保存前退出（例如面板
+                # 初始化后直接关闭），下次启动会再次平移已迁移过的数据，
+                # 直方图坐标系被反复错位。
+                pending_migration_save = False
                 if not data.get("rhythm_tz_migrated", False):
                     self._migrate_rhythm_timezone()
                     self._rhythm_tz_migrated = True
+                    pending_migration_save = True
                 saved_at = float(data.get("last_tick", time.time()))
                 # 离线时长按真实流逝补算（重启后生物钟继续走）；
                 # 补算期间跳过睡眠维护，避免启动时执行重量级全量清理。
@@ -543,6 +549,13 @@ class Biorhythm:
                     self.tick(time.time())
                 finally:
                     self._replaying = False
+                # 迁移标记此时才真正可靠：last_tick 已恢复到"现在"，
+                # 落盘的状态是完整可用的存档，而非加载中途的半成品。
+                if pending_migration_save:
+                    try:
+                        self.save()
+                    except Exception as e:
+                        append_log(f"[生物钟] 迁移标记落盘失败（重启可能重复迁移）: {e}")
                 hours = self.rhythm_hours()
                 append_log(f"[生物钟] 已加载：{self.state}，精力={self.energy:.2f}，"
                            f"作息数据={self.rhythm_nights}晚"

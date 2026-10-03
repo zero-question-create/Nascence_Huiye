@@ -54,6 +54,7 @@ class _Signal:
 class EventBus:
     log = _Signal("log")                 # (分类, 文本)
     status = _Signal("status")           # (状态文本)
+    stage = _Signal("stage")             # (阶段文本, 是否完成) 初始化/关停进度
     chat_reply = _Signal("chat_reply")   # (发送者, 内容)
     task_error = _Signal("task_error")   # (错误文本)
     message = _Signal("message")         # (发送者, 内容, 来源)
