@@ -43,13 +43,15 @@ class VirtualClock:
     def enable_qq_mode(self):
         self.qq_mode = True
         self.speed = 1.0
+        # 两个分支都要重锚基准，使 to_real_time(now()) == time.time()。
+        # 首次分支此前只设 offset、不改 _session_virtual_base，而载入时
+        # base = total_virtual - total_runtime*speed，于是 to_real_time(now())
+        # 会比墙钟超前约"累计虚拟时间"（实测约 27.9 小时），
+        # 使相对时间短语与作息学习整体偏移。现与 else 分支统一处理。
         if not self._qq_real_offset:
             self._qq_real_offset = time.time()
-            self.save_state()
-            self._compensate_downtime()
-        else:
-            self._session_virtual_base = time.time() - self._qq_real_offset - self.get_real_runtime()
-            self.save_state()
+        self._session_virtual_base = time.time() - self._qq_real_offset - self.get_real_runtime()
+        self.save_state()
 
     def to_real_time(self, virtual_timestamp: float) -> float:
         """将虚拟时间戳转换为真实Unix时间戳（仅QQ模式有效）"""
@@ -148,15 +150,10 @@ class VirtualClock:
                     except (ValueError, IndexError):
                         pass
         return None
-    
-    def _compensate_downtime(self):
-        """QQ模式下，补偿停机期间的真实时间流逝"""
-        if self.qq_mode and self._last_save_real_time is not None:
-            elapsed_real = time.time() - self._last_save_real_time
-            if elapsed_real > 0:
-                self._session_virtual_base += elapsed_real
-                # 同时也更新 last_input_time，避免因停机导致立即进入睡眠
-                self.last_input_time = self.now()
+
+    # _compensate_downtime 已移除：它把停机时长加到 _session_virtual_base 来"补流逝"，
+    # 但启用 QQ 模式时的重锚（_session_virtual_base = 墙钟 - offset - 运行时长）
+    # 已经把当前时刻对齐到墙钟，两者叠加会重复补偿。重锚是更简单且可验证的做法。
 
     # === 以下实验状态机已移除（F15）===
     #

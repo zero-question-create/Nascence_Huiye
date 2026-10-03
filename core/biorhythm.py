@@ -78,6 +78,29 @@ RHYTHM_WAKE_HOLD = 0.5
 MAX_RHYTHM_SLEEP = 14 * 3600
 
 
+def local_hour(ts: float = None) -> int:
+    """把真实 Unix 时间戳换算成**本地时区**的小时（0-23）。
+
+    不能用 `int((ts % 86400) / 3600)`——那算的是 **UTC** 小时，
+    在 UTC+8 下整体错位 8 小时：她学到的"23 点睡"实际会被记到 15 点，
+    作息直方图与"常睡时段"显示随之全错，入睡判定也作用在错误时段。
+    改用 time.localtime，跟随系统时区，不写死城市名。
+    """
+    if ts is None:
+        ts = time.time()
+    return time.localtime(ts).tm_hour
+
+
+def local_utc_offset_hours(ts: float = None) -> int:
+    """本地时区相对 UTC 的整点偏移（如 UTC+8 返回 8）。
+
+    用于把旧格式（UTC 索引）的作息直方图一次性重映射到本地小时。
+    """
+    if ts is None:
+        ts = time.time()
+    return int(-(time.altzone if time.localtime(ts).tm_isdst else time.timezone) / 3600)
+
+
 def _load_params():
     """从全局 config 读取可调参数（缺键时回落到本模块默认值）。"""
     global T_WAKE, T_SLEEP, ONSET_THRESHOLD, WAKE_THRESHOLD
@@ -113,6 +136,8 @@ class Biorhythm:
         self.rhythm_nights = 0          # 已积累的睡眠次数（用于置信度渐变）
         self.rhythm_total = 0.0         # 直方图累计总量（用于归一化，抗取整误差）
         self._last_rhythm_sample = None # 上次作息采样时刻（睡眠期间按间隔采样）
+        self._sleep_samples = 0         # 本次睡眠已累计的采样数（醒来时判断是否算一晚）
+        self._rhythm_tz_migrated = True  # 直方图是否已按本地时区迁移（新实例默认为真）
         self._by_rhythm = False         # 本次睡眠是否由作息助攻而入（决定醒来规则）
         self._late_sleep_guard = False  # 作息入睡但节律已弱时，交回自然醒判定
         self.last_guard_wake = False    # 上一次醒来是否由安全阀触发（供观测）
@@ -160,7 +185,7 @@ class Biorhythm:
             return 0.0
         if ts is None:
             ts = time.time()
-        hour = int((ts % 86400) / 3600) % 24
+        hour = local_hour(ts)          # 本地时区取小时（不可用 UTC 取模）
         peak = max(self.rhythm_hist)
         if peak <= 0:
             return 0.0
@@ -247,14 +272,34 @@ class Biorhythm:
         if self._last_rhythm_sample is not None and (now - self._last_rhythm_sample) < RHYTHM_SAMPLE_INTERVAL:
             return
         self._last_rhythm_sample = now
-        hour = int((now % 86400) / 3600) % 24
+        hour = local_hour(now)        # 本地时区取小时（不可用 UTC 取模）
         self.rhythm_hist[hour] += 1.0
         self.rhythm_total += 1.0
+        self._sleep_samples += 1      # 供醒来时判断这一觉是否算"一晚"
 
     def _decay_rhythm(self):
         """入睡前衰减直方图，使作息能跟随生活变化（老数据逐渐淡出）。"""
         self.rhythm_hist = [v * RHYTHM_DECAY for v in self.rhythm_hist]
         self.rhythm_total *= RHYTHM_DECAY
+
+    def _migrate_rhythm_timezone(self):
+        """把旧格式（UTC 小时索引）的直方图整体平移到本地小时。
+
+        v0.7.3 之前用 `ts % 86400` 取小时，得到的是 UTC 小时。修复后改用
+        time.localtime，新数据按本地小时入桶。若不平移旧数据，
+        同一个直方图里会混着两个 8 小时错位的坐标系，作息判定失效。
+        """
+        offset = local_utc_offset_hours() % 24
+        if offset == 0:
+            return
+        old = list(self.rhythm_hist)
+        if not any(old):
+            return
+        self.rhythm_hist = [0.0] * 24
+        for i, v in enumerate(old):
+            self.rhythm_hist[(i + offset) % 24] += v
+        append_log(f"[生物钟] 作息直方图已按本地时区平移 {offset} 小时"
+                   f"（旧数据为 UTC 索引）")
 
     def note_activity(self, now: float = None):
         """记录一次外部活动（群消息）。用于"安静多久了"的判定。
@@ -289,14 +334,30 @@ class Biorhythm:
         self._by_rhythm = bool(by_rhythm)
         self._late_sleep_guard = False
         self._last_rhythm_sample = None   # 新的一觉，采样从入睡后开始
-        # 衰减旧作息后开始累积本次，使作息能跟随生活变化
-        if not self._replaying:
-            self._decay_rhythm()
-            self.rhythm_nights += 1
+        self._sleep_samples = 0           # 本次睡眠累计到的采样数（醒来时据此判断是否算"一晚"）
         # 注意：这里不做睡眠维护。tick 运行在事件循环线程里，
         # 而睡眠维护要十几秒（全量落盘 + faiss 重建），同步执行会卡住
         # 收消息与生物钟自身，导致被 @ 唤醒失效。维护由 qq_bot.enter_sleep
         # 提交到线程池异步执行。
+
+    def _commit_sleep_to_rhythm(self):
+        """本次睡眠结束后，把它记入作息（衰减旧数据 + 计一晚）。
+
+        为什么放到**醒来时**而不是入睡时：
+        此前在 _sleep 里就衰减并 rhythm_nights+1，于是"刚睡下就被叫醒"
+        （甚至测试里的 force_sleep + 立即 wake）也会算作一晚，
+        导致直方图被反复衰减到 0 而 nights 虚高——实测出现过
+        rhythm_hist 全 0 但 rhythm_nights=55 的状态，作息彻底失效。
+
+        只有真正睡出过采样点的一觉才算数。
+        """
+        if self._replaying:
+            return
+        if self._sleep_samples <= 0:
+            # 没睡够一个采样间隔：不算一晚，也不衰减已有作息
+            return
+        self._decay_rhythm()
+        self.rhythm_nights += 1
 
     def _wake_internal(self, now: float = None):
         if now is None:
@@ -313,6 +374,8 @@ class Biorhythm:
         self._by_rhythm = False
         self._late_sleep_guard = False
         self._last_rhythm_sample = None
+        # 睡够了才计入作息（见 _commit_sleep_to_rhythm 的说明）
+        self._commit_sleep_to_rhythm()
 
     def wake(self, reason: str = "user"):
         """外部强制唤醒（如被 @）。被叫醒时压力仍高，之后会更快再次犯困。"""
@@ -331,6 +394,8 @@ class Biorhythm:
             self._by_rhythm = False
             self._late_sleep_guard = False
             self._last_rhythm_sample = None
+            # 被叫醒也算这一觉结束：睡够了就计入作息（没睡够则忽略）
+            self._commit_sleep_to_rhythm()
             append_log(f"[生物钟] 被唤醒（{reason}，仅睡 {dur/3600:.2f}h，压力仍 {self.s:.2f}）")
             try:
                 self.save()
@@ -432,6 +497,7 @@ class Biorhythm:
                 "rhythm_nights": self.rhythm_nights,
                 "rhythm_total": self.rhythm_total,
                 "by_rhythm": self._by_rhythm,
+                "rhythm_tz_migrated": self._rhythm_tz_migrated,
             }
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -461,6 +527,11 @@ class Biorhythm:
                 self.rhythm_nights = int(data.get("rhythm_nights", 0))
                 self.rhythm_total = float(data.get("rhythm_total", sum(self.rhythm_hist)))
                 self._by_rhythm = bool(data.get("by_rhythm", False))
+                # 时区迁移：v0.7.3 之前的直方图按 UTC 小时索引累积，需整体
+                # 平移 offset 小时到本地。用存档标记避免重复平移。
+                if not data.get("rhythm_tz_migrated", False):
+                    self._migrate_rhythm_timezone()
+                    self._rhythm_tz_migrated = True
                 saved_at = float(data.get("last_tick", time.time()))
                 # 离线时长按真实流逝补算（重启后生物钟继续走）；
                 # 补算期间跳过睡眠维护，避免启动时执行重量级全量清理。
