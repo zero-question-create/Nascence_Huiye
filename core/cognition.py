@@ -492,24 +492,8 @@ def reset_dialogue():
 import asyncio
 from typing import Tuple, List
 
-async def process_dialogue(augmented_input: str, extra_context: str = "") -> Tuple[str, List[str]]:
-    full_input = augmented_input
-    if extra_context:
-        full_input = f"{extra_context}\n{augmented_input}"
-
-    # 解析当前说话人（从增强输入中提取）
-    current_speaker = None
-    match = re.match(r"^\[(.+?) 对 .+? 说\]：", augmented_input)
-    if match:
-        current_speaker = match.group(1)
-
-    loop = asyncio.get_event_loop()
-    reply, user_input, new_mem_ids = await loop.run_in_executor(
-        None, generate_response, full_input, current_speaker
-    )
-    # 本轮新建记忆的 ID 由 generate_response 按轮次返回，
-    # 不再使用全局累加器——那会在长跑中无限增长且无法区分轮次（F29）。
-    return reply, new_mem_ids
+# process_dialogue 已移除：它唯一的调用方是控制面板的"对话测试"页，
+# 该页已随 F10 删除。CLI（main.py）直接调用 generate_response。
 
 
 def request_graceful_stop():

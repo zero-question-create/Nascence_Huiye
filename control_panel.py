@@ -72,7 +72,6 @@ LOG_CAT_RUNTIME = "runtime"
 LOG_CAT_THINKING = "thinking"
 LOG_CAT_QQBOT = "qqbot"
 LOG_CAT_OLLAMA = "ollama"
-LOG_CAT_WORLD = "world_gen"
 
 # 日志页显示上限：只保留最近 N 个文本块，避免长时间运行后控件占用持续膨胀。
 # 注意这是"显示"上限，磁盘日志仍由 RotatingFileHandler 独立轮转。
@@ -113,16 +112,15 @@ class SignalLogHandler(logging.Handler):
     @staticmethod
     def _categorize(record):
         name = record.name
-        if name in ("Nascence.Processing", "SelfTraining"):
+        # 自训练与世界生成已删除，对应的日志来源不再存在
+        if name == "Nascence.Processing":
             return LOG_CAT_THINKING
-        if name == "WorldGen":
-            return LOG_CAT_WORLD
         msg = record.getMessage() if hasattr(record, "getMessage") else str(record.msg)
         if "[Ollama]" in msg or msg.startswith("[Ollama]"):
             return LOG_CAT_OLLAMA
         if "[主动发言]" in msg:
             return LOG_CAT_THINKING
-        qq_keywords = ("[对话测试]", "QQ 服务", "QQ Bot", "QQBot", "NapCat", "WebSocket")
+        qq_keywords = ("QQ 服务", "QQ Bot", "QQBot", "NapCat", "WebSocket")
         if any(k in msg for k in qq_keywords):
             return LOG_CAT_QQBOT
         return LOG_CAT_RUNTIME
@@ -355,35 +353,6 @@ class Runtime:
             # 关停已走优雅路径（等认知循环收尾 + 落盘），给足时间但不再无限等待
             self.qq_thread.join(timeout=30)
 
-    def chat(self, sender, text, group_id, mentioned):
-        self.initialize()
-        from core.cognition import process_dialogue
-        from core.llm_interface import add_to_history
-        from utils.persistence import append_dialogue, save_all_data, save_state
-        from core.biorhythm import BIORHYTHM
-        import qq_bot
-
-        if mentioned and BIORHYTHM.is_asleep():
-            BIORHYTHM.wake("panel@")
-            qq_bot.wake_up()
-
-        augmented = (
-            f'{sender}对{BOT_NAME}说：“{text}”'
-            if mentioned
-            else f'{sender}说：“{text}”'
-        )
-        logging.info("[对话测试] 群=%s 发送者=%s @%s=%s 输入=%s", group_id, sender, BOT_NAME, mentioned, augmented)
-        reply, _ = asyncio.run(process_dialogue(augmented_input=augmented))
-        reply = str(reply or "静默")
-        if mentioned and reply.strip() in ("", "静默", "静默。", "[SILENT]"):
-            reply = "嗯......"
-        add_to_history(sender, text, reply, "测试")
-        append_dialogue(augmented, reply)
-        save_all_data()
-        save_state()
-        logging.info("[对话测试] %s回复=%s", BOT_NAME, reply)
-        return sender, reply
-
     def set_speed(self, speed):
         self.initialize()
         from core.virtual_clock import clock
@@ -459,11 +428,6 @@ class Runtime:
         logging.info("控制面板正在停止全部服务")
         self.stop_qq()
         try:
-            from self_training import TRAINER
-            TRAINER.stop()
-        except Exception:
-            pass
-        try:
             # 关停是最后一次落盘机会，绕过节流确保写入
             self.save(force=True)
         except Exception:
@@ -515,13 +479,12 @@ class ControlPanel(QMainWindow):
         super().__init__()
         self.pool = QThreadPool.globalInstance()
         self.active_workers = set()
-        self.busy_chat = False
         self.setWindowTitle(f"Nascence {BOT_NAME} · 控制面板")
         self.resize(1280, 860)
         self.setMinimumSize(1000, 700)
         self.log_views = {}
         self._shutdown_done = False
-        self._running_service = None  # "qq" | "training" | "chat" | None
+        self._running_service = None  # 目前仅 "qq" 一种可启动服务
         self._warnings = []
         self._errors = []
         self._ignore_errors = False
@@ -560,7 +523,6 @@ class ControlPanel(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._overview_page(), "总览")
         self.tabs.addTab(self._qq_page(), "QQ 服务")
-        self.tabs.addTab(self._chat_page(), "对话测试")
         self.tabs.addTab(self._logs_page(), "日志")
         self.tabs.addTab(self._config_page(), "配置")
         self.tabs.addTab(self._maintenance_page(), "维护")
@@ -635,7 +597,7 @@ class ControlPanel(QMainWindow):
         info_header.addWidget(self.ignore_warn_btn)
         info_layout.addLayout(info_header)
         self.status_display = QLabel(
-            "控制面板与终端属于同一进程。关闭启动终端或关闭本窗口，QQ 服务、对话测试任务、自训练任务和本次启动的 Ollama 都会停止。"
+            "控制面板与终端属于同一进程。关闭启动终端或关闭本窗口，QQ 服务与本次启动的 Ollama 都会停止。"
         )
         self.status_display.setWordWrap(True)
         self.status_display.setObjectName("statusDisplay")
@@ -689,39 +651,10 @@ class ControlPanel(QMainWindow):
             f"<p>图片、语音和视频由 <code>{secondary_model}</code> 处理；文本理解和回复由 <code>{primary_model}</code> 处理。</p>"
         )
 
-    def _chat_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        options = QHBoxLayout()
-        self.sender_input = QLineEdit("测试群友")
-        self.sender_input.setMaximumWidth(180)
-        self.group_input = QLineEdit(str(config.get("active_group_id") or "123456"))
-        self.group_input.setMaximumWidth(180)
-        self.mention_check = QCheckBox(f"@{BOT_NAME}")
-        self.mention_check.setChecked(True)
-        options.addWidget(QLabel("发送者"))
-        options.addWidget(self.sender_input)
-        options.addWidget(QLabel("群号"))
-        options.addWidget(self.group_input)
-        options.addWidget(self.mention_check)
-        options.addStretch()
-        layout.addLayout(options)
-
-        self.chat_view = QTextBrowser()
-        self.chat_view.setObjectName("chatView")
-        self.chat_view.setHtml("<div class='system'>对话测试已准备。此页面使用与 QQ 接近的输入格式和相同认知流程。</div>")
-        layout.addWidget(self.chat_view, 1)
-        composer = QHBoxLayout()
-        self.chat_input = QPlainTextEdit()
-        self.chat_input.setPlaceholderText("输入群聊消息，Ctrl+Enter 发送")
-        self.chat_input.setMaximumHeight(92)
-        self.send_btn = QPushButton("发送")
-        self.send_btn.setMinimumHeight(60)
-        self.send_btn.clicked.connect(self.send_chat)
-        composer.addWidget(self.chat_input, 1)
-        composer.addWidget(self.send_btn)
-        layout.addLayout(composer)
-        return page
+    # _chat_page（对话测试页）已移除：
+    # 该页面依赖 core.cognition.process_dialogue，而对话测试在 QQ 接入形态下
+    # 已无实际用途（虚拟时钟加速与离线对话功能一并放弃）。CLI（main.py）保留
+    # 作为架构参考与本机调试入口，其静默语义由 generate_response 负责。
 
     def _logs_page(self):
         page = QWidget()
@@ -738,8 +671,7 @@ class ControlPanel(QMainWindow):
         sub_tabs = QTabWidget()
         sub_tabs.setDocumentMode(True)
         labels = [("运行日志", LOG_CAT_RUNTIME), ("思考过程", LOG_CAT_THINKING),
-                  ("QQbot", LOG_CAT_QQBOT), ("Ollama", LOG_CAT_OLLAMA),
-                  ("世界生成", LOG_CAT_WORLD)]
+                  ("QQbot", LOG_CAT_QQBOT), ("Ollama", LOG_CAT_OLLAMA)]
         for label, cat in labels:
             view = QPlainTextEdit()
             view.setReadOnly(True)
@@ -842,33 +774,8 @@ class ControlPanel(QMainWindow):
         panel_layout.addWidget(inject_btn, alignment=Qt.AlignLeft)
         layout.addWidget(panel)
 
-        train_panel = QFrame(objectName="panel")
-        train_layout = QVBoxLayout(train_panel)
-        train_layout.addWidget(QLabel("自训练", objectName="sectionTitle"))
-        train_layout.addWidget(QLabel("自主循环：世界→感知→决策→语言+动作→位置更新，每轮间隔可调。", objectName="muted"))
-        self.train_status = QLabel("自训练：已停止")
-        self.train_status.setObjectName("statusBadge")
-        train_layout.addWidget(self.train_status)
-        interval_row = QHBoxLayout()
-        interval_row.addWidget(QLabel("循环间隔（秒）："))
-        self.train_interval_spin = QSpinBox()
-        self.train_interval_spin.setRange(5, 600)
-        self.train_interval_spin.setValue(30)
-        self.train_interval_spin.valueChanged.connect(self._update_train_interval)
-        interval_row.addWidget(self.train_interval_spin)
-        interval_row.addStretch()
-        train_layout.addLayout(interval_row)
-        btn_row = QHBoxLayout()
-        self.train_start_btn = QPushButton("启动自训练")
-        self.train_start_btn.clicked.connect(self.start_training)
-        self.train_stop_btn = QPushButton("停止自训练", objectName="secondaryButton")
-        self.train_stop_btn.clicked.connect(self.stop_training)
-        self.train_stop_btn.setEnabled(False)
-        btn_row.addWidget(self.train_start_btn)
-        btn_row.addWidget(self.train_stop_btn)
-        btn_row.addStretch()
-        train_layout.addLayout(btn_row)
-        layout.addWidget(train_panel)
+        # 自训练面板已移除（F01/F14/F26）：自训练链路整体删除，
+        # 项目定位为 QQ 接入的长期对话基座，不再提供离线自主训练循环。
 
         layout.addStretch()
         return page
@@ -949,37 +856,6 @@ class ControlPanel(QMainWindow):
 
     def _on_message(self, sender, content, source):
         self._append_bubble(sender, content, source)
-
-    def send_chat(self):
-        text = self.chat_input.toPlainText().strip()
-        if not text or self.busy_chat:
-            return
-        if not self._check_service_conflict("chat"):
-            return
-        self._running_service = "chat"
-        self._refresh_running_status()
-        sender = self.sender_input.text().strip() or "测试群友"
-        group_id = self.group_input.text().strip() or str(config.get("active_group_id") or "123456")
-        mentioned = self.mention_check.isChecked()
-        self._append_bubble(sender, text, source="测试")
-        self.chat_input.clear()
-        self.busy_chat = True
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("思考中")
-        worker = Worker(RUNTIME.chat, sender, text, group_id, mentioned)
-        self.active_workers.add(worker)
-        worker.signals.result.connect(lambda result: self._append_bubble(BOT_NAME, result[1], source="测试"))
-        worker.signals.error.connect(self.show_error)
-        worker.signals.finished.connect(self._chat_finished)
-        worker.signals.finished.connect(lambda: self.active_workers.discard(worker))
-        self.pool.start(worker)
-
-    def _chat_finished(self):
-        self.busy_chat = False
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("发送")
-        self._running_service = None
-        self._refresh_running_status()
 
     def _append_bubble(self, name, text, source=""):
         if name == BOT_NAME:
@@ -1112,10 +988,8 @@ class ControlPanel(QMainWindow):
             qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
         except Exception:
             pass
-        # 刷新控制面板显示（QQ 页标签、接入说明、对话测试默认群号）
+        # 刷新控制面板显示（QQ 页标签、接入说明、主动发言目标群号）
         self._refresh_napcat_note()
-        if hasattr(self, "group_input"):
-            self.group_input.setText(str(config.get("active_group_id") or "123456"))
         if hasattr(self, "bot_qq_input"):
             self.bot_qq_input.setText(str(config.get("bot_qq") or "123456"))
         if hasattr(self, "active_group_input"):
@@ -1125,40 +999,8 @@ class ControlPanel(QMainWindow):
         QMessageBox.information(self, "已保存", "NapCat 设置已保存，运行中的 QQ 服务将自动使用新值。")
         logging.info("NapCat 配置已保存并热刷新")
 
-    def start_training(self):
-        if not self._check_service_conflict("training"):
-            return
-        from self_training import TRAINER
-        TRAINER.set_interval(self.train_interval_spin.value())
-        try:
-            TRAINER.start()
-        except Exception as e:
-            self._add_error(str(e))
-            return
-        self._running_service = "training"
-        self._refresh_running_status()
-        self._update_train_ui(True)
-
-    def stop_training(self):
-        from self_training import TRAINER
-        try:
-            TRAINER.stop()
-        except Exception as e:
-            self._add_error(str(e))
-            return
-        self._running_service = None
-        self._refresh_running_status()
-        self._update_train_ui(False)
-
-    def _update_train_ui(self, running):
-        self.train_status.setText("自训练：运行中" if running else "自训练：已停止")
-        self.train_start_btn.setEnabled(not running)
-        self.train_stop_btn.setEnabled(running)
-        self.train_interval_spin.setEnabled(not running)
-
-    def _update_train_interval(self, seconds):
-        from self_training import TRAINER
-        TRAINER.set_interval(seconds)
+    # start_training / stop_training / _update_train_ui / _update_train_interval
+    # 已随自训练链路一并移除（F01/F14/F26）。
 
     def _add_warning(self, msg):
         self._warnings.append(msg)
@@ -1176,10 +1018,10 @@ class ControlPanel(QMainWindow):
     def _refresh_running_status(self):
         lines = []
         if self._running_service:
-            names = {"qq": "正在运行QQ服务", "training": "正在运行自训练", "chat": "正在运行对话测试"}
+            names = {"qq": "正在运行QQ服务"}
             lines.append(names.get(self._running_service, "正在运行服务"))
         else:
-            lines.append("控制面板与终端属于同一进程。关闭启动终端或关闭本窗口，QQ 服务、对话测试任务、自训练任务和本次启动的 Ollama 都会停止。")
+            lines.append("控制面板与终端属于同一进程。关闭启动终端或关闭本窗口，QQ 服务与本次启动的 Ollama 都会停止。")
         if self._ignore_errors:
             lines.append("[当前已隐藏报错信息]")
         if self._ignore_warnings:
@@ -1222,18 +1064,16 @@ class ControlPanel(QMainWindow):
             logging.info("已清空 %s 日志", cat)
 
     def _check_service_conflict(self, service_name):
+        """服务互斥检查。
+
+        自训练与对话测试已移除，现在只剩 QQ 服务一种可启动的服务，
+        因此这里只需判断"已有服务在跑且不是同一种"即可。
+        """
         if self._running_service and self._running_service != service_name:
-            conflict_map = {
-                ("qq", "training"): "正在使用QQ服务，无法启动自训练，请手动停止正在使用的服务",
-                ("training", "qq"): "正在使用自训练服务，无法启动QQ服务，请手动停止正在使用的服务",
-                ("qq", "chat"): "正在使用QQ服务，无法启动对话测试，请手动停止正在使用的服务",
-                ("training", "chat"): "正在使用自训练服务，无法启动对话测试，请手动停止正在使用的服务",
-                ("chat", "qq"): "正在使用对话测试，无法启动QQ服务，请手动停止正在使用的服务",
-                ("chat", "training"): "正在使用对话测试，无法启动自训练，请手动停止正在使用的服务",
-            }
-            key = (self._running_service, service_name)
-            if key in conflict_map:
-                self._add_warning(conflict_map[key])
+            self._add_warning(
+                f"正在运行{self._running_service}服务，无法启动{service_name}，"
+                f"请先停止正在使用的服务"
+            )
             return False
         return True
 

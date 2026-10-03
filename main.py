@@ -76,7 +76,6 @@ def main():
     
     try:
         while True:
-            clock.update_state()
             user_input = input("你: ").strip()
             if not user_input:
                 continue
@@ -92,7 +91,6 @@ def main():
             elif user_input.lower() == "move":
                 from utils.persistence import migrate_json_to_sqlite
                 migrate_json_to_sqlite()
-            clock.on_user_input()
             reply, user_input, _new_mem_ids = generate_response(user_input)
             append_dialogue(user_input, reply)
             print(f"{BOT_NAME}: {reply}")

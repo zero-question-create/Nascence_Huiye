@@ -126,7 +126,7 @@ _action_counter = 0
 _pending_actions = {}                 # echo -> Future，用于匹配 NapCat Action 响应
 
 # ========== 睡眠配置 ==========
-# 睡眠窗口统一由 core.virtual_clock 管理（clock.in_sleep_window()）
+# 睡眠由 core.biorhythm 的睡眠压力动力学 + 学得的作息决定（不硬编码钟点）
 _sleeping = False               # 是否处于强制睡眠状态
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

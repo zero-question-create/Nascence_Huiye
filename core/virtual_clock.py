@@ -37,11 +37,8 @@ class VirtualClock:
             self.last_input_time = self.now()
 
         self.session_start = time.time()
-        self.drift_threshold = 15 * 60
-        self.sleep_start_hour = 23
-        self.sleep_duration = 8 * 3600      # 8小时高质睡眠
-        self._drift_thread = None
-        self._stop_drift = threading.Event()
+        # 实验状态机相关字段（drift_threshold / sleep_start_hour / sleep_duration /
+        # _drift_thread / _stop_drift）已随 F15 一并移除，见下方说明。
 
     def enable_qq_mode(self):
         self.qq_mode = True
@@ -89,24 +86,9 @@ class VirtualClock:
         # 累计时间 = 历史已结算时间 + 本段未结算时间
         return self.total_runtime + (time.time() - self.session_start)
 
-    @property
-    def sleep_end_hour(self) -> int:
-        """睡眠结束小时（由开始小时与持续时长推导）"""
-        return (self.sleep_start_hour + int(self.sleep_duration // 3600)) % 24
-
-    def in_sleep_window(self, when: datetime.datetime = None) -> bool:
-        """
-        判断给定真实时刻（默认当前）是否处于睡眠窗口。
-        窗口由 sleep_start_hour 与 sleep_duration 定义。
-        """
-        if when is None:
-            when = datetime.datetime.now()
-        now_time = when.time()
-        start = datetime.time(self.sleep_start_hour, 0)
-        end = datetime.time(self.sleep_end_hour, 0)
-        if start < end:
-            return start <= now_time < end
-        return now_time >= start or now_time < end
+    # sleep_end_hour / in_sleep_window 已随 F15 移除：
+    # 固定睡眠窗口与"不硬编码睡觉时刻"的项目原则冲突，睡眠现由
+    # core/biorhythm.py 的睡眠压力动力学 + 学得的作息决定。
 
     def save_state(self):
         self.total_runtime = self.get_real_runtime()
@@ -176,76 +158,21 @@ class VirtualClock:
                 # 同时也更新 last_input_time，避免因停机导致立即进入睡眠
                 self.last_input_time = self.now()
 
-    # === 状态机控制方法 ===
-    def update_state(self):
-        """每个认知周期调用，根据虚拟时间和空闲时长决定状态转换。每天只睡眠一次。"""
-        virt_now = self.now()
-        day_seconds = virt_now % 86400
-        current_hour = day_seconds / 3600.0
-        current_day = int(virt_now // 86400)
-
-        # 进入新的一天时，重置睡眠标记
-        if current_day != self._last_sleep_day:
-            self._sleep_done_today = False
-
-        # 判断当前是否处于睡眠时间窗口
-        sleep_end_hour = self.sleep_end_hour
-        if self.sleep_start_hour < sleep_end_hour:
-            in_sleep_window = self.sleep_start_hour <= current_hour < sleep_end_hour
-        else:
-            # 跨午夜窗口
-            in_sleep_window = current_hour >= self.sleep_start_hour or current_hour < sleep_end_hour
-
-        # 如果处于睡眠窗口且今天还没睡过，立刻进入睡眠
-        if in_sleep_window and not self._sleep_done_today:
-            self._enter_sleep()
-            self._sleep_done_today = True
-            self._last_sleep_day = current_day
-            return
-
-        # 不在睡眠窗口：如果当前状态是 sleeping，则唤醒
-        if self.state == "sleeping":
-            self._wake_up()
-            return
-
-        # 正常交互/发散逻辑
-        if self.state == "interactive":
-            if virt_now - self.last_input_time > self.drift_threshold:
-                self._enter_drifting()
-        # drifting 状态会一直保持，直到用户输入时通过 on_user_input 切换回 interactive
-
-    def on_user_input(self):
-        """收到用户输入时调用，重置空闲计时并切回交互状态"""
-        self.last_input_time = self.now()
-        if self.state != "interactive":
-            self._enter_interactive()
-
-    def _enter_interactive(self):
-        self.state = "interactive"
-        self._stop_drift.set()   # 停止发散线程
-
-    def _enter_drifting(self):
-        self.state = "drifting"
-        self._stop_drift.clear()
-        # 启动发散线程（如果尚未启动）
-        if self._drift_thread is None or not self._drift_thread.is_alive():
-            self._drift_thread = threading.Thread(target=self._drifting_loop, daemon=True)
-            self._drift_thread.start()
-
-    def _enter_sleep(self):
-        self.state = "sleeping"
-        self._stop_drift.set()
-        self._sleep_done_today = True
-        self._last_sleep_day = int(self.now() // 86400)
-        # 持久化当前状态（包括睡眠标记）
-        self.save_state()
-        # 执行全量睡眠巩固
-        from utils.persistence import sleep_cleanup
-        sleep_cleanup()
-
-    def _wake_up(self):
-        self.state = "interactive"
-        self.last_input_time = self.now()
+    # === 以下实验状态机已移除（F15）===
+    #
+    # 曾有一套基于"虚拟钟点"的行为状态机：update_state / in_sleep_window /
+    # _enter_interactive / _enter_drifting / _enter_sleep / _wake_up /
+    # on_user_input，配合 sleep_start_hour 与 sleep_duration 的固定睡眠窗。
+    #
+    # 它已被删除，原因有三：
+    #   1. 与项目原则冲突——"不硬编码睡觉时刻"，睡眠改由 core/biorhythm.py
+    #      的睡眠压力动力学 + 学得的作息决定；
+    #   2. 它是死代码且会崩溃——_enter_drifting 引用的 _drifting_loop 从未实现，
+    #      CLI 空闲超过阈值即抛 AttributeError；
+    #   3. 虚拟时钟加速功能已放弃（本地大模型部署不现实，实际必联网走 QQ）。
+    #
+    # 保留本类的 now() / to_real_time() / enable_qq_mode()：它们是记忆时间戳
+    # 的换算基准，删除会导致既有记忆库无法解读。
 
 # 全局虚拟时钟实例，默认 1 倍速
 clock = VirtualClock(speed=1)
