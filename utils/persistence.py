@@ -102,6 +102,17 @@ def _db_memory_count() -> int:
         return 0
 
 
+def _newest_db_last_accessed() -> float:
+    """数据库中最新的 last_accessed 时间戳（走索引，微秒级）。
+
+    用于判断"JSON 缓存是否落后于数据库"，替代此前"热集条数 < 全库条数"
+    的恒真判据——后者会导致每次启动都做一次昂贵的热记忆全量恢复。
+    """
+    from core.memory_engine import _get_db
+    row = _get_db().execute("SELECT MAX(last_accessed) FROM memories").fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
 def _restore_hot_memories_from_db(limit: int = None) -> int:
     """从 SQLite 恢复热记忆到内存（调用方需持有 _io_lock）。
 
@@ -129,17 +140,34 @@ def _restore_hot_memories_from_db(limit: int = None) -> int:
 
 
 def _restore_links_from_db():
-    """从 SQLite 恢复链接与字词网络到内存（调用方需持有 _io_lock）。"""
-    from core.memory_engine import _get_db
+    """从 SQLite 恢复链接与字词网络到内存（调用方需持有 _io_lock）。
+
+    只取最近访问的 MAX_HOT_LINKS 条：热链接本就有硬上限，先把全表读进内存
+    再逐条淘汰，在存量库（曾见 96 万条链接）会变成分钟级卡顿；冷链接本就由
+    _load_links_for_memory 在记忆访达时按需装入，这里截断不损失可达性。
+    """
+    from core.memory_engine import _get_db, MAX_HOT_LINKS
     db = _get_db()
+    # 按 last_accessed 排序取 TOP-N：本表默认没有该列索引，大表上必须现建，
+    # 否则排序要扫全表（96 万行 ≈ 分钟级）。索引仅在真正走恢复路径时才建，
+    # 常规启动（JSON 可用）不会付出这份一次性的建索引成本。
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_links_last_accessed ON links(last_accessed)")
+        db.commit()
+    except Exception:
+        pass
     links.clear()
-    for src, tgt, weight, ltype, last_accessed, creation_time in db.execute(
-        "SELECT src, tgt, weight, type, last_accessed, creation_time FROM links"
-    ).fetchall():
+    rows = db.execute(
+        "SELECT src, tgt, weight, type, last_accessed, creation_time FROM links "
+        "ORDER BY last_accessed DESC LIMIT ?",
+        (MAX_HOT_LINKS,)
+    ).fetchall()
+    for src, tgt, weight, ltype, last_accessed, creation_time in rows:
         links[(src, tgt)] = {
             "weight": weight, "type": ltype,
             "last_accessed": last_accessed, "creation_time": creation_time,
         }
+    print(f"[持久化] 链接恢复完成：{len(links)} 条（上限 {MAX_HOT_LINKS}）")
     from core.memory_engine import _load_wordweb_from_db
     _load_wordweb_from_db()
 
@@ -149,14 +177,22 @@ def load_all_data():
 
     **SQLite 是权威数据源**，JSON 仅是"热记忆的可重建缓存"：
       - JSON 不存在（例如已执行过 migrate_json_to_sqlite，它会主动删除 JSON）
-        时，不再直接返回，而是从 SQLite 恢复。
-      - JSON 存在时先加载它（快），再由 SQLite 补齐缺失部分（JSON 可能落后）。
+        时，从 SQLite 恢复。
+      - JSON 存在时先加载它（快），随后按需从 SQLite 补齐。
+
+    注意：热集上限（MAX_HOT_SIZE）天然小于全库总量，因此"热记忆 < 全库"
+    是常态而非异常，不能据此判定 JSON 落后而每次全量重取——存量库上这一步
+    是分钟级的（实测服务端开机 636s 的主要来源）。JSON 未覆盖的记忆与链接
+    由 _load_memory_from_db / _load_links_for_memory 在访达时按需装入，
+    可达性不受影响。
     """
     global memories, links
+    t_total = time.time()
     with _io_lock:
         from core.memory_engine import hot_ids
 
         # 1) 先尝试 JSON 缓存（快路径）
+        t_json = time.time()
         if os.path.exists(MEMORY_FILE):
             try:
                 with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
@@ -173,22 +209,48 @@ def load_all_data():
                 for key_str, val in data.get("wordweb", {}).items():
                     a, b = key_str.split("||")
                     wordweb[(a, b)] = val
+                print(f"[持久化] JSON 缓存加载完成：记忆 {len(memories)}，链接 {len(links)}，"
+                      f"字词 {len(wordweb)}（{time.time() - t_json:.1f}s）")
             except Exception as e:
                 print(f"[持久化] JSON 缓存损坏，将从 SQLite 恢复：{e}")
                 memories.clear()
                 hot_ids.clear()
 
-        # 2) 以 SQLite 为准补齐：JSON 缺失、损坏、或落后于数据库时都会走到这里
+        # 2) 判断是否需要从 SQLite 补载热记忆。
+        #
+        # 旧判据是 "len(memories) < db_total"，但热集上限（MAX_HOT_SIZE）天然
+        # 小于全库总量，该条件恒为真 —— 于是每次启动都做一次全表扫描 + 排序
+        # 的昂贵恢复（服务端 5 万级库实测数百秒），绝大多数时候纯属浪费。
+        #
+        # 现改为：JSON 不可用时才恢复；JSON 可用时，仅当数据库里存在比 JSON
+        # 更新的记忆（上次未及保存就退出）才补载。判据用 last_accessed 最大值
+        # （有索引，微秒级）与 JSON 中的最大值比较。
         db_total = _db_memory_count()
-        if len(memories) < db_total:
+        need_restore = not memories
+        if not need_restore:
+            try:
+                db_newest = _newest_db_last_accessed()
+                json_newest = max(
+                    (float(m.get("last_accessed", 0.0) or 0.0) for m in memories.values()),
+                    default=0.0,
+                )
+                if db_newest > json_newest + 1.0:
+                    need_restore = True
+                    print(f"[持久化] 数据库有比 JSON 更新的记忆"
+                          f"（新 {db_newest - json_newest:.0f}s），补载热记忆")
+            except Exception:
+                need_restore = False
+        if need_restore:
             if not memories:
                 print(f"[持久化] 从 SQLite 恢复记忆（JSON 缺失或损坏），共 {db_total} 条")
             _restore_hot_memories_from_db()
-            if not links:
-                _restore_links_from_db()
+        if not links:
+            _restore_links_from_db()
 
+        t_word = time.time()
         from core.memory_engine import _build_word_to_memories
         _build_word_to_memories()
+        print(f"[持久化] 词网重建耗时：{time.time() - t_word:.1f}s")
 
         # faiss：快照仅在"与数据库成员一致"时采信，否则全量重建
         from core.memory_engine import (
@@ -242,7 +304,7 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
     且映射条数与数据库条数一致。任一不满足就丢弃快照走全量重建——
     否则会静默接受陈旧索引，导致遗漏的记忆无法被向量检索命中。
     """
-    from core.memory_engine import _get_db, EMBED_DIM
+    from core.memory_engine import EMBED_DIM
     if not isinstance(mapping, list):
         return False
     if len(mapping) != index.ntotal:
@@ -251,11 +313,21 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
         return False
     if getattr(index, "d", EMBED_DIM) != EMBED_DIM:
         return False
+    # 逐条 EXISTS 校验：只为确认映射里的 ID 仍存在于库中。
+    # 此前一次性拉全表 ID 建 Python 集合，在 5 万条规模的库存上要数百毫秒到
+    # 数秒；这里只查映射自身（通常几千条）并提前短路。
     try:
-        db_ids = {r[0] for r in _get_db().execute("SELECT id FROM memories").fetchall()}
+        from core.memory_engine import _get_db
+        db = _get_db()
+        missing = 0
+        for mem_id in mapping:
+            if db.execute("SELECT 1 FROM memories WHERE id = ? LIMIT 1", (mem_id,)).fetchone() is None:
+                missing += 1
+                if missing > 0:
+                    return False
+        return True
     except Exception:
         return False
-    return set(mapping).issubset(db_ids)
 
 # ========== 对话状态持久化 ==========
 

@@ -245,6 +245,11 @@ def _get_db():
         # idx_links_tgt 供"邻居查询"（src=? OR tgt=?）使用，保留。
         _db_conn.execute("DROP INDEX IF EXISTS idx_links_src")
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
+        # 热记忆恢复按 last_accessed 倒序取 TOP-N：无索引时是全表扫描 + 临时
+        # B 树排序，存量库上实测单次就要十秒级（服务端库更大时可达数分钟）。
+        _db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)"
+        )
     return _db_conn
 
 def _row_to_memory(row) -> dict | None:
@@ -398,19 +403,25 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
         if not to_evict:
             return
         db = _get_db()
+        params = []
         for (src, tgt) in to_evict:
             d = links[(src, tgt)]
-            db.execute(
-                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (src, tgt, d["weight"], d["type"],
-                 d.get("last_accessed", d.get("creation_time", 0)),
-                 d.get("creation_time", 0))
-            )
+            params.append((
+                src, tgt, d["weight"], d["type"],
+                d.get("last_accessed", d.get("creation_time", 0)),
+                d.get("creation_time", 0),
+            ))
             del links[(src, tgt)]
             # 已直接写入 SQLite，无需再算作待同步的脏数据
             _dirty_links.discard((src, tgt))
             _deleted_links.discard((src, tgt))
+        # 批量写入：存量库首次下沉可能有数十万条，逐条 execute 的 Python 侧
+        # 开销会累积成分钟级停顿（实测一次下沉 89 万条 ≈ 90s+）。
+        db.executemany(
+            """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            params,
+        )
         db.commit()
 
 def periodic_cold_eviction(max_mem=MAX_HOT_SIZE, max_link=MAX_HOT_LINKS) -> dict:

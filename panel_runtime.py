@@ -322,16 +322,22 @@ class Runtime:
             if self.initialized:
                 return
             t_start = time.time()
-            last = [t_start]
+            state = {"name": None, "t": t_start}
 
             def stage(text: str, done: bool = False):
                 now = time.time()
+                # 先结算上一阶段：耗时归它自己，不能记到即将进入的阶段名下。
+                # 此前的写法让 "加载概念层（+612.8s）" 看起来像概念层花了 10 分钟，
+                # 实际那是"预热模型与加载记忆"的耗时。
+                if state["name"]:
+                    logging.info("初始化阶段完成：%s，耗时 %.1fs",
+                                 state["name"], now - state["t"])
                 if done:
-                    logging.info("初始化阶段：%s（本阶段 %.1fs，累计 %.1fs）",
-                                 text, now - last[0], now - t_start)
+                    state["name"] = None
                 else:
-                    logging.info("初始化阶段：%s（+%.1fs）", text, now - last[0])
-                last[0] = now
+                    state["name"] = text
+                    state["t"] = now
+                    logging.info("初始化阶段开始：%s（累计 %.1fs）", text, now - t_start)
                 self._set_stage(text, done)
 
             logging.info("开始初始化 Nascence 运行环境")

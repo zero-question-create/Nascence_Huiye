@@ -243,7 +243,11 @@ document.querySelectorAll('nav button').forEach(btn=>{
 // 总览与配置刷新
 let sysState = '';
 let shuttingDown = false;
+let statsInFlight = false;
 async function refreshStats(){
+  // 0.5s 一轮且请求未返回时不叠加：避免慢响应把线程池堆满（表现为界面越来越卡）
+  if(statsInFlight) return;
+  statsInFlight = true;
   try{
     const d = await getJSON('/api/stats');
     $('c-mem').textContent = d.memory ?? '--';
@@ -284,6 +288,7 @@ async function refreshStats(){
     $('q-status').textContent = d.qq_running ? '运行中' : '未运行';
     $('q-napcat').textContent = d.napcat_connected ? '已连接' : (d.qq_running ? '等待 NapCat 连入…' : '未连接');
   }catch(e){ /* 面板不因统计失败而中断 */ }
+  finally{ statsInFlight = false; }
 }
 async function loadConfig(){
   try{
@@ -474,7 +479,7 @@ $('btnInject').onclick = async () => {
 connectWS();
 refreshStats();
 loadConfig();
-setInterval(refreshStats, 5000);
+setInterval(refreshStats, 500);
 </script>
 </body>
 </html>
