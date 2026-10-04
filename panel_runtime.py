@@ -603,6 +603,41 @@ def reload_biorhythm_params():
         logging.exception("生物钟参数热加载失败")
 
 
+def apply_config_hot_reload(cfg: dict):
+    """保存配置后的热刷新（应在工作线程执行，含重型模块导入）。
+
+    覆盖运行期依赖：
+      - config.api_config 全局字典（所有动态读取方）
+      - QQ 侧模块级缓存（BOT_QQ / 群号 / Token）
+      - API 客户端与模型名（llm_interface.reload_clients）
+      - Ollama 地址与嵌入模型（memory_engine 模块级常量）
+      - 生物钟动力学参数
+    """
+    from config.api_config import reload_config
+    reload_config()
+    try:
+        import qq_bot
+        qq_bot.BOT_QQ = qq_bot.get_bot_qq()
+        qq_bot.ACTIVE_GROUP_ID = qq_bot.get_active_group_id()
+        qq_bot.HTTP_ACCESS_TOKEN = qq_bot.get_napcat_token()
+        qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
+    except Exception:
+        pass
+    try:
+        from core.llm_interface import reload_clients
+        reload_clients()
+    except Exception:
+        logging.exception("API 客户端热重载失败（保存的配置仍会在下次启动生效）")
+    try:
+        from core import memory_engine as me
+        me.OLLAMA_BASE_URL = cfg.get("ollama_base_url", me.OLLAMA_BASE_URL)
+        me.OLLAMA_EMBED_MODEL = cfg.get("ollama_embed_model", me.OLLAMA_EMBED_MODEL)
+    except Exception:
+        pass
+    reload_biorhythm_params()
+    logging.info("配置已保存并热刷新（API 客户端已重建）")
+
+
 def format_error(details):
     """从 traceback 文本里提取最后一行作为简短错误信息。"""
     if not details:

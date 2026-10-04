@@ -30,6 +30,27 @@ MODEL = config["primary_model"]
 MODEL_ = config["secondary_model"]
 
 
+def reload_clients():
+    """按当前全局 config 就地重建 API 客户端与模型名（配置热更新）。
+
+    开放给面板在保存配置后调用，使新的 base_url / api_key / model 立即生效，
+    无需重启进程。正在飞行中的请求不受影响，后续调用使用新客户端；
+    模块级名字在函数内是调用时解析的，因此重绑定后各处引用自动生效。
+    """
+    global client, client_, MODEL, MODEL_
+    client = OpenAI(
+        api_key=config.get("primary_api_key"),
+        base_url=config.get("primary_base_url"),
+    )
+    client_ = OpenAI(
+        api_key=config.get("secondary_api_key"),
+        base_url=config.get("secondary_base_url"),
+    )
+    MODEL = config.get("primary_model")
+    MODEL_ = config.get("secondary_model")
+    append_log(f"[API] 配置已热重载：主模型={MODEL}，副模型={MODEL_}")
+
+
 def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ", quote=None):
     """写入对话历史，返回最后写入条目的序号（无写入时返回 None）。
 

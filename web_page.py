@@ -57,6 +57,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   #logs{background:#101722;border:1px solid var(--border);border-radius:8px;padding:10px;
         height:55vh;overflow:auto;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap}
   #logs .t{color:#6a7d96}#logs .w{color:var(--warn)}#logs .e{color:var(--err)}
+  #feed{max-height:38vh;overflow:auto}
   .msg{border-left:3px solid var(--accent);padding:6px 10px;margin:6px 0;background:#101722;border-radius:0 6px 6px 0}
   .msg .who{color:var(--muted);font-size:11px}
   .hint{color:var(--muted);font-size:12px;margin-top:6px}
@@ -94,10 +95,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div class="card"><div class="k">精力</div><div class="v" id="c-energy">--</div><div class="c" id="c-rhythm"></div></div>
     </div>
     <div class="panel" style="margin-top:14px">
+      <h3>运行控制</h3>
       <div class="row">
+        <button class="act" id="ovQQStart">启动 QQ 服务</button>
+        <button class="act sec" id="ovQQStop">停止 QQ 服务</button>
         <button class="act sec" id="btnSave">立即保存全部数据</button>
-        <span class="hint">绕过节流强制落盘；平时保存由系统自动节流执行。</span>
       </div>
+      <div class="hint">QQ 服务在后台线程独立运行；关闭浏览器不会停止服务与认知循环。</div>
     </div>
     <div class="panel">
       <h3>最近的群消息</h3>
@@ -164,7 +168,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div><label>Secondary API Key（留空表示不修改）</label><input id="f-skey" type="password" placeholder="已配置则留空"></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSaveCfg">保存 API 配置</button></div>
-      <div class="hint">已初始化的 API 客户端在保存后会热刷新；如需彻底重载可重启面板。</div>
+      <div class="hint">保存后立即生效：API 客户端会热重建，无需重启面板或服务。</div>
     </div>
     <div class="panel">
       <h3>生物钟参数（动力学速率，非钟点）</h3>
@@ -300,17 +304,36 @@ async function loadConfig(){
   }catch(e){}
 }
 
-// 日志与消息推送
+// 日志：环形缓冲。
+// 每条日志进入环形缓冲后，按当前筛选重建视图；切换类型不会再丢之前的日志，
+// 也不会因为反复切换而无限增长（上限 MAX_LOG_LINES 条，只滚不丢）。
 const logs = $('logs');
-function addLog(cat, line){
+const LOG_CATS = ['runtime', 'thinking', 'qqbot', 'ollama'];
+const logRing = [];               // 环形缓冲：{cat, line, cls}[]
+function pushLog(cat, line){
+  const cls = /ERROR|失败|异常/.test(line) ? 'e' : (/WARNING|警告/.test(line) ? 'w' : '');
+  logRing.push({cat, line, cls});
+  if(logRing.length > MAX_LOG_LINES) logRing.shift();
+  // 仅在当前筛选可见时追加，避免无关类型触发重绘
   const filter = $('logCat').value;
   if(filter !== 'all' && filter !== cat) return;
-  const div = document.createElement('div');
-  const cls = /ERROR|失败|异常/.test(line) ? 'e' : (/WARNING|警告/.test(line) ? 'w' : '');
-  div.className = cls;
-  div.textContent = line;
-  logs.appendChild(div);
+  appendLogNode(logRing[logRing.length - 1]);
   while(logs.childNodes.length > MAX_LOG_LINES) logs.removeChild(logs.firstChild);
+  logs.scrollTop = logs.scrollHeight;
+}
+function appendLogNode(entry){
+  const div = document.createElement('div');
+  div.className = entry.cls || '';
+  div.textContent = entry.line;
+  logs.appendChild(div);
+}
+function rebuildLogView(){
+  const filter = $('logCat').value;
+  logs.innerHTML = '';
+  for(const entry of logRing){
+    if(filter !== 'all' && filter !== entry.cat) continue;
+    appendLogNode(entry);
+  }
   logs.scrollTop = logs.scrollHeight;
 }
 function addFeed(sender, content, source){
@@ -321,18 +344,20 @@ function addFeed(sender, content, source){
   const safe = String(content).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   div.innerHTML = `<div class="who">${sender} · ${source||''}</div><div>${safe}</div>`;
   feed.prepend(div);
-  while(feed.childNodes.length > 50) feed.removeChild(feed.lastChild);
+  // 条数上限：超出后丢弃最旧的一条，容器另有 CSS 限高，双击查看需滚动
+  while(feed.childNodes.length > 30) feed.removeChild(feed.lastChild);
 }
 
 function connectWS(){
   if(shuttingDown) return;   // 面板关闭中，不再重连
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
-  // 连接（含重连）时清空日志窗：服务端会补发本次会话日志尾部，避免重复堆叠
-  ws.onopen = () => { logs.innerHTML = ''; };
+  // 连接（含重连）时清空日志窗与环形缓冲：服务端会补发本次会话日志尾部，
+  // 避免重复堆叠（重连时缓冲里的内容会被补发内容覆盖）
+  ws.onopen = () => { logs.innerHTML = ''; logRing.length = 0; };
   ws.onmessage = (ev) => {
     let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
-    if(m.type === 'log') addLog(m.cat, m.line);
+    if(m.type === 'log') pushLog(m.cat, m.line);
     else if(m.type === 'status') toast(m.text);
     else if(m.type === 'error') toast('错误：' + m.text);
     else if(m.type === 'message') addFeed(m.sender, m.content, m.source);
@@ -379,8 +404,18 @@ $('btnQQStop').onclick = async () => {
   try{ await post('/api/qq/stop'); toast('QQ 服务已停止'); refreshStats(); }
   catch(e){ toast('停止失败：'+e.message); }
 };
-$('btnClearLog').onclick = () => { logs.innerHTML = ''; };
-$('logCat').onchange = () => { logs.innerHTML = ''; };
+$('ovQQStart').onclick = async () => {
+  toast('QQ 服务启动中（首次需初始化，请稍候）');
+  try{ await post('/api/qq/start'); toast('QQ 服务已启动'); refreshStats(); }
+  catch(e){ toast('启动失败：'+e.message); }
+};
+$('ovQQStop').onclick = async () => {
+  toast('正在停止 QQ 服务…');
+  try{ await post('/api/qq/stop'); toast('QQ 服务已停止'); refreshStats(); }
+  catch(e){ toast('停止失败：'+e.message); }
+};
+$('btnClearLog').onclick = () => { logs.innerHTML = ''; logRing.length = 0; };
+$('logCat').onchange = () => { rebuildLogView(); };
 $('btnSaveCfg').onclick = async () => {
   try{
     await post('/api/config', {

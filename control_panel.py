@@ -69,6 +69,7 @@ from panel_runtime import (
     RUNTIME,
     SESSION_LOG,
     acquire_panel_lock,
+    apply_config_hot_reload,
     configure_logging,
     load_panel_config,
     release_panel_lock,
@@ -595,8 +596,13 @@ class ControlPanel(QMainWindow):
             "secondary_api_key": self.lucis_key.text().strip(),
         })
         save_panel_config(cfg)
-        QMessageBox.information(self, "配置已保存", "配置已写入文件。已初始化的 API 客户端需重启控制面板后生效。")
-        logging.info("API 配置已保存，重启后生效")
+        # 热刷新：API 客户端就地重建，新的 base_url / key / model 立即生效
+        self.run_worker(
+            apply_config_hot_reload, cfg,
+            on_result=lambda _: QMessageBox.information(
+                self, "配置已保存", "配置已保存并热刷新，新的 API 设置立即生效。"),
+        )
+        logging.info("API 配置已保存并热刷新")
 
     def save_napcat_config(self):
         cfg = load_panel_config()
@@ -606,18 +612,11 @@ class ControlPanel(QMainWindow):
             "napcat_token": self.napcat_token_input.text().strip() or "Nascence",
         })
         save_panel_config(cfg)
-        # 热刷新：重读磁盘配置到全局 config，运行中的 QQ 服务立即感知新值（无需重启面板）
-        from config.api_config import reload_config
-        reload_config()
-        try:
-            import qq_bot
-            qq_bot.BOT_QQ = qq_bot.get_bot_qq()
-            qq_bot.ACTIVE_GROUP_ID = qq_bot.get_active_group_id()
-            qq_bot.HTTP_ACCESS_TOKEN = qq_bot.get_napcat_token()
-            qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
-        except Exception:
-            pass
-        # 刷新控制面板显示（QQ 页标签、接入说明、主动发言目标群号）
+        # 热刷新放工作线程：其中 qq_bot 属重型导入，直接在 GUI 线程跑会短暂假死
+        self.run_worker(apply_config_hot_reload, cfg, on_result=lambda _: self._on_napcat_saved())
+
+    def _on_napcat_saved(self):
+        """热刷新完成后刷新 QQ 页标签与接入说明（GUI 线程）。"""
         self._refresh_napcat_note()
         if hasattr(self, "bot_qq_input"):
             self.bot_qq_input.setText(str(config.get("bot_qq") or "123456"))

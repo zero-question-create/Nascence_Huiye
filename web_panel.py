@@ -307,19 +307,10 @@ async def handle_config_post(request):
                 pass
 
     panel.save_panel_config(cfg)
-    from config.api_config import reload_config
-    reload_config()
-    # 热刷新：QQ 侧动态读取 + 生物钟参数热加载，运行中的服务立即感知新值
-    try:
-        import qq_bot
-        qq_bot.BOT_QQ = qq_bot.get_bot_qq()
-        qq_bot.ACTIVE_GROUP_ID = qq_bot.get_active_group_id()
-        qq_bot.HTTP_ACCESS_TOKEN = qq_bot.get_napcat_token()
-        qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
-    except Exception:
-        pass
-    panel.reload_biorhythm_params()
-    logging.info("配置已保存并热刷新")
+    # 热刷新里包含 qq_bot / memory_engine 等重型导入，必须放线程池：
+    # 事件循环线程执行秒级导入会把整个面板卡住（与 /api/stats 同一教训）。
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, panel.apply_config_hot_reload, cfg)
     return web.json_response({"ok": True})
 
 
