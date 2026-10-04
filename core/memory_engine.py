@@ -245,11 +245,15 @@ def _get_db():
         # idx_links_tgt 供"邻居查询"（src=? OR tgt=?）使用，保留。
         _db_conn.execute("DROP INDEX IF EXISTS idx_links_src")
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
-        # 热记忆恢复按 last_accessed 倒序取 TOP-N：无索引时是全表扫描 + 临时
-        # B 树排序，存量库上实测单次就要十秒级（服务端库更大时可达数分钟）。
-        _db_conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed)"
-        )
+        # 清理历史遗留的无用索引（曾为"按 last_accessed 排序"而建）。
+        # 现在热记忆恢复与落后判定全部走 rowid（隐式主键 B 树，O(1)），
+        # 这些索引不再被任何查询使用，保留只会拖慢 create_memory 的写入。
+        # DROP 不扫描全表，索引不存在时是微秒级 schema 查询。
+        _db_conn.execute("DROP INDEX IF EXISTS idx_memories_last_accessed")
+        _db_conn.execute("DROP INDEX IF EXISTS idx_links_last_accessed")
+        # 注意：启动路径上**不要**再执行 CREATE INDEX。
+        # 首次建索引要全表扫描数据表（记忆表含向量，服务端实测约 490s 静默），
+        # 在慢盘 VPS 上会把启动拖成分钟级。rowid 方案不需要任何新索引。
     return _db_conn
 
 def _row_to_memory(row) -> dict | None:

@@ -103,21 +103,35 @@ def _db_memory_count() -> int:
 
 
 def _newest_db_last_accessed() -> float:
-    """数据库中最新的 last_accessed 时间戳（走索引，微秒级）。
+    """数据库中最新的 last_accessed 时间戳。
 
-    用于判断"JSON 缓存是否落后于数据库"，替代此前"热集条数 < 全库条数"
-    的恒真判据——后者会导致每次启动都做一次昂贵的热记忆全量恢复。
+    走 MAX(rowid) 主键 B 树定位最新一行再取值（O(1)），而不是
+    `SELECT MAX(last_accessed)`：后者在没有该列索引时是全表扫描
+    （存量库上数百毫秒到数秒），而我们已决定不在启动路径建任何新索引。
+    记忆按插入顺序累积，rowid 最大 ≈ 最后写入，语义等价。
     """
     from core.memory_engine import _get_db
-    row = _get_db().execute("SELECT MAX(last_accessed) FROM memories").fetchone()
+    row = _get_db().execute(
+        "SELECT last_accessed FROM memories ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
     return float(row[0]) if row and row[0] is not None else 0.0
+
+
+def _newest_db_rowid() -> int:
+    """数据库中最新的 rowid（O(1)）。0 表示空库。"""
+    from core.memory_engine import _get_db
+    row = _get_db().execute("SELECT MAX(rowid) FROM memories").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def _restore_hot_memories_from_db(limit: int = None) -> int:
     """从 SQLite 恢复热记忆到内存（调用方需持有 _io_lock）。
 
-    取最近访问的若干条装入内存，其余保持冷态（按需加载）。
-    返回装入内存的条数。
+    取最近写入的若干条装入内存，其余保持冷态（按需加载）。
+    **按 rowid 倒序**取 TOP-N：rowid 是隐式主键 B 树，反向游走只读 N 行；
+    若按 last_accessed 排序，在该列无索引时是全表扫描 + 临时 B 树排序
+    （存量库上实测十几秒到分钟级，服务端 5 万级库正是启动 636s 的主因）。
+    记忆按时间顺序写入，rowid 序与写入序一致，取出的就是最新一批。
     """
     from core.memory_engine import (
         _get_db, hot_ids, MAX_HOT_SIZE, _row_to_memory,
@@ -128,7 +142,7 @@ def _restore_hot_memories_from_db(limit: int = None) -> int:
     rows = db.execute(
         "SELECT id, content, vector, half_life, last_accessed, creation_time, "
         "last_strengthen_time, concept_tag_ids FROM memories "
-        "ORDER BY last_accessed DESC LIMIT ?",
+        "ORDER BY rowid DESC LIMIT ?",
         (limit,)
     ).fetchall()
     for row in rows:
@@ -142,24 +156,20 @@ def _restore_hot_memories_from_db(limit: int = None) -> int:
 def _restore_links_from_db():
     """从 SQLite 恢复链接与字词网络到内存（调用方需持有 _io_lock）。
 
-    只取最近访问的 MAX_HOT_LINKS 条：热链接本就有硬上限，先把全表读进内存
+    只取最近写入的 MAX_HOT_LINKS 条：热链接本就有硬上限，先把全表读进内存
     再逐条淘汰，在存量库（曾见 96 万条链接）会变成分钟级卡顿；冷链接本就由
     _load_links_for_memory 在记忆访达时按需装入，这里截断不损失可达性。
+
+    按 rowid 倒序取 TOP-N（隐式主键 B 树反向游走，只读 N 行）。
+    **不要**按 last_accessed 排序，也**不要**为此建索引：在 96 万行的表上，
+    建索引或全表排序都是分钟级的启动开销。
     """
     from core.memory_engine import _get_db, MAX_HOT_LINKS
     db = _get_db()
-    # 按 last_accessed 排序取 TOP-N：本表默认没有该列索引，大表上必须现建，
-    # 否则排序要扫全表（96 万行 ≈ 分钟级）。索引仅在真正走恢复路径时才建，
-    # 常规启动（JSON 可用）不会付出这份一次性的建索引成本。
-    try:
-        db.execute("CREATE INDEX IF NOT EXISTS idx_links_last_accessed ON links(last_accessed)")
-        db.commit()
-    except Exception:
-        pass
     links.clear()
     rows = db.execute(
         "SELECT src, tgt, weight, type, last_accessed, creation_time FROM links "
-        "ORDER BY last_accessed DESC LIMIT ?",
+        "ORDER BY rowid DESC LIMIT ?",
         (MAX_HOT_LINKS,)
     ).fetchall()
     for src, tgt, weight, ltype, last_accessed, creation_time in rows:
@@ -223,8 +233,9 @@ def load_all_data():
         # 的昂贵恢复（服务端 5 万级库实测数百秒），绝大多数时候纯属浪费。
         #
         # 现改为：JSON 不可用时才恢复；JSON 可用时，仅当数据库里存在比 JSON
-        # 更新的记忆（上次未及保存就退出）才补载。判据用 last_accessed 最大值
-        # （有索引，微秒级）与 JSON 中的最大值比较。
+        # 更新的记忆（上次未及保存就退出）才补载。判据走 rowid（O(1)），
+        # 不做任何全表扫描、不依赖任何索引。
+        t_check = time.time()
         db_total = _db_memory_count()
         need_restore = not memories
         if not need_restore:
@@ -240,12 +251,20 @@ def load_all_data():
                           f"（新 {db_newest - json_newest:.0f}s），补载热记忆")
             except Exception:
                 need_restore = False
+        print(f"[持久化] 落后判定完成：{time.time() - t_check:.2f}s（不补载）"
+              if not need_restore else
+              f"[持久化] 落后判定完成：{time.time() - t_check:.2f}s（将补载）")
         if need_restore:
             if not memories:
                 print(f"[持久化] 从 SQLite 恢复记忆（JSON 缺失或损坏），共 {db_total} 条")
+            t_restore = time.time()
             _restore_hot_memories_from_db()
+            print(f"[持久化] 热记忆恢复完成：{len(memories)} 条"
+                  f"（{time.time() - t_restore:.1f}s）")
         if not links:
+            t_links = time.time()
             _restore_links_from_db()
+            print(f"[持久化] 链接恢复段耗时：{time.time() - t_links:.1f}s")
 
         t_word = time.time()
         from core.memory_engine import _build_word_to_memories
@@ -304,7 +323,7 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
     且映射条数与数据库条数一致。任一不满足就丢弃快照走全量重建——
     否则会静默接受陈旧索引，导致遗漏的记忆无法被向量检索命中。
     """
-    from core.memory_engine import EMBED_DIM
+    from core.memory_engine import _get_db, EMBED_DIM
     if not isinstance(mapping, list):
         return False
     if len(mapping) != index.ntotal:
@@ -313,21 +332,14 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
         return False
     if getattr(index, "d", EMBED_DIM) != EMBED_DIM:
         return False
-    # 逐条 EXISTS 校验：只为确认映射里的 ID 仍存在于库中。
-    # 此前一次性拉全表 ID 建 Python 集合，在 5 万条规模的库存上要数百毫秒到
-    # 数秒；这里只查映射自身（通常几千条）并提前短路。
+    # 一次扫描取全表 ID（id 是主键，走覆盖索引，5 万条实测约 0.1s）。
+    # 不要改成"逐条 EXISTS"：那是 N 次数据库往返，映射上万条时反而慢出量级
+    # （服务端 5 万条映射实测 43s），本地小库测不出差距。
     try:
-        from core.memory_engine import _get_db
-        db = _get_db()
-        missing = 0
-        for mem_id in mapping:
-            if db.execute("SELECT 1 FROM memories WHERE id = ? LIMIT 1", (mem_id,)).fetchone() is None:
-                missing += 1
-                if missing > 0:
-                    return False
-        return True
+        db_ids = {r[0] for r in _get_db().execute("SELECT id FROM memories").fetchall()}
     except Exception:
         return False
+    return set(mapping).issubset(db_ids)
 
 # ========== 对话状态持久化 ==========
 
