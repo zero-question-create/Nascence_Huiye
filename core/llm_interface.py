@@ -51,17 +51,18 @@ def reload_clients():
     append_log(f"[API] 配置已热重载：主模型={MODEL}，副模型={MODEL_}")
 
 
-def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ", quote=None):
+def add_to_history(sender_name: str, user_text: str, bot_reply: str, source="QQ", quote=None, target=None):
     """写入对话历史，返回最后写入条目的序号（无写入时返回 None）。
 
     返回 seq 是为了让调用方能在发送失败时回填"（消息发送失败）"标记（F20）。
+    target: 可选的说话/回应对象（如 "@辉夜" 时为 BOT_NAME，"@张三" 时为 "张三"）。
     quote: 可选引用信息 {"sender": 被引用者, "text": 被引用的原话}，
     只随用户消息记录，供短期上下文还原"这句话在回应什么"。
     """
     from utils.message_history import add_message
     seq = None
     if user_text:
-        seq = add_message(sender_name, user_text, source, quote=quote)
+        seq = add_message(sender_name, user_text, source, quote=quote, target=target)
     if bot_reply:
         seq = add_message(BOT_NAME, bot_reply, source)
     return seq

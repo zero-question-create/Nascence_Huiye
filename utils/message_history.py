@@ -22,12 +22,13 @@ _HISTORY_FILE = "data/test/message_history.log"
 _STATE_FILE = "data/test/message_state.json"
 
 
-def add_message(sender, content, source, quote=None):
+def add_message(sender, content, source, quote=None, target=None):
     """追加一条历史消息，返回其序号（seq）。
 
+    target: 可选的说话/回应对象（如 "辉夜"、"张三"），支持渲染出 "xx对xx说："。
     quote: 可选的引用信息 {"sender": 被引用者, "text": 被引用的原话}。
     长期记忆侧由 decompose_input 把引用解析成记忆片段；
-    这里的 quote 字段服务于短期上下文——让历史窗口能看到"这句话在回应什么"。
+    这里的 quote/target 字段服务于短期上下文——让历史窗口能看到"这句话在对谁说/回应什么"。
     """
     from core.virtual_clock import clock
     global _next_seq
@@ -40,6 +41,8 @@ def add_message(sender, content, source, quote=None):
             "seq": _next_seq,
         }
         _next_seq += 1
+        if target:
+            record["target"] = str(target)
         if quote and quote.get("text"):
             record["quote"] = {
                 "sender": quote.get("sender") or "",
@@ -97,8 +100,10 @@ def quote_suffix(msg) -> str:
 
 
 def render_message(msg) -> str:
-    """把一条历史消息渲染成可读文本（含引用）。"""
-    return f"{msg['sender']}说：{msg['content']}{quote_suffix(msg)}"
+    """把一条历史消息渲染成可读文本（含目标对象与引用）。"""
+    target = msg.get("target")
+    prefix = f"{msg['sender']}对{target}说：" if target else f"{msg['sender']}说："
+    return f"{prefix}{msg['content']}{quote_suffix(msg)}"
 
 
 def get_recent(n=10):

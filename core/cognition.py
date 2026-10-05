@@ -913,12 +913,14 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             dialogue_memories = []
             dialogue_ts = []
             for msg in selected_msgs:
-                # 引用后缀还原"这句话在回应什么"，短期上下文才连得上
+                # 引用与提及目标还原"这句话对谁说/在回应什么"，短期上下文才连得上
                 suffix = quote_suffix(msg)
+                target = msg.get("target")
                 if msg["sender"] == BOT_NAME:
-                    d_content = f"我说：{msg['content']}{suffix}"
+                    prefix = f"我对{target}说：" if target else "我说："
                 else:
-                    d_content = f"{msg['sender']}说：{msg['content']}{suffix}"
+                    prefix = f"{msg['sender']}对{target}说：" if target else f"{msg['sender']}说："
+                d_content = f"{prefix}{msg['content']}{suffix}"
                 d_msg_time = msg.get("time")
                 if d_msg_time is None:
                     d_msg_time = clock.now()

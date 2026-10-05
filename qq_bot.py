@@ -398,6 +398,17 @@ async def handle_group_message(data: dict):
     if is_mentioned_me:
         mentions = [m for m in mentions if m != bot_qq and m != "all"]
 
+    # 解析说话对象：@机器人 -> BOT_NAME；@其他人 -> 映射名称列表
+    target_name = None
+    if is_mentioned_me:
+        target_name = BOT_NAME
+    elif mentions:
+        mapped_names = []
+        for qq in mentions:
+            name = manifest.name_map.get(group_id, {}).get(qq, qq)
+            mapped_names.append(name)
+        target_name = "、".join(mapped_names)
+
     # 睡眠判定（在解析出 @ 之后）：未被 @ 则忽略；被 @ 则唤醒后继续回应
     if is_sleeping():
         if is_mentioned_me:
@@ -518,6 +529,11 @@ async def handle_group_message(data: dict):
                 except OSError:
                     logger.info(f"临时文件删除失败，请及时清理：{tmp_path}")
 
+    # 若为纯多媒体消息（无正文文字），向事件总线广播媒体摘要供面板显示
+    if not clean_text and media_list:
+        first_type, first_desc = media_list[0]
+        BUS.message.emit(sender_name, f"[{first_type}] {first_desc}", "QQ")
+
     # ---------- 构建自然语言增强输入 ----------
     if media_list:
         # 生成媒体部分的自然描述
@@ -533,10 +549,11 @@ async def handle_group_message(data: dict):
                 media_parts.append(f"一个视频，内容是“{d}”")
         media_text = "、".join(media_parts)  # 用顿号分隔多个媒体
         
+        target_clause = f"对{target_name}" if target_name else ""
         if clean_text:  # 有文字伴随
-            augmented_input = f"{sender_name}说：“{clean_text}”，同时发送了{media_text}"
+            augmented_input = f"{sender_name}{target_clause}说：“{clean_text}”，同时发送了{media_text}"
         else:           # 纯媒体
-            augmented_input = f"{sender_name}发送了{media_text}"
+            augmented_input = f"{sender_name}{target_clause}发送了{media_text}"
     else:
         # 没有媒体，沿用原有文本格式（带@和引号）
         augmented_input = build_augmented_input(
@@ -575,7 +592,7 @@ async def handle_group_message(data: dict):
             ])
         await send_group_msg(group_id, wake_reply)
         from core.llm_interface import add_to_history
-        add_to_history(sender_name, "（叫了辉夜一声）", wake_reply, "QQ")
+        add_to_history(sender_name, "（叫了辉夜一声）", wake_reply, "QQ", target=BOT_NAME)
         BUS.message.emit(BOT_NAME, wake_reply, "QQ")
         return
 
@@ -642,8 +659,24 @@ async def handle_group_message(data: dict):
         inject_message_keywords(msg_keywords)
 
     # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
-    # 引用信息以结构化字段随消息保存，短期上下文才能看出这句话在回应什么
-    add_to_history(sender_name, clean_text.strip(), None, "QQ", quote=quote_info)
+    # 引用与提及对象以结构化字段随消息保存，短期上下文才能还原"对谁说/在回应什么"
+    history_content = clean_text.strip()
+    if media_list:
+        media_desc = "、".join(
+            f"一个表情包，内容是“{d}”" if m_type == "sticker" else
+            f"一张图片，内容是“{d}”" if m_type == "image" else
+            f"一段录音，内容是“{d}”" if m_type == "record" else
+            f"一个视频，内容是“{d}”"
+            for m_type, d in media_list
+        )
+        if history_content:
+            history_content = f"{history_content}（发送了{media_desc}）"
+        else:
+            history_content = f"（发送了{media_desc}）"
+    elif not history_content:
+        history_content = "（没有说话）"
+
+    add_to_history(sender_name, history_content, None, "QQ", quote=quote_info, target=target_name)
 
     logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，jieba关键词: {msg_keywords}")
     BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
