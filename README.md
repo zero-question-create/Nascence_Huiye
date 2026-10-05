@@ -32,13 +32,13 @@ QQ 白名单 `config/qq_manifest.json` 在 QQ 服务首次启动时自动从 `co
 
 | 方式 | 命令 | 说明 |
 |---|---|---|
-| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 浏览器打开 `http://127.0.0.1:8080`，管理 QQ 服务、日志、配置与维护 |
+| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 默认端口 `8080`（可在面板配置中修改），管理 QQ 服务、日志、配置与维护 |
 | 桌面控制面板（可选） | `python control_panel.py` | PyQt5 桌面窗口，功能与 Web 面板一致 |
 | CLI 对话 | `python main.py` | 本地调试入口 |
 | QQ Bot | `python qq_bot.py` | 不经过面板直接接入 NapCat |
 | 命令行选择 | `start.bat` / `bash start.sh` | 菜单选择 CLI 或 QQ Bot，并自动启动 Ollama |
 
-Web 面板直接运行 `python web_panel.py --port 8080` 亦可；`--open` 参数会在启动后自动打开浏览器。
+Web 面板直接运行 `python web_panel.py` 亦可（从配置读取端口，亦支持 `--port` 临时指定）；`--open` 参数会在启动后自动打开浏览器。
 
 ## 项目结构
 

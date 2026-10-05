@@ -376,6 +376,16 @@ class ControlPanel(QMainWindow):
         save_napcat = QPushButton("保存 NapCat 设置")
         save_napcat.clicked.connect(self.save_napcat_config)
         layout.addWidget(save_napcat, alignment=Qt.AlignLeft)
+
+        web_panel_frame = QFrame(objectName="panel")
+        web_panel_form = QFormLayout(web_panel_frame)
+        self.panel_port_input = QLineEdit()
+        self.panel_port_input.setPlaceholderText("8080")
+        web_panel_form.addRow("Web 面板端口", self.panel_port_input)
+        layout.addWidget(web_panel_frame)
+        save_panel_port = QPushButton("保存 Web 面板端口")
+        save_panel_port.clicked.connect(self.save_panel_port_config)
+        layout.addWidget(save_panel_port, alignment=Qt.AlignLeft)
         layout.addStretch()
         return page
 
@@ -584,6 +594,22 @@ class ControlPanel(QMainWindow):
         self.bot_qq_input.setText(str(cfg.get("bot_qq") or "123456"))
         self.active_group_input.setText(str(cfg.get("active_group_id") or "123456"))
         self.napcat_token_input.setText(str(cfg.get("napcat_token") or "Nascence"))
+        if hasattr(self, "panel_port_input"):
+            self.panel_port_input.setText(str(cfg.get("panel_port") or 8080))
+
+    def save_panel_port_config(self):
+        cfg = load_panel_config()
+        try:
+            port = int(self.panel_port_input.text().strip() or 8080)
+            if not (1 <= port <= 65535):
+                raise ValueError()
+        except ValueError:
+            QMessageBox.warning(self, "错误", "请输入有效端口号 (1-65535)")
+            return
+        cfg["panel_port"] = port
+        save_panel_config(cfg)
+        QMessageBox.information(self, "已保存", f"Web 控制面板端口已保存为 {port}，下次启动 Web 面板时生效。")
+        logging.info("Web 控制面板端口已配置为 %d，下次启动生效", port)
 
     def save_config(self):
         cfg = load_panel_config()

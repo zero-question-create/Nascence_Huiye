@@ -158,6 +158,14 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <!-- 配置 -->
   <section class="page" id="page-config">
     <div class="panel">
+      <h3>控制面板设置</h3>
+      <div class="grid2">
+        <div><label>Web 控制面板端口（默认 8080，修改后下次启动生效）</label><input id="f-panel-port" type="number" min="1" max="65535" placeholder="8080"></div>
+      </div>
+      <div class="row" style="margin-top:12px"><button class="act" id="btnSavePanel">保存面板端口</button></div>
+      <div class="hint">端口号修改后写入配置文件，将在下次启动控制面板时生效。</div>
+    </div>
+    <div class="panel">
       <h3>API 配置</h3>
       <div class="grid2">
         <div><label>Primary URL</label><input id="f-pburl"></div>
@@ -306,6 +314,7 @@ async function loadConfig(){
     $('f-wake').value = c.biorhythm_wake_threshold ?? '';
     $('f-rw').value = c.biorhythm_rhythm_weight ?? 0.25;
     $('f-idle').value = c.biorhythm_idle_to_sleep ?? 300;
+    $('f-panel-port').value = c.panel_port ?? 8080;
   }catch(e){}
 }
 
@@ -433,6 +442,17 @@ $('btnSaveCfg').onclick = async () => {
     });
     $('f-pkey').value = ''; $('f-skey').value = '';
     toast('API 配置已保存');
+  }catch(e){ toast('保存失败：'+e.message); }
+};
+$('btnSavePanel').onclick = async () => {
+  const p = parseInt($('f-panel-port').value);
+  if (!p || p < 1 || p > 65535) {
+    toast('请输入有效端口号 (1-65535)');
+    return;
+  }
+  try{
+    await post('/api/config', { panel_port: p });
+    toast('面板端口已保存为 ' + p + '，下次启动生效');
   }catch(e){ toast('保存失败：'+e.message); }
 };
 $('btnSaveNapcat').onclick = async () => {

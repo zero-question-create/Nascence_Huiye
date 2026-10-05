@@ -31,8 +31,8 @@ if [ ! -x "$PROJECT_DIR/venv/bin/python" ]; then
     bash "$PROJECT_DIR/setup.sh"
 fi
 
-echo "[*] 正在启动 Web 控制面板（http://127.0.0.1:8080）..."
-"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/web_panel.py" --port 8080 --open &
+echo "[*] 正在启动 Web 控制面板..."
+"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/web_panel.py" --open &
 PANEL_PID=$!
 wait "$PANEL_PID"
 PANEL_PID=""

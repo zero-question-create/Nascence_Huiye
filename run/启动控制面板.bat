@@ -50,9 +50,9 @@ if not exist "%PROJECT_DIR%\ollama\bin\ollama.exe" (
     )
 )
 
-echo [*] Starting web panel on http://127.0.0.1:8080 ...
+echo [*] Starting web panel...
 echo [*] Press Ctrl+C to stop the panel and all services.
-"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\web_panel.py" --port 8080 --open
+"%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\web_panel.py" --open
 if %errorlevel% neq 0 (
     powershell -Command "Write-Host '[ERROR] Program exited abnormally, code: %errorlevel%' -ForegroundColor Red"
 )
