@@ -160,7 +160,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="panel">
       <h3>控制面板设置</h3>
       <div class="grid2">
-        <div><label>Web 控制面板端口（默认 8080，修改后下次启动生效）</label><input id="f-panel-port" type="number" min="1" max="65535" placeholder="8080"></div>
+        <div><label>Web 控制面板端口（默认 32123，修改后下次启动生效）</label><input id="f-panel-port" type="number" min="1" max="65535" placeholder="32123"></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSavePanel">保存面板端口</button></div>
       <div class="hint">端口号修改后写入配置文件，将在下次启动控制面板时生效。</div>
@@ -314,7 +314,7 @@ async function loadConfig(){
     $('f-wake').value = c.biorhythm_wake_threshold ?? '';
     $('f-rw').value = c.biorhythm_rhythm_weight ?? 0.25;
     $('f-idle').value = c.biorhythm_idle_to_sleep ?? 300;
-    $('f-panel-port').value = c.panel_port ?? 8080;
+    $('f-panel-port').value = c.panel_port ?? 32123;
   }catch(e){}
 }
 

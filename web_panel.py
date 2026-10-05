@@ -12,8 +12,8 @@
 #   - 关闭浏览器**不应**停止 QQ 服务与认知循环：服务在独立线程的事件循环里跑。
 #   - 不引入新的第三方依赖：只用 aiohttp（项目已有），且不依赖 PyQt5。
 #
-# 启动：python web_panel.py [--host 127.0.0.1] [--port 8080] [--open]
-# 端口可在控制面板页面中配置（默认 8080，保存后下次启动生效）。
+# 启动：python web_panel.py [--host 127.0.0.1] [--port 32123] [--open]
+# 端口可在控制面板页面中配置（默认 32123，保存后下次启动生效）。
 # ========================================================================
 
 import argparse
@@ -442,9 +442,9 @@ def run(host=None, port=None, open_browser=False):
         host = str(cfg.get("panel_host") or "127.0.0.1")
     if port is None:
         try:
-            port = int(cfg.get("panel_port") or 8080)
+            port = int(cfg.get("panel_port") or 32123)
         except (TypeError, ValueError):
-            port = 8080
+            port = 32123
 
     lock = panel.acquire_panel_lock()
     if lock is None:
@@ -546,7 +546,7 @@ def run(host=None, port=None, open_browser=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Nascence Huiye Web 控制面板")
     parser.add_argument("--host", default=None, help="监听地址（默认从配置读取或 127.0.0.1）")
-    parser.add_argument("--port", type=int, default=None, help="监听端口（默认从配置读取或 8080）")
+    parser.add_argument("--port", type=int, default=None, help="监听端口（默认从配置读取或 32123）")
     parser.add_argument("--open", action="store_true", dest="open_browser",
                         help="启动后自动打开浏览器")
     args = parser.parse_args()

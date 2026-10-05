@@ -380,7 +380,7 @@ class ControlPanel(QMainWindow):
         web_panel_frame = QFrame(objectName="panel")
         web_panel_form = QFormLayout(web_panel_frame)
         self.panel_port_input = QLineEdit()
-        self.panel_port_input.setPlaceholderText("8080")
+        self.panel_port_input.setPlaceholderText("32123")
         web_panel_form.addRow("Web 面板端口", self.panel_port_input)
         layout.addWidget(web_panel_frame)
         save_panel_port = QPushButton("保存 Web 面板端口")
@@ -595,12 +595,12 @@ class ControlPanel(QMainWindow):
         self.active_group_input.setText(str(cfg.get("active_group_id") or "123456"))
         self.napcat_token_input.setText(str(cfg.get("napcat_token") or "Nascence"))
         if hasattr(self, "panel_port_input"):
-            self.panel_port_input.setText(str(cfg.get("panel_port") or 8080))
+            self.panel_port_input.setText(str(cfg.get("panel_port") or 32123))
 
     def save_panel_port_config(self):
         cfg = load_panel_config()
         try:
-            port = int(self.panel_port_input.text().strip() or 8080)
+            port = int(self.panel_port_input.text().strip() or 32123)
             if not (1 <= port <= 65535):
                 raise ValueError()
         except ValueError:

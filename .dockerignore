@@ -1,0 +1,46 @@
+# Git & IDE
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+.zcode/
+.zcodeignore
+
+# 虚拟环境与 Python 缓存
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# 敏感与私有配置（保护隐私与密钥，绝不打入镜像）
+config/api_config.json
+config/qq_manifest.json
+config/__pycache__/
+.env*
+
+# 运行时数据与日志
+data/test/
+data/notes/
+run/logs/
+run/control_panel.lock
+*.log
+debug.log
+
+# 本地 Ollama 模型二进制
+ollama/
+
+# 桌面端专属运行库
+run/lib/
+run/qt-plugins/
+run/qt5-plugins/
+
+# 测试脚本与临时文件
+test_*.py
+*_test.py
+*.tmp

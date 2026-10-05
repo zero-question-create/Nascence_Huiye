@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "bot_qq": "123456",
     "active_group_id": "123456",
     "napcat_token": "Nascence",
-    "panel_port": 8080,                     # 控制面板 Web 端口（修改后下次启动生效）
+    "panel_port": 32123,                    # 控制面板 Web 端口（修改后下次启动生效）
     # ===== 生物钟参数（动力学速率，非钟点；不预设节律周期）=====
     "biorhythm_wake_seconds": 18.40 * 3600, # 清醒时睡眠压力上升的指数时间常数（秒）
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）

@@ -1,8 +1,8 @@
 # Nascence 辉夜 (Huiye)
 
-长期对话 AI 系统。人格从交互记忆中自然涌现，无硬编码身份锚点。
+AI人格增强底座。提供完全开源的架构基座，人格从交互记忆中自然涌现，无硬编码身份锚点。
 
-本项目以 [BigScience Open RAIL-M License](LICENSE) 发布，并受 [弥生计划伦理宣言](MISEI-ETHICS.md) 的约束。许可证管束代码的复制与分发，伦理宣言则叩问使用者的良知。
+本项目以 [MIT License](LICENSE) 发布，并倡议遵循 [弥生计划伦理宣言](MISEI-ETHICS.md)。开源协议管束代码的复制与分发，伦理宣言则叩问使用者的良知。
 
 ## 快速开始
 
@@ -32,13 +32,14 @@ QQ 白名单 `config/qq_manifest.json` 在 QQ 服务首次启动时自动从 `co
 
 | 方式 | 命令 | 说明 |
 |---|---|---|
-| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 默认端口 `8080`（可在面板配置中修改），管理 QQ 服务、日志、配置与维护 |
+| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 默认端口 `32123`（可在面板配置中修改），管理 QQ 服务、日志、配置与维护 |
+| Docker 容器部署 | `docker compose up -d` | 容器化运行 Web 控制面板与 QQ 服务，端口映射 `32123` 与 `6700` |
 | 桌面控制面板（可选） | `python control_panel.py` | PyQt5 桌面窗口，功能与 Web 面板一致 |
 | CLI 对话 | `python main.py` | 本地调试入口 |
 | QQ Bot | `python qq_bot.py` | 不经过面板直接接入 NapCat |
 | 命令行选择 | `start.bat` / `bash start.sh` | 菜单选择 CLI 或 QQ Bot，并自动启动 Ollama |
 
-Web 面板直接运行 `python web_panel.py` 亦可（从配置读取端口，亦支持 `--port` 临时指定）；`--open` 参数会在启动后自动打开浏览器。
+Web 面板直接运行 `python web_panel.py` 亦可（从配置读取端口，默认 32123，亦支持 `--port` 临时指定）；`--open` 参数会在启动后自动打开浏览器。
 
 ## 项目结构
 
@@ -56,6 +57,8 @@ Nascence_Huiye/
 ├── setup.ps1 / setup.sh    # 环境安装
 ├── 安装环境.bat            # Windows 一键安装
 ├── start.bat / start.sh    # 命令行启动器
+├── Dockerfile              # Docker 镜像构建文件
+├── docker-compose.yml      # Docker Compose 服务编排
 ├── requirements.txt
 │
 ├── config/

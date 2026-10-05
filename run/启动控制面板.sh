@@ -3,13 +3,6 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LAUNCHER="$PROJECT_DIR/run/启动控制面板.sh"
-
-# 文件管理器双击执行时没有终端，主动创建一个可见终端。
-if [ ! -t 0 ] && [ "${NASCENCE_IN_TERMINAL:-0}" != "1" ]; then
-    exec gnome-terminal --wait --title="Nascence 辉夜" --env=NASCENCE_IN_TERMINAL=1 -- bash "$LAUNCHER"
-fi
-
 cd "$PROJECT_DIR"
 
 cleanup() {
@@ -32,7 +25,12 @@ if [ ! -x "$PROJECT_DIR/venv/bin/python" ]; then
 fi
 
 echo "[*] 正在启动 Web 控制面板..."
-"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/web_panel.py" --open &
+OPEN_ARG=""
+if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    OPEN_ARG="--open"
+fi
+
+"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/web_panel.py" $OPEN_ARG "$@" &
 PANEL_PID=$!
 wait "$PANEL_PID"
 PANEL_PID=""

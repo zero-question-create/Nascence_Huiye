@@ -1,0 +1,16 @@
+services:
+  huiye:
+    build: .
+    image: ghcr.io/zero-question-create/nascence_huiye:latest
+    container_name: nascence-huiye
+    restart: unless-stopped
+    ports:
+      - "32123:32123"   # Web 控制面板端口
+      - "6700:6700"     # NapCat 反向 WebSocket 端口
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./run/logs:/app/run/logs
+    extra_hosts:
+      # 支持在容器内访问宿主机上运行的本地 Ollama 服务 (http://host.docker.internal:11434)
+      - "host.docker.internal:host-gateway"

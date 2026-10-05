@@ -1,0 +1,97 @@
+name: Build and Publish Docker Image
+
+# ==============================================================================
+# 触发策略说明（防滥用与配额保护）：
+# 1. 默认仅在发布版本（Release / Tag v*）时自动触发，杜绝日常小提交频繁空耗 Actions 额度
+# 2. 支持在 GitHub Actions 页面随时手动触发（workflow_dispatch）
+# 3. 采用并发控制，同分支/Tag新构建排队时自动取消旧构建
+# ==============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: '是否推送镜像到容器镜像源'
+        required: true
+        type: boolean
+        default: true
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (Multi-platform support)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 默认发布至 GitHub Container Registry (ghcr.io)，无需配置外部第三方密钥，安全可控
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 若仓库配置了 Docker Hub 凭据（DOCKERHUB_USERNAME / DOCKERHUB_TOKEN），则同步支持登录
+      - name: Check Docker Hub Credentials
+        id: check-dockerhub
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "has_dockerhub=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_dockerhub=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to Docker Hub (Optional)
+        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && steps.check-dockerhub.outputs.has_dockerhub == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 规范化镜像标签：语义化版本（v*）自动提取 major/minor/patch 与 latest
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ steps.check-dockerhub.outputs.has_dockerhub == 'true' && format('{0}/nascence-huiye', secrets.DOCKERHUB_USERNAME) || '' }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
