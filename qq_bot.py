@@ -76,8 +76,8 @@ from config.api_config import config
 # ---------- 配置常量 ----------
 CONFIG_PATH = "config/qq_manifest.json"
 HTTP_API_BASE = "http://127.0.0.1:5700"
-WS_HOST = "127.0.0.1"
-WS_PORT = 6700  # NapCat 配置中填写的端口
+WS_HOST = os.environ.get("WS_HOST", "0.0.0.0")
+WS_PORT = int(os.environ.get("WS_PORT", 6700))  # NapCat 配置中填写的端口
 WS_PATH = "/ws"
 
 

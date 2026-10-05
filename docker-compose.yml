@@ -1,3 +1,10 @@
+# ==============================================================================
+# Nascence Huiye - Docker Compose 服务编排
+# 启动方式：
+#   cp .env.example .env   # 复制并配置你的参数
+#   docker compose up -d   # 启动服务
+# ==============================================================================
+
 services:
   huiye:
     build: .
@@ -5,12 +12,29 @@ services:
     container_name: nascence-huiye
     restart: unless-stopped
     ports:
-      - "32123:32123"   # Web 控制面板端口
-      - "6700:6700"     # NapCat 反向 WebSocket 端口
+      # Web 控制面板端口（宿主机端口 : 容器端口）
+      - "${PANEL_PORT:-32123}:32123"
+      # NapCat 反向 WebSocket 端口
+      - "${NAPCAT_PORT:-6700}:6700"
+    environment:
+      # 从 .env 读取环境变量并注入容器
+      - PRIMARY_API_KEY=${PRIMARY_API_KEY:-}
+      - PRIMARY_BASE_URL=${PRIMARY_BASE_URL:-}
+      - PRIMARY_MODEL=${PRIMARY_MODEL:-}
+      - SECONDARY_API_KEY=${SECONDARY_API_KEY:-}
+      - SECONDARY_BASE_URL=${SECONDARY_BASE_URL:-}
+      - SECONDARY_MODEL=${SECONDARY_MODEL:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-shaw/dmeta-embedding-zh}
+      - BOT_QQ=${BOT_QQ:-}
+      - ACTIVE_GROUP_ID=${ACTIVE_GROUP_ID:-}
+      - NAPCAT_TOKEN=${NAPCAT_TOKEN:-Nascence}
+      - HUIYE_ENV_OVERRIDE=${HUIYE_ENV_OVERRIDE:-0}
     volumes:
+      # 持久化数据、配置与日志目录挂载
       - ./data:/app/data
       - ./config:/app/config
       - ./run/logs:/app/run/logs
     extra_hosts:
-      # 支持在容器内访问宿主机上运行的本地 Ollama 服务 (http://host.docker.internal:11434)
+      # 允许容器直接访问宿主机上的服务（如宿主机本地安装的 Ollama 11434 端口）
       - "host.docker.internal:host-gateway"

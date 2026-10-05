@@ -56,14 +56,48 @@ DEFAULT_CONFIG = {
     "action_note_enabled": True             # 是否允许写 txt 笔记
 }
 
+ENV_MAPPING = {
+    "PRIMARY_API_KEY": "primary_api_key",
+    "PRIMARY_BASE_URL": "primary_base_url",
+    "PRIMARY_MODEL": "primary_model",
+    "SECONDARY_API_KEY": "secondary_api_key",
+    "SECONDARY_BASE_URL": "secondary_base_url",
+    "SECONDARY_MODEL": "secondary_model",
+    "OLLAMA_BASE_URL": "ollama_base_url",
+    "OLLAMA_EMBED_MODEL": "ollama_embed_model",
+    "BOT_QQ": "bot_qq",
+    "ACTIVE_GROUP_ID": "active_group_id",
+    "NAPCAT_TOKEN": "napcat_token",
+    "PANEL_PORT": "panel_port",
+}
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
             for k in DEFAULT_CONFIG:
                 cfg.setdefault(k, DEFAULT_CONFIG[k])
-            return cfg
-    return dict(DEFAULT_CONFIG)
+    else:
+        cfg = dict(DEFAULT_CONFIG)
+
+    # 容器化与环境变量支持（Docker / .env）：
+    # 当配置项仍为默认占位符，或设置了 HUIYE_ENV_OVERRIDE=1 时，优先采用非空环境变量
+    env_override = os.environ.get("HUIYE_ENV_OVERRIDE") == "1"
+    for env_k, cfg_k in ENV_MAPPING.items():
+        env_val = os.environ.get(env_k)
+        if env_val is not None and str(env_val).strip():
+            val_str = str(env_val).strip()
+            is_placeholder = cfg.get(cfg_k) in (DEFAULT_CONFIG.get(cfg_k), "", None)
+            if env_override or is_placeholder:
+                if cfg_k == "panel_port":
+                    try:
+                        cfg[cfg_k] = int(val_str)
+                    except ValueError:
+                        pass
+                else:
+                    cfg[cfg_k] = val_str
+
+    return cfg
 
 def reload_config():
     """重读磁盘配置并原地更新全局 config，使运行中的模块立即感知最新设置。"""
