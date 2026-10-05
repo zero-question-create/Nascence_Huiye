@@ -38,6 +38,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Lowercase Repository Name
+        id: repo-name
+        run: |
+          # Docker/GHCR 镜像名称强制全小写，避免仓库名大小写混杂导致推送报错
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
       - name: Set up QEMU (Multi-platform support)
         uses: docker/setup-qemu-action@v3
 
@@ -76,7 +82,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ github.repository }}
+            ghcr.io/${{ steps.repo-name.outputs.repo }}
             ${{ steps.check-dockerhub.outputs.has_dockerhub == 'true' && format('{0}/nascence-huiye', secrets.DOCKERHUB_USERNAME) || '' }}
           tags: |
             type=ref,event=branch

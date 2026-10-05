@@ -41,6 +41,27 @@ QQ 白名单 `config/qq_manifest.json` 在 QQ 服务首次启动时自动从 `co
 
 Web 面板直接运行 `python web_panel.py` 亦可（从配置读取端口，默认 32123，亦支持 `--port` 临时指定）；`--open` 参数会在启动后自动打开浏览器。
 
+### Docker 容器部署（推荐服务器使用）
+
+在 Linux / 云服务器上，推荐使用 Docker Compose 快速运行：
+
+```bash
+# 1. 复制环境变量模板
+cp .env.example .env
+
+# 2. 编辑 .env 填入 API Key、QQ 号、群号等信息（亦可启动后在面板配置页填写）
+vim .env
+
+# 3. 后台启动容器
+docker compose up -d
+```
+
+- **Web 控制面板**：浏览器访问 `http://<服务器IP>:32123/`
+- **NapCat QQ 接入**：NapCat 客户端配置为反向 WebSocket 连接 `ws://<服务器IP>:6700/ws`，Token 与 `.env` 中的 `NAPCAT_TOKEN` 保持一致
+- **宿主机 Ollama 连通**：容器内默认通过 `http://host.docker.internal:11434` 直连宿主机 Ollama，无缝复用宿主机的模型与 GPU 加速
+- **查看日志与状态**：`docker compose logs -f huiye` 或直接在 Web 控制面板「日志」页查看
+- **停止服务**：`docker compose down`（数据卷 `data/`、`config/`、`run/logs/` 挂载在宿主机，数据安全持久化）
+
 ## 项目结构
 
 ```
