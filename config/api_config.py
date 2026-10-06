@@ -65,6 +65,7 @@ ENV_MAPPING = {
     "SECONDARY_MODEL": "secondary_model",
     "OLLAMA_BASE_URL": "ollama_base_url",
     "OLLAMA_EMBED_MODEL": "ollama_embed_model",
+    "OLLAMA_BIN": "ollama_bin",
     "BOT_QQ": "bot_qq",
     "ACTIVE_GROUP_ID": "active_group_id",
     "NAPCAT_TOKEN": "napcat_token",
@@ -81,8 +82,9 @@ def load_config():
         cfg = dict(DEFAULT_CONFIG)
 
     # 容器化与环境变量支持（Docker / .env）：
-    # 当配置项仍为默认占位符，或设置了 HUIYE_ENV_OVERRIDE=1 时，优先采用非空环境变量
-    env_override = os.environ.get("HUIYE_ENV_OVERRIDE") == "1"
+    # 当处于容器环境、显式开启 HUIYE_ENV_OVERRIDE=1，或配置项仍为默认占位符时，优先采用非空环境变量
+    is_container = os.path.exists("/.dockerenv") or os.environ.get("CONTAINER") == "docker"
+    env_override = (os.environ.get("HUIYE_ENV_OVERRIDE") == "1") or is_container
     for env_k, cfg_k in ENV_MAPPING.items():
         env_val = os.environ.get(env_k)
         if env_val is not None and str(env_val).strip():

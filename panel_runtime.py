@@ -213,43 +213,110 @@ class Runtime:
 
     def start_ollama(self):
         import requests
+        import shutil
+        import urllib.parse
         session = requests.Session()
         session.trust_env = False
 
-        api_url = "http://127.0.0.1:11434/api/tags"
+        cfg = load_panel_config()
+        # 优先读取环境变量 OLLAMA_BASE_URL 或配置中的服务地址
+        raw_base_url = (
+            os.environ.get("OLLAMA_BASE_URL")
+            or cfg.get("ollama_base_url")
+            or "http://127.0.0.1:11434"
+        ).strip().rstrip("/")
+        if not raw_base_url.startswith(("http://", "https://")):
+            raw_base_url = "http://" + raw_base_url
 
-        def api_ready():
+        api_url = f"{raw_base_url}/api/tags"
+
+        # 同步更新内存中的向量模型服务地址
+        try:
+            from core import memory_engine as me
+            me.OLLAMA_BASE_URL = raw_base_url
+        except Exception:
+            pass
+
+        parsed = urllib.parse.urlparse(raw_base_url)
+        target_host = parsed.hostname or "127.0.0.1"
+        target_port = parsed.port or (443 if parsed.scheme == "https" else 11434)
+        is_local_host = target_host in ("127.0.0.1", "localhost", "0.0.0.0", "::1")
+        is_container = os.path.exists("/.dockerenv") or os.environ.get("CONTAINER") == "docker"
+
+        def api_ready(timeout=1.5):
             try:
-                response = session.get(api_url, timeout=1)
-                response.raise_for_status()
-                response.json()
-                return True
+                response = session.get(api_url, timeout=timeout)
+                return response.status_code == 200
             except Exception:
                 return False
 
+        # 优先探测目标 Ollama 服务（无论本地或外部）是否已经就绪
+        if api_ready():
+            logging.info("Ollama 服务已就绪（%s），直接复用", raw_base_url)
+            return
+
+        # 若目标地址为外部/宿主机（如 host.docker.internal / 局域网 IP），或当前运行在容器环境中：
+        # 服务由外部或宿主机托管，容器内部绝不能去启动本地二进制，更不能因缺少二进制文件报错终止！
+        if not is_local_host or is_container:
+            logging.info("检测到配置的外部/宿主机 Ollama（%s），等待服务连通...", raw_base_url)
+            for _ in range(6):
+                time.sleep(1.0)
+                if api_ready():
+                    logging.info("已成功连接到外部 Ollama 服务（%s）", raw_base_url)
+                    return
+            logging.warning(
+                "未能连接到配置的外部 Ollama 服务（%s）。"
+                "若使用宿主机服务，请确保宿主机 Ollama 已启动且允许外部访问（可在宿主机设置 OLLAMA_HOST=0.0.0.0:11434）。"
+                "核心将继续启动，待服务就绪后自动重连。",
+                raw_base_url,
+            )
+            return
+
+        # 本地环境：检查目标本地端口是否已被其他程序占用
         def port_in_use():
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(0.2)
-                return sock.connect_ex(("127.0.0.1", 11434)) == 0
+                return sock.connect_ex((target_host, target_port)) == 0
 
-        if api_ready():
-            logging.info("Ollama 服务已在运行，直接复用")
-            return
-
-        # 端口已被其他 Ollama 实例占用时，只等待它完成启动，不再启动第二个实例。
         if port_in_use():
-            logging.info("检测到 11434 端口已有服务，等待该 Ollama 完成启动")
-            for _ in range(60):
+            logging.info("检测到 %s:%s 端口已有服务，等待 Ollama 完成启动", target_host, target_port)
+            for _ in range(30):
                 if api_ready():
                     logging.info("已连接到现有 Ollama 服务")
                     return
                 time.sleep(0.5)
-            raise RuntimeError("11434 端口已被其他服务占用，且 Ollama API 未就绪")
+            logging.warning("本地端口 %s:%s 已被占用，但 Ollama API 响应超时。跳过本地启动。", target_host, target_port)
+            return
+
+        # 查找本地可执行程序：环境变量优先 -> 系统 PATH -> 项目内置目录
+        candidate_binaries = []
+        for env_key in ("OLLAMA_BIN", "OLLAMA_PATH"):
+            val = os.environ.get(env_key)
+            if val and os.path.isfile(val):
+                candidate_binaries.append(Path(val))
+
+        which_ollama = shutil.which("ollama.exe" if sys.platform == "win32" else "ollama")
+        if which_ollama and os.path.isfile(which_ollama):
+            candidate_binaries.append(Path(which_ollama))
 
         binary_name = "ollama.exe" if sys.platform == "win32" else "ollama"
-        binary = PROJECT_DIR / "ollama" / "bin" / binary_name
-        if not binary.exists():
-            raise FileNotFoundError(f"未找到项目内 Ollama: {binary}")
+        candidate_binaries.append(PROJECT_DIR / "ollama" / "bin" / binary_name)
+
+        binary = None
+        for cand in candidate_binaries:
+            if cand.is_file():
+                binary = cand
+                break
+
+        if not binary:
+            logging.warning(
+                "未找到本地 Ollama 可执行程序（已检索环境变量 OLLAMA_BIN、系统 PATH 与项目目录 ollama/bin），"
+                "且目标服务 %s 未就绪。跳过启动本地 Ollama 进程。如需使用外部服务请设置环境变量 OLLAMA_BASE_URL。",
+                raw_base_url,
+            )
+            return
+
+        logging.info("正在启动本地 Ollama 服务: %s", binary)
         env = os.environ.copy()
         env["OLLAMA_HOME"] = str(PROJECT_DIR / "ollama" / "home")
         env["OLLAMA_MODELS"] = str(PROJECT_DIR / "ollama" / "home" / "models")
@@ -270,17 +337,17 @@ class Runtime:
         ).start()
         for _ in range(60):
             if self.ollama_process.poll() is not None:
-                # 竞态下另一实例可能刚刚接管端口，优先尝试复用它。
                 if api_ready():
                     self.ollama_process = None
                     logging.info("检测到其他 Ollama 已接管服务，直接复用")
                     return
-                raise RuntimeError("Ollama 启动失败，请查看完整日志")
+                logging.warning("本地 Ollama 进程异常退出，跳过本地进程托管")
+                return
             if api_ready():
-                logging.info("Ollama 服务启动完成")
+                logging.info("本地 Ollama 服务启动完成")
                 return
             time.sleep(0.5)
-        raise TimeoutError("等待 Ollama 启动超时")
+        logging.warning("等待本地 Ollama 启动超时，跳过阻塞")
 
     @staticmethod
     def _pipe_process_output(process, name):
@@ -580,18 +647,9 @@ RUNTIME = Runtime()
 # ---------- 配置文件读写（供两个面板共用） ----------
 
 def load_panel_config():
-    path = PROJECT_DIR / "config" / "api_config.json"
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-    with path.open("r", encoding="utf-8-sig") as f:
-        cfg = json.load(f)
-    # 与 config.load_config 一致地补齐缺省键：
-    # 用户的存档往往只有 API/QQ 字段，生物钟等新参数要显示实际生效值而非空白。
-    for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
-    return cfg
+    """读取配置并自动应用环境变量覆盖（容器支持）与缺省值补齐。"""
+    from config.api_config import load_config
+    return load_config()
 
 
 def save_panel_config(cfg):

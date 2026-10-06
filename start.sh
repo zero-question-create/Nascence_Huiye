@@ -33,29 +33,33 @@ source venv/bin/activate
 mkdir -p data/test
 
 # ---------- 3. 启动 Ollama ----------
-OLLAMA_BIN="$PROJECT_DIR/ollama/bin/ollama"
+OLLAMA_TARGET_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
+OLLAMA_BIN="${OLLAMA_BIN:-$PROJECT_DIR/ollama/bin/ollama}"
+if [ ! -f "$OLLAMA_BIN" ] && command -v ollama >/dev/null 2>&1; then
+    OLLAMA_BIN="$(command -v ollama)"
+fi
 OLLAMA_PID=""
 
 start_ollama() {
+    # 优先检查指定或默认的 Ollama 服务是否已在运行
+    if curl -s "$OLLAMA_TARGET_URL/api/tags" > /dev/null 2>&1; then
+        echo "[√] Ollama 服务已在运行 ($OLLAMA_TARGET_URL)"
+        return 0
+    fi
+
     if [ -f "$OLLAMA_BIN" ]; then
         # 与 setup.sh / 控制面板统一模型目录，避免装好的模型运行时找不到
         export OLLAMA_HOME="${OLLAMA_HOME:-$PROJECT_DIR/ollama/home}"
         export OLLAMA_MODELS="${OLLAMA_MODELS:-$PROJECT_DIR/ollama/home/models}"
         mkdir -p "$OLLAMA_MODELS"
         
-        # 检查是否已有 Ollama 在运行
-        if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            echo "[√] Ollama 服务已在运行"
-            return 0
-        fi
-        
-        echo "[*] 启动本地 Ollama 服务..."
+        echo "[*] 启动本地 Ollama 服务 ($OLLAMA_BIN)..."
         "$OLLAMA_BIN" serve > /dev/null 2>&1 &
         OLLAMA_PID=$!
         
         # 等待 Ollama 就绪
         for i in $(seq 1 30); do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            if curl -s "$OLLAMA_TARGET_URL/api/tags" > /dev/null 2>&1; then
                 echo "[√] Ollama 服务已就绪"
                 return 0
             fi
@@ -64,20 +68,20 @@ start_ollama() {
         echo "[!] Ollama 启动超时"
         return 1
     else
-        echo "[!] Ollama 二进制未找到 ($OLLAMA_BIN)"
-        echo "[!] 请确保系统已安装 Ollama 或重新运行 setup.sh"
-        return 1
+        echo "[*] 未找到本地 Ollama 二进制，且 $OLLAMA_TARGET_URL 未就绪"
+        echo "[*] 若使用外部或宿主机 Ollama，请确保已启动服务并配置 OLLAMA_BASE_URL"
+        return 0
     fi
 }
 
-start_ollama || echo "[!] Ollama 启动失败，请手动启动"
+start_ollama || echo "[!] Ollama 启动检查结束"
 
 # ---------- 4. 检查并拉取 Embedding 模型 ----------
-if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    MODEL="shaw/dmeta-embedding-zh"
-    if ! curl -s http://localhost:11434/api/tags | grep -q "dmeta-embedding-zh"; then
+if curl -s "$OLLAMA_TARGET_URL/api/tags" > /dev/null 2>&1; then
+    MODEL="${OLLAMA_EMBED_MODEL:-shaw/dmeta-embedding-zh}"
+    if ! curl -s "$OLLAMA_TARGET_URL/api/tags" | grep -q "dmeta-embedding-zh"; then
         echo "[*] 正在拉取 Embedding 模型: $MODEL ..."
-        curl -s -X POST http://localhost:11434/api/pull -d "{\"model\":\"$MODEL\"}" > /dev/null 2>&1
+        curl -s -X POST "$OLLAMA_TARGET_URL/api/pull" -d "{\"model\":\"$MODEL\"}" > /dev/null 2>&1
         echo "[√] Embedding 模型已就绪"
     else
         echo "[√] Embedding 模型已存在"

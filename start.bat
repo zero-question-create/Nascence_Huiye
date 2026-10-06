@@ -43,8 +43,23 @@ echo [OK] Virtual env found
 if not exist "%PROJECT_DIR%data\test" mkdir "%PROJECT_DIR%data\test"
 
 :: ---------- 3. Start Ollama ----------
-set "OLLAMA_BIN=%PROJECT_DIR%ollama\bin\ollama.exe"
+if defined OLLAMA_BASE_URL (
+    set "OLLAMA_TARGET_URL=%OLLAMA_BASE_URL%"
+) else (
+    set "OLLAMA_TARGET_URL=http://localhost:11434"
+)
+
+if not defined OLLAMA_BIN (
+    set "OLLAMA_BIN=%PROJECT_DIR%ollama\bin\ollama.exe"
+)
 set "OLLAMA_SERVER="
+
+:: 优先检查目标 Ollama 服务是否已在运行
+powershell -Command "try { $r = Invoke-WebRequest -Uri '%OLLAMA_TARGET_URL%/api/tags' -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+if "!ERRORLEVEL!"=="0" (
+    echo [OK] Ollama already running at %OLLAMA_TARGET_URL%
+    goto :ollama_ready
+)
 
 if exist "%OLLAMA_BIN%" (
     echo [*] Starting local Ollama service...
@@ -53,38 +68,35 @@ if exist "%OLLAMA_BIN%" (
     set "OLLAMA_MODELS=!OLLAMA_HOME!\models"
     if not exist "!OLLAMA_MODELS!" mkdir "!OLLAMA_MODELS!"
 
-    powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-    if "!ERRORLEVEL!"=="0" (
-        echo [OK] Ollama already running
-    ) else (
-        echo [*] Launching Ollama...
-        start "Ollama" /B "%OLLAMA_BIN%" serve > nul 2>&1
-        set "OLLAMA_SERVER=1"
-        echo [*] Waiting for Ollama...
-        for /l %%i in (1,1,30) do (
-            timeout /t 1 /nobreak >nul
-            powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-            if "!ERRORLEVEL!"=="0" (
-                echo [OK] Ollama ready
-                goto :ollama_ready
-            )
+    echo [*] Launching Ollama...
+    start "Ollama" /B "%OLLAMA_BIN%" serve > nul 2>&1
+    set "OLLAMA_SERVER=1"
+    echo [*] Waiting for Ollama...
+    for /l %%i in (1,1,30) do (
+        timeout /t 1 /nobreak >nul
+        powershell -Command "try { $r = Invoke-WebRequest -Uri '%OLLAMA_TARGET_URL%/api/tags' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+        if "!ERRORLEVEL!"=="0" (
+            echo [OK] Ollama ready
+            goto :ollama_ready
         )
-        echo [Warning] Ollama start timed out, please start manually
     )
+    echo [Warning] Ollama start timed out, please start manually
 ) else (
-    echo [Warning] Ollama not found at %OLLAMA_BIN%
-    echo [Warning] Please place ollama.exe in ollama\bin\ or start Ollama manually
+    echo [*] Local Ollama binary not found at %OLLAMA_BIN%
+    echo [*] If using remote or host Ollama, ensure service is running at %OLLAMA_TARGET_URL%
 )
 :ollama_ready
 
 :: ---------- 4. Check embedding model ----------
 echo [*] Checking embedding model...
-powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 2; $d = $r.Content | ConvertFrom-Json; $found = $d.models | Where-Object { $_.name -like '*dmeta-embedding-zh*' }; if ($found) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+powershell -Command "try { $r = Invoke-WebRequest -Uri '%OLLAMA_TARGET_URL%/api/tags' -UseBasicParsing -TimeoutSec 2; $d = $r.Content | ConvertFrom-Json; $found = $d.models | Where-Object { $_.name -like '*dmeta-embedding-zh*' }; if ($found) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
 if "!ERRORLEVEL!"=="0" (
     echo [OK] Embedding model exists
 ) else (
-    echo [*] Pulling embedding model shaw/dmeta-embedding-zh ...
-    start "Ollama Pull" /B "%OLLAMA_BIN%" pull shaw/dmeta-embedding-zh
+    if exist "%OLLAMA_BIN%" (
+        echo [*] Pulling embedding model shaw/dmeta-embedding-zh ...
+        start "Ollama Pull" /B "%OLLAMA_BIN%" pull shaw/dmeta-embedding-zh
+    )
 )
 
 :: ---------- 5. Mode selection ----------
