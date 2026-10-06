@@ -50,6 +50,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
   textarea{min-height:80px;resize:vertical}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 16px}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px 16px}
+  .sub-box{background:#0f1621;border:1px solid #1f2a3a;border-radius:8px;padding:12px 14px;margin-bottom:14px}
+  .sub-box h4{margin:0 0 8px;font-size:13px;color:var(--accent2);font-weight:700}
   button.act{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:9px 16px;
              font-weight:700;cursor:pointer}
   button.act.sec{background:#222d3d;border:1px solid #35445a}
@@ -167,17 +170,39 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div class="hint">端口号修改后写入配置文件，将在下次启动控制面板时生效。</div>
     </div>
     <div class="panel">
-      <h3>API 配置</h3>
-      <div class="grid2">
-        <div><label>Primary URL</label><input id="f-pburl"></div>
-        <div><label>Primary 模型</label><input id="f-pmodel"></div>
-        <div><label>Primary API Key（留空表示不修改）</label><input id="f-pkey" type="password" placeholder="已配置则留空"></div>
-        <div><label>Secondary URL</label><input id="f-sburl"></div>
-        <div><label>Secondary 模型</label><input id="f-smode"></div>
-        <div><label>Secondary API Key（留空表示不修改）</label><input id="f-skey" type="password" placeholder="已配置则留空"></div>
+      <h3>大模型 (LLM) 与向量嵌入配置</h3>
+
+      <!-- 主大模型区块 -->
+      <div class="sub-box">
+        <h4>主模型（Primary LLM）— 文本理解、思考与回复生成</h4>
+        <div class="grid3">
+          <div><label>服务地址 (Base URL)</label><input id="f-pburl" placeholder="https://api.deepseek.com"></div>
+          <div><label>模型名称 (Model)</label><input id="f-pmodel" placeholder="deepseek-v4-flash"></div>
+          <div><label>API Key（留空表示不修改）</label><input id="f-pkey" type="password" placeholder="已配置则留空"></div>
+        </div>
       </div>
-      <div class="row" style="margin-top:12px"><button class="act" id="btnSaveCfg">保存 API 配置</button></div>
-      <div class="hint">保存后立即生效：API 客户端会热重建，无需重启面板或服务。</div>
+
+      <!-- 次大模型区块（独立换行展示） -->
+      <div class="sub-box">
+        <h4>次模型（Secondary LLM）— 多模态图片、表情包与音视频理解</h4>
+        <div class="grid3">
+          <div><label>服务地址 (Base URL)</label><input id="f-sburl" placeholder="https://api.deepseek.com"></div>
+          <div><label>模型名称 (Model)</label><input id="f-smode" placeholder="deepseek-v4-flash-vision-exp"></div>
+          <div><label>API Key（留空表示不修改）</label><input id="f-skey" type="password" placeholder="已配置则留空"></div>
+        </div>
+      </div>
+
+      <!-- 向量嵌入模型区块（独立换行展示） -->
+      <div class="sub-box">
+        <h4>向量嵌入模型（Ollama Embedding）— 语义记忆向量化与检索</h4>
+        <div class="grid2">
+          <div><label>Ollama 服务地址（本地填 http://127.0.0.1:11434，容器访问宿主机填 http://host.docker.internal:11434）</label><input id="f-oburl" placeholder="http://127.0.0.1:11434"></div>
+          <div><label>嵌入模型名称（须已执行 ollama pull）</label><input id="f-omodel" placeholder="shaw/dmeta-embedding-zh"></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px"><button class="act" id="btnSaveCfg">保存模型与 API 配置</button></div>
+      <div class="hint">保存后立即生效：API 客户端与向量模型配置实时热刷新，无需重启面板或容器。</div>
     </div>
     <div class="panel">
       <h3>生物钟参数（动力学速率，非钟点）</h3>
@@ -306,6 +331,8 @@ async function loadConfig(){
     $('f-pmodel').value = c.primary_model || '';
     $('f-sburl').value = c.secondary_base_url || '';
     $('f-smode').value = c.secondary_model || '';
+    $('f-oburl').value = c.ollama_base_url || '';
+    $('f-omodel').value = c.ollama_embed_model || '';
     $('q-bot').value = c.bot_qq || '';
     $('q-group').value = c.active_group_id || '';
     $('q-token').value = c.napcat_token || '';
@@ -441,9 +468,11 @@ $('btnSaveCfg').onclick = async () => {
       secondary_base_url:$('f-sburl').value.trim(),
       secondary_model:$('f-smode').value.trim(),
       secondary_api_key:$('f-skey').value.trim(),
+      ollama_base_url:$('f-oburl').value.trim(),
+      ollama_embed_model:$('f-omodel').value.trim(),
     });
     $('f-pkey').value = ''; $('f-skey').value = '';
-    toast('API 配置已保存');
+    toast('模型与 API 配置已保存并热刷新');
   }catch(e){ toast('保存失败：'+e.message); }
 };
 $('btnSavePanel').onclick = async () => {

@@ -57,23 +57,6 @@ DEFAULT_CONFIG = {
     "action_note_enabled": True             # 是否允许写 txt 笔记
 }
 
-ENV_MAPPING = {
-    "PRIMARY_API_KEY": "primary_api_key",
-    "PRIMARY_BASE_URL": "primary_base_url",
-    "PRIMARY_MODEL": "primary_model",
-    "SECONDARY_API_KEY": "secondary_api_key",
-    "SECONDARY_BASE_URL": "secondary_base_url",
-    "SECONDARY_MODEL": "secondary_model",
-    "OLLAMA_BASE_URL": "ollama_base_url",
-    "OLLAMA_EMBED_MODEL": "ollama_embed_model",
-    "OLLAMA_BIN": "ollama_bin",
-    "BOT_QQ": "bot_qq",
-    "ACTIVE_GROUP_ID": "active_group_id",
-    "NAPCAT_TOKEN": "napcat_token",
-    "NAPCAT_HTTP_URL": "napcat_http_url",
-    "PANEL_PORT": "panel_port",
-}
-
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
@@ -83,23 +66,34 @@ def load_config():
     else:
         cfg = dict(DEFAULT_CONFIG)
 
-    # 容器化与环境变量支持（Docker / .env）：
-    # 当处于容器环境、显式开启 HUIYE_ENV_OVERRIDE=1，或配置项仍为默认占位符时，优先采用非空环境变量
-    is_container = os.path.exists("/.dockerenv") or os.environ.get("CONTAINER") == "docker"
-    env_override = (os.environ.get("HUIYE_ENV_OVERRIDE") == "1") or is_container
-    for env_k, cfg_k in ENV_MAPPING.items():
-        env_val = os.environ.get(env_k)
-        if env_val is not None and str(env_val).strip():
-            val_str = str(env_val).strip()
-            is_placeholder = cfg.get(cfg_k) in (DEFAULT_CONFIG.get(cfg_k), "", None)
-            if env_override or is_placeholder:
-                if cfg_k == "panel_port":
-                    try:
-                        cfg[cfg_k] = int(val_str)
-                    except ValueError:
-                        pass
-                else:
-                    cfg[cfg_k] = val_str
+    # 环境变量仅保留 Web 端口设置（其余配置全部收敛在控制面板内可视化管理）
+    env_port = os.environ.get("PANEL_PORT")
+    if env_port and str(env_port).strip():
+        try:
+            cfg["panel_port"] = int(str(env_port).strip())
+        except ValueError:
+            pass
+
+    # 高级覆盖开关（可选，仅当显式设置 HUIYE_ENV_OVERRIDE=1 时生效）
+    if os.environ.get("HUIYE_ENV_OVERRIDE") == "1":
+        env_map = {
+            "PRIMARY_API_KEY": "primary_api_key",
+            "PRIMARY_BASE_URL": "primary_base_url",
+            "PRIMARY_MODEL": "primary_model",
+            "SECONDARY_API_KEY": "secondary_api_key",
+            "SECONDARY_BASE_URL": "secondary_base_url",
+            "SECONDARY_MODEL": "secondary_model",
+            "OLLAMA_BASE_URL": "ollama_base_url",
+            "OLLAMA_EMBED_MODEL": "ollama_embed_model",
+            "BOT_QQ": "bot_qq",
+            "ACTIVE_GROUP_ID": "active_group_id",
+            "NAPCAT_TOKEN": "napcat_token",
+            "NAPCAT_HTTP_URL": "napcat_http_url",
+        }
+        for ek, ck in env_map.items():
+            val = os.environ.get(ek)
+            if val is not None and str(val).strip():
+                cfg[ck] = str(val).strip()
 
     return cfg
 

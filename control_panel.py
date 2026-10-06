@@ -353,14 +353,18 @@ class ControlPanel(QMainWindow):
         self.lucis_model = QLineEdit()
         self.lucis_key = QLineEdit()
         self.lucis_key.setEchoMode(QLineEdit.Password)
-        form.addRow("DeepSeek URL", self.ds_url)
-        form.addRow("DeepSeek 模型", self.ds_model)
-        form.addRow("DeepSeek API Key", self.ds_key)
-        form.addRow("Lucis URL", self.lucis_url)
-        form.addRow("Lucis GPT 模型", self.lucis_model)
-        form.addRow("Lucis API Key", self.lucis_key)
+        self.ollama_url = QLineEdit()
+        self.ollama_model = QLineEdit()
+        form.addRow("主模型 Base URL", self.ds_url)
+        form.addRow("主模型名称", self.ds_model)
+        form.addRow("主模型 API Key", self.ds_key)
+        form.addRow("次模型 Base URL", self.lucis_url)
+        form.addRow("次模型名称", self.lucis_model)
+        form.addRow("次模型 API Key", self.lucis_key)
+        form.addRow("Ollama 服务地址", self.ollama_url)
+        form.addRow("Ollama 嵌入模型", self.ollama_model)
         layout.addWidget(panel)
-        save = QPushButton("保存 API 配置")
+        save = QPushButton("保存模型与 API 配置")
         save.clicked.connect(self.save_config)
         layout.addWidget(save, alignment=Qt.AlignLeft)
 
@@ -594,6 +598,8 @@ class ControlPanel(QMainWindow):
         self.lucis_url.setText(cfg.get("secondary_base_url", ""))
         self.lucis_model.setText(cfg.get("secondary_model", ""))
         self.lucis_key.setText(cfg.get("secondary_api_key", ""))
+        self.ollama_url.setText(cfg.get("ollama_base_url", "http://127.0.0.1:11434"))
+        self.ollama_model.setText(cfg.get("ollama_embed_model", "shaw/dmeta-embedding-zh"))
         self.bot_qq_input.setText(str(cfg.get("bot_qq") or "123456"))
         self.active_group_input.setText(str(cfg.get("active_group_id") or "123456"))
         self.napcat_token_input.setText(str(cfg.get("napcat_token") or "Nascence"))
@@ -625,6 +631,8 @@ class ControlPanel(QMainWindow):
             "secondary_base_url": self.lucis_url.text().strip(),
             "secondary_model": self.lucis_model.text().strip(),
             "secondary_api_key": self.lucis_key.text().strip(),
+            "ollama_base_url": self.ollama_url.text().strip(),
+            "ollama_embed_model": self.ollama_model.text().strip(),
         })
         save_panel_config(cfg)
         # 热刷新：API 客户端就地重建，新的 base_url / key / model 立即生效

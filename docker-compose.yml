@@ -1,7 +1,7 @@
 # ==============================================================================
 # Nascence Huiye - Docker Compose 服务编排
 # 启动方式：
-#   cp .env.example .env   # 复制并配置你的参数
+#   cp .env.example .env   # 复制端口配置文件（默认 32123）
 #   docker compose up -d   # 启动服务
 # ==============================================================================
 
@@ -12,30 +12,19 @@ services:
     container_name: nascence-huiye
     restart: unless-stopped
     ports:
-      # Web 控制面板端口（宿主机端口 : 容器端口）
+      # Web 控制面板访问端口（宿主机端口 : 容器端口）
       - "${PANEL_PORT:-32123}:32123"
-      # NapCat 反向 WebSocket 端口
+      # NapCat 反向 WebSocket 端口（宿主机端口 : 容器端口）
       - "${NAPCAT_PORT:-6700}:6700"
     environment:
-      # 从 .env 读取环境变量并注入容器
-      - PRIMARY_API_KEY=${PRIMARY_API_KEY:-}
-      - PRIMARY_BASE_URL=${PRIMARY_BASE_URL:-}
-      - PRIMARY_MODEL=${PRIMARY_MODEL:-}
-      - SECONDARY_API_KEY=${SECONDARY_API_KEY:-}
-      - SECONDARY_BASE_URL=${SECONDARY_BASE_URL:-}
-      - SECONDARY_MODEL=${SECONDARY_MODEL:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-shaw/dmeta-embedding-zh}
-      - BOT_QQ=${BOT_QQ:-}
-      - ACTIVE_GROUP_ID=${ACTIVE_GROUP_ID:-}
-      - NAPCAT_TOKEN=${NAPCAT_TOKEN:-Nascence}
-      - NAPCAT_HTTP_URL=${NAPCAT_HTTP_URL:-http://host.docker.internal:5700}
-      - HUIYE_ENV_OVERRIDE=${HUIYE_ENV_OVERRIDE:-0}
+      # 容器内仅需传递 Web 端口变量，大模型/Ollama/QQ 等全部业务配置收敛在控制面板内可视化配置并保存至挂载卷
+      - PANEL_PORT=32123
+      - CONTAINER=docker
     volumes:
-      # 持久化数据、配置与日志目录挂载
+      # 持久化数据、配置与日志目录挂载到宿主机当前目录
       - ./data:/app/data
       - ./config:/app/config
       - ./run/logs:/app/run/logs
     extra_hosts:
-      # 允许容器直接访问宿主机上的服务（如宿主机本地安装的 Ollama 11434 端口）
+      # 允许容器直接访问宿主机上的服务（如宿主机本地运行的 Ollama 11434 端口）
       - "host.docker.internal:host-gateway"
