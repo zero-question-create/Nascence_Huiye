@@ -131,6 +131,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div><label>机器人 QQ</label><input id="q-bot"></div>
         <div><label>主动发言群号</label><input id="q-group"></div>
         <div><label>NapCat 鉴权 Token</label><input id="q-token"></div>
+        <div><label>NapCat HTTP 接口地址（正向 HTTP，用于语音下载）</label><input id="q-http" placeholder="http://127.0.0.1:5700"></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSaveNapcat">保存并热刷新</button></div>
       <div class="hint">保存后立即生效：运行中的 QQ 服务会直接使用新值，无需重启。</div>
@@ -308,6 +309,7 @@ async function loadConfig(){
     $('q-bot').value = c.bot_qq || '';
     $('q-group').value = c.active_group_id || '';
     $('q-token').value = c.napcat_token || '';
+    $('q-http').value = c.napcat_http_url || '';
     $('f-twake').value = c.biorhythm_wake_seconds ?? '';
     $('f-tsleep').value = c.biorhythm_sleep_seconds ?? '';
     $('f-onset').value = c.biorhythm_onset_threshold ?? '';
@@ -461,6 +463,7 @@ $('btnSaveNapcat').onclick = async () => {
       bot_qq:$('q-bot').value.trim(),
       active_group_id:$('q-group').value.trim(),
       napcat_token:$('q-token').value.trim(),
+      napcat_http_url:$('q-http').value.trim(),
     });
     toast('NapCat 设置已保存并热刷新');
     refreshStats();

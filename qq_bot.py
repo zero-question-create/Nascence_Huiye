@@ -75,7 +75,6 @@ from config.api_config import config
 
 # ---------- 配置常量 ----------
 CONFIG_PATH = "config/qq_manifest.json"
-HTTP_API_BASE = "http://127.0.0.1:5700"
 WS_HOST = os.environ.get("WS_HOST", "0.0.0.0")
 WS_PORT = int(os.environ.get("WS_PORT", 6700))  # NapCat 配置中填写的端口
 WS_PATH = "/ws"
@@ -105,11 +104,21 @@ def get_napcat_token():
     return _cfg_str("napcat_token", "Nascence")
 
 
+def get_napcat_http_url():
+    """NapCat 正向 HTTP 服务地址（支持环境变量 NAPCAT_HTTP_URL 或动态配置，供语音下载等调用）。"""
+    raw = os.environ.get("NAPCAT_HTTP_URL") or _cfg_str("napcat_http_url", "http://127.0.0.1:5700")
+    raw = str(raw).strip().rstrip("/")
+    if raw and not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    return raw or "http://127.0.0.1:5700"
+
+
 # 兼容旧引用（模块内部已改为动态读取）
 BOT_QQ = get_bot_qq()
 ACTIVE_GROUP_ID = get_active_group_id()
 HTTP_ACCESS_TOKEN = get_napcat_token()
 WS_ACCESS_TOKEN = get_napcat_token()
+HTTP_API_BASE = get_napcat_http_url()
 
 _recent_msg_list = []      # 有序存储 (sender_id, clean_text)
 _recent_msg_set = set()    # 快速查找去重
@@ -446,9 +455,10 @@ async def handle_group_message(data: dict):
         if seg_type == "record" and file_url and not str(file_url).startswith(("http://", "https://")):
             # NapCat 有时只回传文件名或本地路径，通过 get_record 获取可下载文件。
             try:
+                napcat_api = get_napcat_http_url()
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
-                        f"{HTTP_API_BASE}/get_record",
+                        f"{napcat_api}/get_record",
                         params={"file": file_url, "out_format": "wav"},
                         headers={"Authorization": f"Bearer {get_napcat_token()}"},
                         timeout=30,

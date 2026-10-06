@@ -685,6 +685,7 @@ def apply_config_hot_reload(cfg: dict):
         qq_bot.ACTIVE_GROUP_ID = qq_bot.get_active_group_id()
         qq_bot.HTTP_ACCESS_TOKEN = qq_bot.get_napcat_token()
         qq_bot.WS_ACCESS_TOKEN = qq_bot.get_napcat_token()
+        qq_bot.HTTP_API_BASE = qq_bot.get_napcat_http_url()
     except Exception:
         pass
     try:

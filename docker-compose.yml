@@ -29,6 +29,7 @@ services:
       - BOT_QQ=${BOT_QQ:-}
       - ACTIVE_GROUP_ID=${ACTIVE_GROUP_ID:-}
       - NAPCAT_TOKEN=${NAPCAT_TOKEN:-Nascence}
+      - NAPCAT_HTTP_URL=${NAPCAT_HTTP_URL:-http://host.docker.internal:5700}
       - HUIYE_ENV_OVERRIDE=${HUIYE_ENV_OVERRIDE:-0}
     volumes:
       # 持久化数据、配置与日志目录挂载

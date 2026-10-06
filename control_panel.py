@@ -369,9 +369,12 @@ class ControlPanel(QMainWindow):
         self.bot_qq_input = QLineEdit()
         self.active_group_input = QLineEdit()
         self.napcat_token_input = QLineEdit()
+        self.napcat_http_input = QLineEdit()
+        self.napcat_http_input.setPlaceholderText("http://127.0.0.1:5700")
         napcat_form.addRow("机器人QQ号", self.bot_qq_input)
         napcat_form.addRow("主动发言目标群号", self.active_group_input)
         napcat_form.addRow("NapCat 鉴权 Token", self.napcat_token_input)
+        napcat_form.addRow("NapCat HTTP 接口", self.napcat_http_input)
         layout.addWidget(napcat_panel)
         save_napcat = QPushButton("保存 NapCat 设置")
         save_napcat.clicked.connect(self.save_napcat_config)
@@ -594,6 +597,8 @@ class ControlPanel(QMainWindow):
         self.bot_qq_input.setText(str(cfg.get("bot_qq") or "123456"))
         self.active_group_input.setText(str(cfg.get("active_group_id") or "123456"))
         self.napcat_token_input.setText(str(cfg.get("napcat_token") or "Nascence"))
+        if hasattr(self, "napcat_http_input"):
+            self.napcat_http_input.setText(str(cfg.get("napcat_http_url") or "http://127.0.0.1:5700"))
         if hasattr(self, "panel_port_input"):
             self.panel_port_input.setText(str(cfg.get("panel_port") or 32123))
 
@@ -636,6 +641,7 @@ class ControlPanel(QMainWindow):
             "bot_qq": self.bot_qq_input.text().strip() or "123456",
             "active_group_id": self.active_group_input.text().strip() or "123456",
             "napcat_token": self.napcat_token_input.text().strip() or "Nascence",
+            "napcat_http_url": self.napcat_http_input.text().strip() or "http://127.0.0.1:5700",
         })
         save_panel_config(cfg)
         # 热刷新放工作线程：其中 qq_bot 属重型导入，直接在 GUI 线程跑会短暂假死
@@ -650,6 +656,8 @@ class ControlPanel(QMainWindow):
             self.active_group_input.setText(str(config.get("active_group_id") or "123456"))
         if hasattr(self, "napcat_token_input"):
             self.napcat_token_input.setText(str(config.get("napcat_token") or "Nascence"))
+        if hasattr(self, "napcat_http_input"):
+            self.napcat_http_input.setText(str(config.get("napcat_http_url") or "http://127.0.0.1:5700"))
         QMessageBox.information(self, "已保存", "NapCat 设置已保存，运行中的 QQ 服务将自动使用新值。")
         logging.info("NapCat 配置已保存并热刷新")
 

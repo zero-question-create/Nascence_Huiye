@@ -272,7 +272,7 @@ async def handle_config_get(request):
 # API Key / 文本字段 / 数值字段分别处理：空值不覆盖，数字容错转换。
 _CONFIG_STR_KEYS = (
     "primary_base_url", "primary_model", "secondary_base_url", "secondary_model",
-    "bot_qq", "active_group_id", "napcat_token",
+    "bot_qq", "active_group_id", "napcat_token", "napcat_http_url",
 )
 _CONFIG_KEY_KEYS = ("primary_api_key", "secondary_api_key")
 _CONFIG_FLOAT_KEYS = (
