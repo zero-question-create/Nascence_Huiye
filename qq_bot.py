@@ -5,6 +5,7 @@
 # ========================================================================
 
 import asyncio
+import base64
 import json
 import re
 import threading
@@ -447,12 +448,12 @@ async def handle_group_message(data: dict):
         local_file = None
         for key in ("file", "path"):
             candidate = seg_data.get(key)
-            if candidate and not str(candidate).startswith(("http://", "https://")) and os.path.isfile(str(candidate)):
+            if candidate and not str(candidate).startswith(("http://", "https://", "base64://")) and os.path.isfile(str(candidate)):
                 local_file = str(candidate)
                 break
 
         file_url = seg_data.get("url") or seg_data.get("path") or seg_data.get("file")
-        if seg_type == "record" and file_url and not str(file_url).startswith(("http://", "https://")):
+        if seg_type == "record" and file_url and not str(file_url).startswith(("http://", "https://", "base64://")):
             # NapCat 有时只回传文件名或本地路径，通过 get_record 获取可下载文件。
             try:
                 napcat_api = get_napcat_http_url()
@@ -469,7 +470,30 @@ async def handle_group_message(data: dict):
             except Exception as e:
                 logger.warning(f"通过 NapCat 获取语音失败: {e}")
 
-        if not local_file and (not file_url or not str(file_url).startswith(("http://", "https://"))):
+        # 跨容器收图兜底：若既不是本地直接可读文件，也不是 HTTP 直链或 Base64，
+        # 则尝试调用 NapCat 的 /get_image 接口获取下载直链或文件路径
+        if not local_file and (not file_url or not str(file_url).startswith(("http://", "https://", "base64://"))):
+            if seg_type in ("image", "sticker"):
+                try:
+                    napcat_api = get_napcat_http_url()
+                    file_param = seg_data.get("file") or file_url or ""
+                    if file_param:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                f"{napcat_api}/get_image",
+                                params={"file": file_param},
+                                headers={"Authorization": f"Bearer {get_napcat_token()}"},
+                                timeout=30,
+                            ) as resp:
+                                if resp.status == 200:
+                                    img_result = await resp.json()
+                                    fetched = img_result.get("data", {}).get("url") or img_result.get("data", {}).get("file")
+                                    if fetched:
+                                        file_url = fetched
+                except Exception as e:
+                    logger.warning(f"通过 NapCat 获取图片失败: {e}")
+
+        if not local_file and (not file_url or not str(file_url).startswith(("http://", "https://", "base64://"))):
             if not file_url or not os.path.isfile(str(file_url)):
                 logger.warning(f"媒体没有可下载的 URL 或本地文件，类型={seg_type}")
                 continue
@@ -483,9 +507,17 @@ async def handle_group_message(data: dict):
             file_format = re.sub(r"[^a-zA-Z0-9]", "", file_format).lower() or "amr"
 
             if local_file:
-                # NapCat 已把文件落在本地（QQ 缓存目录），直接读，不复制不下载
+                # NapCat 已把文件落在本地（同机部署环境），直接读，不复制不下载
                 tmp_path = local_file
                 owns_tmp_path = False
+            elif str(file_url).startswith("base64://"):
+                # Base64 编码的二进制数据，直接在内存解码为临时文件
+                b64_str = str(file_url)[len("base64://"):]
+                raw_bytes = base64.b64decode(b64_str)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_format}") as tmp_file:
+                    tmp_file.write(raw_bytes)
+                    tmp_path = tmp_file.name
+                    owns_tmp_path = True
             elif str(file_url).startswith(("http://", "https://")):
                 async with aiohttp.ClientSession() as session:
                     async with session.get(file_url, timeout=30) as resp:
@@ -788,7 +820,17 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "", as_
     segments = []
     if caption:
         segments.append({"type": "text", "data": {"text": caption}})
-    image_data = {"file": Path(str(file_path)).resolve().as_uri()}
+
+    # 跨容器支持：采用 base64:// 协议发送二进制图片，完全不依赖容器间共享文件系统，
+    # NapCat 无论在宿主机、其他容器或远程均可从 WebSocket 内存解码并上传至 QQ。
+    try:
+        with open(str(file_path), "rb") as f:
+            b64_content = base64.b64encode(f.read()).decode("utf-8")
+        image_data = {"file": f"base64://{b64_content}"}
+    except Exception as e:
+        logger.error(f"媒体 Base64 编码失败 ({file_path}): {e}")
+        return False
+
     if as_sticker:
         # OneBot 图片子类型 1 = 表情包，NapCat 会映射为 picSubType
         image_data["sub_type"] = 1
@@ -1038,7 +1080,8 @@ async def start_server():
 
     loop.set_exception_handler(_graceful_exception_handler)
 
-    server = await websockets.serve(ws_handler, WS_HOST, WS_PORT)
+    # 扩容 WebSocket 单帧上限至 32MB（默认仅 1MB），支持收发 Base64 图片与表情包不被截断
+    server = await websockets.serve(ws_handler, WS_HOST, WS_PORT, max_size=32 * 1024 * 1024)
     try:
         logger.info(f"WebSocket 服务器已启动，等待 NapCat 连接: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
         # 服务器已就绪：此时补做睡眠维护，保证"启动即睡眠"也能被 @ 唤醒。
