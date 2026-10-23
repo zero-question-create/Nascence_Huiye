@@ -26,11 +26,11 @@ from config.constants import BOT_NAME
 from utils.monitor import append_log
 
 DEFAULT_MAX_PAGES = 4    # 单个动作类型的翻页上限，超过强制结束抉择
-DEFAULT_PAGE_SIZE = 12   # 每页候选数量
+DEFAULT_PAGE_SIZE = 8    # 每页候选数量
 VALID_ACTIONS = {
     "none", "image", "sticker",
     "image_next_page", "sticker_next_page",
-    "save_image", "save_sticker", "write_txt", "edit_txt", "read_txt",
+    "save_image", "save_sticker", "write_txt", "edit_txt", "delete_txt", "read_txt",
 }
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
@@ -87,7 +87,7 @@ def _parse_action(raw: str) -> dict:
 
 
 def _page_text(kind: str, entries: list, page: int) -> str:
-    """渲染某一页候选，编号供模型指代。"""
+    """渲染某一页候选，编号供模型指代。描述截断到 40 字，控制提示词长度。"""
     page_size = _page_size()
     total_pages = max(1, (len(entries) + page_size - 1) // page_size)
     start = page * page_size
@@ -95,7 +95,10 @@ def _page_text(kind: str, entries: list, page: int) -> str:
     label = "图片" if kind == ASSETS.IMAGE else "表情包"
     lines = [f"【我的收藏·{label} 第{page + 1}/{total_pages}页，共{len(entries)}个】"]
     for e in chunk:
-        lines.append(f"- {e['id']}｜{e['desc']}")
+        desc = str(e.get("desc") or "")
+        if len(desc) > 40:
+            desc = desc[:40] + "…"
+        lines.append(f"- {e['id']}｜{desc}")
     if not chunk:
         lines.append("（本页没有内容）")
     return "\n".join(lines)
@@ -116,49 +119,50 @@ def _pending_text() -> str:
 def _system_prompt() -> str:
     return (
         f"你是{BOT_NAME}的冲动决策层，只决定此刻要不要做一个小动作。\n\n"
-        "可用动作（每次只输出一个）：\n"
-        "- {\"action\":\"none\"} 什么都不做\n"
-        "- {\"action\":\"image\",\"id\":\"编号\"} 发一张自己收藏的图片\n"
-        "- {\"action\":\"sticker\",\"id\":\"编号\"} 发一个自己收藏的表情包\n"
-        "- {\"action\":\"image_next_page\"} 翻看图片收藏的下一页\n"
-        "- {\"action\":\"sticker_next_page\"} 翻看表情包收藏的下一页\n"
-        "- {\"action\":\"save_image\",\"ref\":\"m1\"} 把本轮收到的一张图收进自己的收藏\n"
-        "- {\"action\":\"save_sticker\",\"ref\":\"m1\"} 把本轮收到的一个表情包收进自己的收藏\n"
-        "- {\"action\":\"read_txt\",\"name\":\"文件名\"} 翻开自己以前写的记事本看看\n"
-        "- {\"action\":\"write_txt\",\"name\":\"文件名\",\"text\":\"要写的内容\"} 写进自己的记事本\n"
+        "可用动作（每次只输出一个 JSON）：\n"
+        "- {\"action\":\"none\"}\n"
+        "- {\"action\":\"image\",\"id\":\"编号\"} / {\"action\":\"sticker\",\"id\":\"编号\"}\n"
+        "- {\"action\":\"image_next_page\"} / {\"action\":\"sticker_next_page\"}\n"
+        "- {\"action\":\"save_image\",\"ref\":\"m1\"} / {\"action\":\"save_sticker\",\"ref\":\"m1\"}\n"
+        "- {\"action\":\"read_txt\",\"name\":\"文件名\"}\n"
+        "- {\"action\":\"write_txt\",\"name\":\"文件名\",\"text\":\"一条内容\"}\n"
         "- {\"action\":\"edit_txt\",\"name\":\"文件名\",\"old_text\":\"原来那条\",\"new_text\":\"改成什么\"}\n"
-        "  修改已经记下的一条（做完的事可以把 new_text 留空表示划掉）\n\n"
+        "- {\"action\":\"delete_txt\",\"name\":\"文件名\",\"old_text\":\"要划掉的那条\"}\n\n"
         "规则：\n"
-        "1. 输出严格只包含 JSON，不要任何解释、不要多余字段。\n"
-        "2. 编号必须来自上面给出的收藏清单或本轮收到的媒体，禁止自己编造。\n"
-        "3. 大多数时候应该是什么都不做；只有此刻确实想发、或确实觉得值得收下时才动手。\n"
-        "4. 不要因为看到收藏清单就随便挑一个；发出的东西要和此刻在想的事情有关系。\n"
-        "5. 一次只做一个动作。翻页时不要同时发送。\n"
-        "6. 是否发出去要符合你此刻的心情和场合，别打断自己刚说的话。\n"
-        "7. 记事本只能写 txt，文件名用中文或字母数字，不要带路径和扩展名。\n"
-        "8. 写记事本前先看【我的记事本】里已记的内容：同一件事没必要反复记，\n"
-        "   确实有新增或需要重申的才写；一次只记一件。\n"
-        "9. 记下的旧条目不合适、或那件事已经做完了，可以用 edit_txt 改写它或把它划掉\n"
-        "   （new_text 留空即删除）；old_text 用你看到的那条内容，不必逐字一模一样。\n"
-        "10. 发素材前先看【我最近发过的】：刚发过的同一条不要连着再发；\n"
-        "   清单里没有合适的、或此刻并没有想发的，就选 none，不要为了发而发。\n"
+        "1. 只输出 JSON，不加解释、不加多余字段。\n"
+        "2. 编号必须来自给出的清单或本轮媒体，禁止编造。\n"
+        "3. 大多数时候选 none；只有当前念头明确需要时才动手，不要为了发而发。\n"
+        "4. 一次只做一个动作，翻页时不要同时发送。\n"
+        "5. 笔记一次只记一件事；修改/删除前先 read_txt，old_text 用看到的那条原句。\n"
     )
 
 
-def _notes_brief(notes: list, max_chars: int = 600) -> str:
-    """把记事本现状摘要给模型看：文件名 + 最近记下的几条。
+def _notes_brief(notes: list, max_chars: int = None) -> str:
+    """把记事本现状摘要给模型看：文件名 + 最近几条（带行号）。
 
-    只给文件名的话，模型不知道里面已经写过什么，会把同一件事反复再写一遍。
-    这里带上最近若干条内容，让它自己判断哪些已经记过。
+    行号来自总条目数倒推，模型可以直接用 line 精确修改；
+    old_text 仍要求唯一命中，行号只是辅助。
     """
+    if max_chars is None:
+        try:
+            max_chars = max(80, int(config.get("note_brief_max_chars", 400)))
+        except (TypeError, ValueError):
+            max_chars = 400
+    try:
+        recent_limit = max(1, int(config.get("note_brief_recent_lines", 5)))
+    except (TypeError, ValueError):
+        recent_limit = 5
+
     lines = ["【我的记事本】（写之前先看，已经记过的事不必再记一遍）"]
-    for name in notes:
-        existing = ASSETS.recent_note_lines(name, limit=8)
+    for name in notes[:5]:
+        existing = ASSETS.recent_note_lines(name, limit=recent_limit)
         total = ASSETS.note_line_count(name)
-        lines.append(f"- {name}（共 {total} 条）")
+        stats = ASSETS.note_stats(name)
+        lines.append(f"- {name}（共 {total} 条，{stats['chars']} 字）")
         if existing:
-            for item in existing:
-                lines.append(f"    · {item[:60]}")
+            start = max(1, total - len(existing) + 1)
+            for offset, item in enumerate(existing):
+                lines.append(f"    {start + offset}| {item[:60]}")
             if total > len(existing):
                 lines.append(f"    （更早的 {total - len(existing)} 条已略）")
     text = "\n".join(lines)
@@ -187,34 +191,35 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
         if kws:
             parts.append(f"【此刻萦绕的词】{kws}")
 
-    # 候选列表由调用方传入并**固定**。此前这里每次重新调 ordered_pool()，
-    # 而它内部含随机排序，导致提示词里展示的候选与翻页时用的列表不是同一份，
-    # 翻页会重复或跳过条目（F18）。
+    # 候选列表由调用方传入并**固定**，翻页复用同一份，避免重复或跳过。
     if images is None:
         images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords)
     if stickers is None:
         stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords)
+
+    # 收藏提示必须紧跟在“本轮收到的媒体”之后：先看到图，再看到能留下它。
+    pending = ASSETS.list_pending()
+    if pending:
+        parts.append(_pending_text())
+        parts.append("如果想留下上面的某一条，用 save_image / save_sticker 引用它的编号。")
+
     if images:
         parts.append(_page_text(ASSETS.IMAGE, images, 0))
     if stickers:
         parts.append(_page_text(ASSETS.STICKER, stickers, 0))
-    pending = _pending_text()
-    if pending:
-        parts.append(pending)
     if note_enabled():
         notes = ASSETS.list_notes()
         if notes:
             parts.append(_notes_brief(notes))
     if not images and not stickers and not pending:
-        # 区分"真的没收藏"与"收藏暂时没有合适的"：后者不该说成"还没收下过"
+        # 区分"真的没收藏"与"收藏暂时没有合适的"
         has_any = ASSETS.count(ASSETS.IMAGE) + ASSETS.count(ASSETS.STICKER)
         if has_any:
             parts.append("【我的收藏】（有几张，但此刻没有特别想发的）")
         else:
             parts.append("【我的收藏】（空，还没收下过任何图片或表情包）")
 
-    # 最近发过什么：让模型看得见，避免把同一条反复发出去。
-    # 只提供信息、不做硬性拦截——是否重发由它自己结合语境判断。
+    # 最近发过什么：只提供信息，不做硬性拦截。
     sent_lines = []
     for kind in (ASSETS.IMAGE, ASSETS.STICKER):
         for desc in ASSETS.recent_sent(kind)[:3]:
@@ -251,9 +256,11 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
         {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords,
                                                  context_hint, images=images, stickers=stickers)},
     ]
+    from .llm_interface import fingerprint_prompt
+    fingerprint_prompt("action", messages[0]["content"])
 
     for turn in range(max_pages + 1):
-        raw = call_api_thinking(messages, max_tokens=4000, thinking=False)
+        raw = call_api_thinking(messages, max_tokens=800, thinking=False)
         data = _parse_action(raw)
         action = str(data.get("action") or "").strip().lower()
         append_log(f"[动作抉择] 第{turn + 1}次询问返回: {raw}")
@@ -302,7 +309,6 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             append_log(f"[动作抉择] 编号无法对应到收藏（{kind}: {token!r}），放弃发送")
             return {"action": "none", "detail": ""}
         # 不做硬性拦截：把"最近发过什么"告诉模型，由它自己判断是否重复。
-        # 硬排除会挡掉"同一张图在新语境下确实想再发"这类真实需求。
         return {"action": action, "detail": entry["desc"], "entry": entry}
 
     if action in ("save_image", "save_sticker"):
@@ -312,8 +318,6 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             append_log(f"[动作抉择] 找不到对应的暂存媒体（ref={ref!r}），放弃收藏")
             return {"action": "none", "detail": ""}
         # 以抉择的意图为准：模型判断是表情包就存成表情包（会转 GIF）。
-        # NapCat 常把群里的表情包上报为普通 image，若此时按暂存类型回退，
-        # 表情包就永远进不了表情包库、也不会转 GIF。
         if action == "save_sticker":
             kind = ASSETS.STICKER
         else:
@@ -324,7 +328,8 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             return {"action": "none", "detail": ""}
         word = "收进了收藏" if saved.get("added") else "早就已经在收藏里了"
         return {"action": action, "detail": item["desc"], "saved": saved, "added": saved.get("added", False),
-                "reply": f"（{word}：{item['desc']}）"}
+                "reply": f"（{word}：{item['desc']}）",
+                "memory_ids": item.get("memory_ids") or []}
 
     if action == "write_txt":
         if not note_enabled():
@@ -332,18 +337,24 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             return {"action": "none", "detail": ""}
         name = str(data.get("name") or "").strip()
         text = str(data.get("text") or "").strip()
-        path = ASSETS.write_note(name, text)
-        if not path:
-            append_log(f"[动作抉择] 写笔记被拒绝（name={name!r}）")
-            return {"action": "none", "detail": ""}
+        result = ASSETS.write_note_ex(name, text)
+        if result.get("error"):
+            append_log(f"[动作抉择] 写笔记被拒绝（{result['error']}，name={name!r}）")
+            return {
+                "action": "none", "detail": "",
+                "note_error": result["error"],
+                "note_used_chars": result.get("used_chars", 0),
+                "note_used_lines": result.get("used_lines", 0),
+                "written": result.get("written", ""),
+            }
         # 正在写这个文件时，顺手读回全文，交给下一轮以特供记忆方式回看（不入库）
         note = ASSETS.read_note(name)
         return {
-            "action": action, "detail": path, "path": path,
-            "note_name": os.path.splitext(os.path.basename(path))[0],
-            "written": text,
-            "note_text": (note or {}).get("text", text),
-            "truncated": bool((note or {}).get("truncated")),
+            "action": action, "detail": result["path"], "path": result["path"],
+            "note_name": result["name"],
+            "written": result["written"],
+            "truncated": bool(result.get("truncated")) or bool((note or {}).get("truncated")),
+            "note_text": (note or {}).get("text", result["written"]),
         }
 
     if action == "edit_txt":
@@ -352,19 +363,54 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             return {"action": "none", "detail": ""}
         name = str(data.get("name") or "").strip()
         old_text = str(data.get("old_text") or "").strip()
-        new_text = str(data.get("new_text") or "").strip()
-        result = ASSETS.edit_note(name, old_text, new_text)
-        if not result:
-            append_log(f"[动作抉择] 改笔记未命中（name={name!r}, old_text={old_text[:20]!r}）")
-            return {"action": "none", "detail": ""}
+        new_text = data.get("new_text")
+        line = data.get("line")
+        if new_text is None:
+            append_log(f"[动作抉择] edit_txt 缺少 new_text，拒绝隐式删除（name={name!r}）")
+            return {"action": "none", "detail": "", "note_error": "missing_new_text"}
+        result = ASSETS.edit_note_ex(name, old_text, str(new_text).strip(), line=line)
+        if result.get("error"):
+            append_log(f"[动作抉择] 改笔记未生效（{result['error']}，name={name!r}）")
+            return {
+                "action": "none", "detail": "",
+                "note_error": result["error"],
+                "candidates": result.get("candidates") or [],
+            }
         note = ASSETS.read_note(name)
         return {
             "action": action, "detail": result["path"], "path": result["path"],
-            "note_name": os.path.splitext(os.path.basename(result["path"]))[0],
-            "old_text": old_text, "new_text": new_text,
-            "deleted": not new_text,
+            "note_name": result["name"],
+            "old_text": result["old_text"], "new_text": result["new_text"],
+            "deleted": result["deleted"],
             "note_text": (note or {}).get("text", ""),
             "truncated": bool((note or {}).get("truncated")),
+            "line": result.get("line"),
+        }
+
+    if action == "delete_txt":
+        if not note_enabled():
+            append_log("[动作抉择] 改笔记已在配置中关闭，忽略")
+            return {"action": "none", "detail": ""}
+        name = str(data.get("name") or "").strip()
+        old_text = str(data.get("old_text") or "").strip()
+        line = data.get("line")
+        result = ASSETS.delete_note_line(name, old_text=old_text or None, line=line)
+        if result.get("error"):
+            append_log(f"[动作抉择] 删除笔记行未生效（{result['error']}，name={name!r}）")
+            return {
+                "action": "none", "detail": "",
+                "note_error": result["error"],
+                "candidates": result.get("candidates") or [],
+            }
+        note = ASSETS.read_note(name)
+        return {
+            "action": action, "detail": result["path"], "path": result["path"],
+            "note_name": result["name"],
+            "old_text": result["old_text"], "new_text": "",
+            "deleted": True,
+            "note_text": (note or {}).get("text", ""),
+            "truncated": bool((note or {}).get("truncated")),
+            "line": result.get("line"),
         }
 
     if action == "read_txt":
@@ -379,7 +425,12 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
         return {
             "action": action, "detail": note["name"], "path": note["path"],
             "note_name": note["name"], "note_text": note["text"],
-            "truncated": note["truncated"], "read_only": True,
+            "truncated": note["truncated"],
+            "total_chars": note.get("total_chars"),
+            "total_lines": note.get("total_lines"),
+            "start_line": note.get("start_line"),
+            "end_line": note.get("end_line"),
+            "read_only": True,
         }
 
     return {"action": "none", "detail": ""}

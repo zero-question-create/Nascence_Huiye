@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+
+# 配置文件（只忽略敏感凭据，保留 API 读取类 + 示例框架）
+config/api_config.json
+config/qq_manifest.json
+config/__pycache__/
+
+# 运行数据（记忆、向量索引、日志等）
+data/__pycache__
+data/test
+
+# 本地 Ollama 部署（大模型二进制）
+ollama/
+
+# 运行时产物
+run/logs/
+run/control_panel.lock
+run/bat_temp.bat
+run/qt-plugins/
+run/lib/
+*.log
+debug.log
+
+# IDE
+.vscode/
+.idea/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+
+# 本地工具/代理配置
+.zcode/
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+site-packages/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

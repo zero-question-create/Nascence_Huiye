@@ -33,6 +33,8 @@ if sys.platform == "linux":
 
 from core.memory_engine import memories
 from core.memory_engine import get_model
+from core.memory_engine import log_metrics_status
+from core.memory_writer import start_default_workers, stop_default_workers
 from config.constants import BOT_NAME
 from utils.persistence import load_all_data, save_all_data, load_state, save_state, append_dialogue
 from core.cognition import generate_response
@@ -41,16 +43,24 @@ from utils.monitor import monitor_start
 
 # 批量注入函数
 def cold_start_batch_injection():
-    """批量注入冷启动记忆，用于初始化记忆库"""
+    """批量注入冷启动记忆，用于初始化记忆库。
+
+    冷启动语料默认关闭（data/cold_start_prompts.py 中的语料未导出为变量）。
+    需要种子记忆时，由使用者自行填充该文件；这里不自动注入任何身份/来历内容。
+    """
     try:
-        from data.cold_start_prompts import COLD_START_DIALOGS
-    except (ImportError, ModuleNotFoundError):
+        from data import cold_start_prompts
+    except ImportError:
         print("[冷启动] 未找到 data/cold_start_prompts.py，跳过冷启动")
+        return
+    dialogs = getattr(cold_start_prompts, "COLD_START_DIALOGS", None)
+    if not dialogs:
+        print("[冷启动] 语料未启用（需要时在 data/cold_start_prompts.py 中填充 COLD_START_DIALOGS）")
         return
     from core.memory_engine import create_memory, add_link
     from utils.dialogue_state import set_state, get_state
-    
-    for user_text, bot_text in COLD_START_DIALOGS:
+
+    for user_text, bot_text in dialogs:
         user_mem_id = create_memory(user_text, half_life=7*24*3600)
         bot_mem_id = create_memory(f"我说：{bot_text}", half_life=7*24*3600)
         add_link(user_mem_id, bot_mem_id, 0.8, "causal")
@@ -58,7 +68,7 @@ def cold_start_batch_injection():
     state = get_state()
     state["参与者"] = [BOT_NAME]
     set_state(state)
-    print(f"[冷启动] 已注入 {len(COLD_START_DIALOGS)} 条基础记忆")
+    print(f"[冷启动] 已注入 {len(dialogs)} 条基础记忆")
 
 def main():
     monitor_start()
@@ -66,6 +76,8 @@ def main():
     print(f"当前时间倍速：{clock.set_speed(144)}")
     load_all_data()
     load_state()
+    log_metrics_status()
+    start_default_workers()
     global memories
     if not memories:
         cold_start_batch_injection()
@@ -103,6 +115,7 @@ def main():
     finally:
         save_all_data()
         save_state()
+        stop_default_workers()
         print("再见。")
 
 if __name__ == "__main__":

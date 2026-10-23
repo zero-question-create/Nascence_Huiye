@@ -77,6 +77,8 @@ def _get_db():
         _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         _db_conn.execute("PRAGMA journal_mode=WAL")
         _db_conn.execute("PRAGMA synchronous=NORMAL")
+        # 与 memory_engine 的主连接共用一个库：等锁而不是立刻报 database is locked
+        _db_conn.execute("PRAGMA busy_timeout=5000")
         _db_conn.execute("""
             CREATE TABLE IF NOT EXISTS concepts (
                 id TEXT PRIMARY KEY,

@@ -95,14 +95,18 @@ class VirtualClock:
         self.session_start = time.time()
         total_virtual = self._session_virtual_base + self.total_runtime * self.speed
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            f.write(f"{self.speed}\n{total_virtual}\n{self.total_runtime}\n")
-            f.write(f"{self._sleep_done_today}\n{self._last_sleep_day}\n")
-            f.write(f"{self.state}\n{self.last_input_time}\n")
-            f.write(f"{self.qq_mode}\n")
-            offset_str = str(self._qq_real_offset) if self._qq_real_offset is not None else ""
-            f.write(f"{offset_str}\n")
-            f.write(f"{time.time()}\n")   # 第10行：保存时的真实时间
+        offset_str = str(self._qq_real_offset) if self._qq_real_offset is not None else ""
+        text = (
+            f"{self.speed}\n{total_virtual}\n{self.total_runtime}\n"
+            f"{self._sleep_done_today}\n{self._last_sleep_day}\n"
+            f"{self.state}\n{self.last_input_time}\n"
+            f"{self.qq_mode}\n"
+            f"{offset_str}\n"
+            f"{time.time()}\n"
+        )
+        # 原子写：多处（认知循环/面板/CLI）都会保存时钟，直接 open('w') 可能留下半截文件
+        from utils.atomic_io import atomic_write_text
+        atomic_write_text(STATE_FILE, text)
 
     def _load_state(self):
         if os.path.exists(STATE_FILE):

@@ -1,16 +1,19 @@
 # core/llm_interface.py
 import json
 import base64
+import hashlib
 import os
 import re
 import aiofiles
 import asyncio
 import subprocess
 import tempfile
+from collections import OrderedDict
 #import requests    # 使用网络访问链接LLM（已弃用）
 from openai import OpenAI
 import datetime
 from utils.monitor import append_log
+from utils.metrics_probe import PROBE
 from utils.dialogue_state import get_state, set_state
 
 from config.api_config import config
@@ -82,6 +85,36 @@ def get_history_context() -> str:
     append_log(result)
     return result
 
+def _record_usage(kind: str, response):
+    """记录一次 LLM 调用的 token 用量（字段存在时）。"""
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        PROBE.bump(f"tokens.{kind}.prompt", int(getattr(usage, "prompt_tokens", 0) or 0))
+        PROBE.bump(f"tokens.{kind}.completion", int(getattr(usage, "completion_tokens", 0) or 0))
+        hit = getattr(usage, "prompt_cache_hit_tokens", None)
+        miss = getattr(usage, "prompt_cache_miss_tokens", None)
+        if hit is not None:
+            PROBE.bump(f"tokens.{kind}.cache_hit", int(hit or 0))
+        if miss is not None:
+            PROBE.bump(f"tokens.{kind}.cache_miss", int(miss or 0))
+    except Exception:
+        pass
+
+
+def fingerprint_prompt(kind: str, system_prompt: str) -> str:
+    """记录静态 system prompt 的指纹，用于确认缓存前缀是否稳定。
+
+    前缀缓存的前提是“每次请求的静态段逐字节相同”。这里只统计，不修改内容；
+    指纹变化说明提示词被改过（应显式提升版本号，而不是悄悄漂移）。
+    """
+    digest = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()[:16]
+    PROBE.gauge(f"prompt.{kind}.fingerprint", digest)
+    PROBE.bump(f"prompt.{kind}.calls")
+    return digest
+
+
 def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
     """
     LLM思考模式唯一外部调用接口。
@@ -101,11 +134,15 @@ def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
     if thinking:
         kwargs["reasoning_effort"] = "high"
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    PROBE.bump("llm.calls")
     try:
-        response = client.chat.completions.create(**kwargs)
+        with PROBE.timed("llm.call_ms"):
+            response = client.chat.completions.create(**kwargs)
+        _record_usage("thinking", response)
         content = response.choices[0].message.content
         return content.strip() if content else None
     except Exception as e:
+        PROBE.bump("llm.errors")
         print(f"[API Error] {e}")
         return None
 
@@ -127,53 +164,55 @@ def decompose_input(user_input: str) -> tuple:
     state_str = json.dumps(normalized_state, ensure_ascii=False)
     now = datetime.datetime.now()
 
-    system_prompt = f"""你是{BOT_NAME}，请理解输入的话，将其转换为“我”的第一人称记忆片段，并提取检索关键词。
-拆解规则：
-1. 将句子中的代词替换为根据状态推断的确定名称，同时适当将人称进行转换（如将“我”改为“你”，将“你”改为“我”）。
-2. 每条记忆片段都是是一个完整清晰的第一人称陈述句，不限数量，但是每一条尽量简短。所有记忆片段必须明确谁说了什么、对谁说的，内容不要做任何删减。
-3. 不要凭空添加对方未说的信息，也不要修改任何细节，没有记忆需要存储则返回“无”。
-4. 关键词：从输入中提取 1-3 个原词，不做联想。
-5. 状态维护：仅更新“participants”与“topic”。
-6. 纯指令或重复的输入不需要转为记忆片段，直接跳过。
-7. 概念：把这次输入归纳成一件"发生了什么"的事，6~20字，要包含人物或对象，
-   便于日后凭它找到这段记忆（如"周圻晨在催物理作业"、"李坤运发的表情包"）。
-   若只是寒暄、无实质事件，返回空字符串。
-8. 时间指代：判断说话人是否在指向过去发生的某件事，只能从下面五个值里选一个：
-   - "latest"：指刚才、刚刚、这会儿刚发生的事
-   - "recent"：指最近、这两天、这两天发生的事
-   - "earlier"：指上次、之前、那天、更早发生的事
-   - "any"：提到过去的事但说不清具体什么时候（如"还记得吗"、"那次"）
-   - "none"：没有指向过去的任何迹象（默认）
-   注意：这里只判断意图，不要计算或输出任何日期、天数、时间点。
-9. 只根据以上提供的信息输出，不得添加未给出的内容。
+    system_prompt = f"""任务：把输入转换为“我”的第一人称记忆片段，并提取检索关键词。
+规则：
+1. 代词按当前状态换成确定名称，人称按对话关系转换（如“我”改为“你”、“你”改为“我”）。
+2. 每条记忆是完整清晰的第一人称陈述，明确谁说了什么、对谁说，不删减、不凭空添加。
+3. 纯指令、重复输入、无实质内容时不生成记忆。
+4. 关键词：从输入提取 1-3 个原词，不做联想。
+5. 概念：用 6~20 字概括“发生了什么”，包含人物或对象；寒暄无实质事件时返回空字符串。
+6. 时间指代只从 none/latest/recent/earlier/any 中选一个，不计算或输出日期。
+7. 只使用上述给出信息。
 
-输出严格只包含 JSON，字段如下：
-{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1","记忆2"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题"}}, "c":"概念名或空字符串", "t":"none"}}
+输出严格只包含 JSON：
+{{"k":["关键词1","关键词2"], "m":"store|ask|normal", "mem":["记忆1"], "s":{{"participants":["{BOT_NAME}"],"topic":"话题"}}, "c":"概念名或空字符串", "t":"none"}}
 """
 
+    history = get_history_context()
+    user_parts = [
+        f"当前状态：{state_str}",
+        f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分",
+    ]
+    if history:
+        user_parts.append(history)
+    user_parts.append(f"【输入】\n{user_input}")
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"当前对话状态：{state_str}\n现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"},
-        {"role": "system", "content": get_history_context()},
-        {"role": "user", "content": user_input}
+        {"role": "user", "content": "\n\n".join(user_parts)},
     ]
+    fingerprint_prompt("decompose", system_prompt)
 
     # 打印日志
     append_log("="*30+"发送信息"+"="*30)
     append_log(str(user_input))
 
+    PROBE.bump("llm.decompose.calls")
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=8000,
-            temperature=0.1,
-            stream=False,
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        with PROBE.timed("llm.decompose_ms"):
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                max_tokens=800,
+                temperature=0.1,
+                stream=False,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
+                timeout=30.0,
+            )
+        _record_usage("decompose", response)
         result = response.choices[0].message.content
     except Exception as e:
+        PROBE.bump("llm.decompose.errors")
         append_log(f"[API Error] {e}")
         result = None
 
@@ -258,8 +297,10 @@ def decompose_input(user_input: str) -> tuple:
         memories = [f"你告诉我，{fallback}"]
 
     # 同步搜索输入内容（测试）
-    if user_input not in keywords:
-        keywords.append(user_input)
+    # 注意：不再把整句 user_input 追加进关键词。整句会污染检索和反刍判定，
+    # 也会让缓存前缀失去稳定性；全文只作为输入文本使用。
+    if not keywords:
+        keywords = []
 
     append_log("="*30+"解析结果"+"="*30)
     append_log(f"记忆：{memories}\n模式：{mode}\n状态：{new_state}\n关键词：{keywords}\n"
@@ -330,7 +371,7 @@ def _safe_json_parse(text: str) -> dict:
     return result
 
 
-def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, pinned: list = None, timestamps: list = None, pinned_timestamps: list = None) -> dict:
+def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, pinned: list = None, timestamps: list = None, pinned_timestamps: list = None, body_state: str = None) -> dict:
     """
     根据记忆生成内心独白和发言决策。
     返回: {"say": bool, "text": str}
@@ -339,6 +380,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     - pinned: 必须保留并传给 LLM 的记忆条目（如历史对话、上一轮回复），不被关键词过滤丢弃
     - timestamps: 与 memories 对齐的真实时间戳列表；提供时按时间升序排序（越早越靠前），否则保持原顺序（最新在前）
     - pinned_timestamps: 与 pinned 对齐的时间戳列表
+    - body_state: 身体状态文本（睡前/刚醒），作为独立提示行，不写成记忆
     """
     if not memories and not pinned:
         return {"say": False, "text": ""}
@@ -422,32 +464,36 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     time_hint = f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
 
     system_prompt = (
-        f"你是{BOT_NAME}，正在思考。请根据当前浮现的记忆和情况，输出你此刻最真实的想法或独白，禁止同时输出想法和独白"
-        "以及是否应该把这句话说出来。\n\n"
+        f"你是{BOT_NAME}，正在思考。根据下面给出的记忆和情况，输出此刻的想法，并判断是否说出口。\n\n"
         "规则：\n"
-        "- 如果当前有人在对你说什么，且你想回应，'say'为true\n"
-        "- 如果只是内心自然浮现的念头、碎碎念、联想，'say'为false\n"
-        "- 'say'为false时，'text'可以是更碎片化、自由联想的内心独白\n"
-        "- 'say'为true时，'text'需要是一句简短的口语，尽量保持在20字以内，只能使用给出记忆中的词语、信息，可以适当有情绪起伏，甚至带一点吐糟或调侃，但不要过度使用比喻。避免语式重复化\n"
-        "- 每条记忆开头的[刚刚]/[几分钟前]/[N天前]等只是它的相对时间标签，仅表示这句发生在何时，不是一条新消息，也不是'又重复了一条'；多条记忆共用同一个标签（例如多个[刚刚]）说明它们属于同一时刻或同一件事，不代表事情又发生了一遍，不要据此产生'又来一遍''这是新的'之类的反应\n"
-        "- 严禁生成'又是这句''又来了''怎么又这样''每次都是这样''又没人回''说一句就消失'这类针对同一件事反复吐槽的内心话；若记忆里已出现相同或相近的内容，应视为同一件事，不要再次展开、升级或复述自己对这件事的不满\n"
-        "- 严格根据记忆，记忆片段是按照时间排序的，不知道的事情不要提及，只能使用记忆或状态中明确给出的信息\n"
-        "- 不要添加动作或神态描述，禁止使用括号补充内容\n"
-        "- 不要包含'xx说'，直接输出想法本身，你可以补充之前说的内容、提出观点或疑问，但是不可以重复自己说过的话"
-        "输出严格只包含 JSON，只输出 json，text字段只允许至多一句话：\n"
-        '{"say": true/false, "text": "..."}\n\n'
+        "- 如果有人在对你说什么，且你想回应，say 为 true；只是自然浮现的念头、联想，say 为 false\n"
+        "- say 为 true 时，text 是一句简短口语，尽量 20 字以内，只能使用给定记忆中的信息\n"
+        "- 不知道的事情不要提及，只能使用记忆或状态里明确给出的信息\n"
+        "- 不要复述记忆里已有的同一内容，也不要重复自己刚才说过的话\n"
+        "- 每条记忆开头的[刚刚]/[N天前]只是时间标签，表示这件事发生在何时，不是一条新消息\n"
+        "- 记忆按时间排序，可以直接引用、补充观点或提问，但不要添加动作、神态或括号补充\n"
+        "输出严格只包含 JSON：\n"
+        '{"say": true/false, "text": "..."}\n'
     )
 
-    user_content = f"记忆片段（按时间排序）：\n{points}\n\n请结合这些记忆和对话情况，不要复述或重复自己说过的话，也不要对同一件事反复抱怨（如'又是这句''怎么又这样''来来回回''没完没了'），把同一件事当作一次来想，输出你此刻的想法或独白。"
+    body_hint = f"【身体状态】{body_state}\n\n" if body_state else ""
+    user_content = (
+        f"{state_hint}\n{time_hint}\n\n"
+        f"{body_hint}"
+        f"记忆片段（按时间排序）：\n{points}\n\n"
+        "请结合这些记忆和对话情况，输出你此刻的想法。"
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"{state_hint}\n{time_hint}"},
-        {"role": "user", "content": user_content}
+        {"role": "user", "content": user_content},
     ]
+    fingerprint_prompt("verbalize", system_prompt)
 
     # 认知循环高频调用：只需输出一句 JSON 短句，关闭推理以大幅降低输出 token
-    reply = call_api_thinking(messages, max_tokens=8000, thinking=False)
+    PROBE.bump("llm.verbalize.calls")
+    with PROBE.timed("llm.verbalize_ms"):
+        reply = call_api_thinking(messages, max_tokens=300, thinking=False)
 
     append_log("="*30+"理解回复"+"="*30)
     append_log(reply)
@@ -467,24 +513,96 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     return {"say": True, "text": reply}
 
 
-async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁，禁止猜测或识别人物等信息，只要客观陈述") -> str:
+DEFAULT_IMAGE_PROMPT = (
+    "客观描述这张图片：主体是什么、关键可见文字有哪些，最多40字。"
+    "文字只摘录关键片段，不要逐字复述；不要猜测人物身份、关系、情绪或意图。"
+)
+DEFAULT_STICKER_PROMPT = (
+    "客观描述这个表情包：画面主体和关键文字，最多30字。"
+    "不要猜测人物身份、关系、情绪或意图。"
+)
+
+_DESC_CACHE_FILE = "data/test/media_desc_cache.json"
+_DESC_CACHE_VERSION = "v2"
+_desc_cache = OrderedDict()
+_desc_cache_lock = __import__("threading").RLock()
+
+
+def _load_desc_cache():
+    global _desc_cache
+    if _desc_cache:
+        return
+    try:
+        if os.path.exists(_DESC_CACHE_FILE):
+            with open(_DESC_CACHE_FILE, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if isinstance(value, str):
+                        _desc_cache[key] = value
+    except Exception:
+        _desc_cache = OrderedDict()
+
+
+def _save_desc_cache():
+    try:
+        os.makedirs(os.path.dirname(_DESC_CACHE_FILE), exist_ok=True)
+        tmp = _DESC_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(_desc_cache), f, ensure_ascii=False)
+        os.replace(tmp, _DESC_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _clip_desc(text: str, max_chars: int = None) -> str:
+    """清理并截断描述：去换行/引号/多余空白，在标点处截断。"""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip().strip("“”\"'` ")
+    if not max_chars or len(cleaned) <= max_chars:
+        return cleaned
+    head = cleaned[:max_chars]
+    cut = max(head.rfind(p) for p in "。！？；，、,.!?;")
+    if cut >= max_chars // 2:
+        return head[:cut].rstrip("，、,;；")
+    return head.rstrip()
+
+
+async def describe_image_from_path(image_path: str, prompt: str = None, max_chars: int = None) -> str:
+    """从本地路径读取图片，返回简短客观描述。
+
+    - 默认使用短描述提示词，max_tokens=160，temperature=0；
+    - 相同文件 + 相同提示词命中内容哈希缓存，不再调用视觉模型；
+    - max_chars 控制最终长度（图片 60、表情包 30），在标点处截断。
     """
-    从本地路径读取图片
-    """
-    # 检查文件是否存在
     if not os.path.exists(image_path):
         return f"[图片文件不存在: {image_path}]"
-    
+
+    if prompt is None:
+        prompt = DEFAULT_IMAGE_PROMPT
+    if max_chars is None:
+        try:
+            max_chars = int(config.get("image_desc_max_chars", 60))
+        except (TypeError, ValueError):
+            max_chars = 60
+
     try:
-        # 异步读取文件并转 Base64
-        loop = asyncio.get_event_loop()
         async def read_and_encode():
             async with aiofiles.open(image_path, "rb") as f:
                 data = await f.read()
-                return base64.b64encode(data).decode('utf-8')
-        
-        base64_str = await read_and_encode()
-        # 推测 MIME 类型（根据扩展名）
+                return data, base64.b64encode(data).decode('utf-8')
+
+        raw_bytes, base64_str = await read_and_encode()
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        cache_key = f"{_DESC_CACHE_VERSION}|{digest}|{prompt}|{max_chars}"
+
+        _load_desc_cache()
+        with _desc_cache_lock:
+            cached = _desc_cache.get(cache_key)
+            if cached:
+                _desc_cache.move_to_end(cache_key)
+                PROBE.bump("vision.cache_hit")
+                return cached
+
         ext = os.path.splitext(image_path)[1].lower()
         mime_map = {
             '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -492,33 +610,55 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
             '.webp': 'image/webp', '.bmp': 'image/bmp'
         }
         mime_type = mime_map.get(ext, 'image/jpeg')
-        
-        # 调用 API
-        response = client_.chat.completions.create(
-            model=MODEL_,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
+
+        PROBE.bump("vision.calls")
+        with PROBE.timed("vision.ms"):
+            response = await asyncio.to_thread(
+                lambda: client_.chat.completions.create(
+                    model=MODEL_,
+                    messages=[
                         {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_str}"
-                            }
-                        },
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime_type};base64,{base64_str}"
+                                    }
+                                },
+                            ],
+                        }
                     ],
-                }
-            ],
-            stream=False,
-            max_tokens=10000,
-        )
+                    stream=False,
+                    max_tokens=160,
+                    temperature=0,
+                    timeout=30.0,
+                )
+            )
+        _record_usage("vision", response)
         content = response.choices[0].message.content
-        reply = content.strip() if content else ""
+        reply = _clip_desc(content or "", max_chars)
         append_log("="*30+"多模态理解"+"="*30)
         append_log(reply)
+        PROBE.record_ms("vision.desc_chars", len(reply))
+
+        try:
+            with _desc_cache_lock:
+                _desc_cache[cache_key] = reply
+                _desc_cache.move_to_end(cache_key)
+                try:
+                    limit = max(1, int(config.get("media_desc_cache_size", 500)))
+                except (TypeError, ValueError):
+                    limit = 500
+                while len(_desc_cache) > limit:
+                    _desc_cache.popitem(last=False)
+                _save_desc_cache()
+        except Exception:
+            pass
         return reply
     except Exception as e:
+        PROBE.bump("vision.errors")
         return f"[图片识别失败: {e}]"
 
 async def describe_audio_from_path(audio_path: str, prompt: str = "请描述这段音频内容") -> str:
@@ -558,11 +698,14 @@ async def _describe_media_from_path(file_path: str, media_type: str, prompt: str
                 {"type": "video_url", "video_url": {"url": f"data:{mime_type};base64,{base64_str}"}},
             ]
 
-        response = client_.chat.completions.create(
-            model=MODEL_,
-            messages=[{"role": "user", "content": content}],
-            stream=False,
-            max_tokens=10000,
+        response = await asyncio.to_thread(
+            lambda: client_.chat.completions.create(
+                model=MODEL_,
+                messages=[{"role": "user", "content": content}],
+                stream=False,
+                max_tokens=200,
+                timeout=60.0,
+            )
         )
         response_content = response.choices[0].message.content
         reply = response_content.strip() if response_content else ""

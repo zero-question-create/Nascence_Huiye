@@ -65,9 +65,10 @@ if sys.platform == "linux":
 
 from core.llm_interface import describe_image_from_path, describe_audio_from_path, describe_video_from_path, decompose_input
 from utils.event_bus import BUS
+from utils.metrics_probe import PROBE
 
 # 导入你现有的核心模块
-from core.cognition import inject_message_keywords, cognitive_loop, extract_keywords_jieba
+from core.cognition import inject_message_keywords, inject_keywords, cognitive_loop, extract_keywords_jieba, MODE_HALF_LIFE
 from core.memory_engine import create_memory, access_memory, pathfind_activation, retrieve_similar, memories
 from core.virtual_clock import clock
 from core.biorhythm import BIORHYTHM
@@ -225,9 +226,12 @@ def extract_quote_message_id(message_segments: List[Dict]) -> Optional[str]:
     return None
 
 async def drift_loop():
-    """后台发散任务：持续驱动生物钟，并随机激活记忆以强化半衰期、提供热身种子，定时执行冷热下沉"""
+    """后台发散任务：持续驱动生物钟，并随机激活记忆以强化半衰期、提供热身种子。
+
+    冷热下沉统一由 MemoryWriter / HotSetPlanner 负责（见 core/memory_writer.py），
+    这里不再重复调度，避免同一份淘汰工作被三处同时触发。
+    """
     logger.info("[浅层意识] 发散任务已启动")
-    last_eviction_time = time.time()
     while True:
         # 由生物钟自行判定入睡/醒来（不再依赖固定钟点）
         BIORHYTHM.tick()
@@ -236,15 +240,10 @@ async def drift_loop():
         elif not BIORHYTHM.is_asleep() and _sleeping:
             wake_up()
 
-        # 定时下沉：每 10 分钟检查一次，将超出上限的最久未访问记忆与链接下沉至 SQLite
+        # 素材暂存清理：与记忆无关，仍在这里按分钟级节流
         now = time.time()
-        if now - last_eviction_time >= 600:
-            last_eviction_time = now
-            try:
-                from core.memory_engine import periodic_cold_eviction
-                periodic_cold_eviction()
-            except Exception as e:
-                logger.error(f"[定时下沉] 执行异常: {e}")
+        if now - getattr(drift_loop, "_last_cleanup", 0.0) >= 600:
+            drift_loop._last_cleanup = now
             try:
                 from core.asset_library import cleanup_pending
                 cleanup_pending()
@@ -263,11 +262,17 @@ async def drift_loop():
         logger.info(f"[浅层意识] 激活记忆 {mem_id[:8]}...")
 
 def is_sleeping() -> bool:
-    """判断当前是否处于睡眠状态（由生物钟判定）"""
+    """判断当前是否处于睡眠状态（由生物钟唯一判定）。
+
+    历史问题：此前是 `_sleeping or BIORHYTHM.is_asleep()`，而 _sleeping 要等
+    drift_loop 下一轮（最多 30 秒）才被清掉。认知循环自己 tick 到醒来后，
+    这 30 秒里所有发送都会被误拦，表现为“醒了但话发不出去”。
+    现在以生物钟为唯一权威，_sleeping 只做镜像，供日志与面板观测。
+    """
     global _sleeping
-    if _sleeping:
-        return True
-    return BIORHYTHM.is_asleep()
+    asleep = BIORHYTHM.is_asleep()
+    _sleeping = asleep
+    return asleep
 
 def enter_sleep():
     """进入睡眠状态。
@@ -342,16 +347,198 @@ def _sleep_maintenance_bg():
         logger.error(f"[睡眠维护] 执行失败: {e}")
 
 # ---------- 消息处理核心 ----------
+# ---------- message_id 幂等 ----------
+# NapCat 在重连、重试或事件重复投递时会把同一条消息再发一遍。
+# 以 message_id 做短时效幂等，避免重复下载媒体、重复视觉调用、重复理解层。
+_seen_message_ids = deque(maxlen=500)
+_seen_message_id_set = set()
+_SEEN_MESSAGE_TTL = 600.0
+_seen_message_ts = {}
+
+
+def _message_id_of(data: dict) -> str:
+    value = data.get("message_id")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _is_duplicate_message(message_id: str) -> bool:
+    """同一条消息只处理一次。返回 True 表示应跳过。"""
+    if not message_id:
+        return False
+    now = time.time()
+    # 清理过期
+    while _seen_message_ids:
+        old = _seen_message_ids[0]
+        if now - _seen_message_ts.get(old, 0) <= _SEEN_MESSAGE_TTL:
+            break
+        _seen_message_ids.popleft()
+        _seen_message_id_set.discard(old)
+        _seen_message_ts.pop(old, None)
+    if message_id in _seen_message_id_set:
+        return True
+    _seen_message_ids.append(message_id)
+    _seen_message_id_set.add(message_id)
+    _seen_message_ts[message_id] = now
+    return False
+
+
+def _text_from_segments(message_segments) -> str:
+    """从结构化消息段还原正文（raw_message 为空或只有 CQ 码时兜底）。"""
+    if not isinstance(message_segments, list):
+        return ""
+    parts = []
+    for seg in message_segments:
+        if not isinstance(seg, dict):
+            continue
+        if seg.get("type") == "text":
+            text = seg.get("data", {}).get("text")
+            if text:
+                parts.append(str(text))
+    return "".join(parts).strip()
+
+
+def _media_phrase(media_type: str, desc: str) -> str:
+    """把媒体类型+描述渲染成自然短语（历史与增强输入共用，保证口径一致）。"""
+    if media_type == "sticker":
+        return f"一个表情包，内容是“{desc}”"
+    if media_type == "image":
+        return f"一张图片，内容是“{desc}”"
+    if media_type == "record":
+        return f"一段录音，内容是“{desc}”"
+    return f"一个视频，内容是“{desc}”"
+
+
+def _attach_media_memory_ids(media_list: list, memory_ids: list, media_refs: list = None):
+    """把本轮纯媒体记忆的 ID 回填到对应的暂存条目上。
+
+    动作层决定收藏时，需要这条 ID 才能在“图片记忆”和“我收藏了…”之间
+    直接建因果边，让收藏贴着原图，而不是散落在记忆图别处。
+
+    media_refs 与 media_list 一一对应（mface 这类没有暂存的条目为 None）；
+    不用 pending 列表的尾部切片——中途可能有别的消息登记了新的暂存条目。
+    """
+    if not memory_ids or not media_refs:
+        return
+    try:
+        from core import asset_library as ASSETS
+        for ref, mem_id in zip(media_refs, memory_ids):
+            if not ref:
+                continue
+            ASSETS.set_pending_memory_ids(ref, [mem_id])
+    except Exception as e:
+        logger.debug(f"媒体记忆 ID 回填失败: {e}")
+
+
+# ---------- 回应目标 ----------
+# 最近一条等待回应的消息作者。认知循环发言时据此决定是否 @ 回去。
+_reply_target = None          # {"group_id","qq","name","message_id","ts","mention_me"}
+_REPLY_TARGET_TTL = 180.0     # 3 分钟内的消息才视为“正在回应”
+_last_at_time = {}            # {(group_id, qq): 上次 @ 的时间}，防刷屏
+
+
+def _remember_reply_target(group_id: str, qq: str, name: str, message_id: str, mention_me: bool = False):
+    """记录本轮消息的回应目标（供认知循环 @ 使用）。"""
+    global _reply_target
+    _reply_target = {
+        "group_id": str(group_id),
+        "qq": str(qq),
+        "name": str(name or ""),
+        "message_id": message_id,
+        "ts": time.time(),
+        "mention_me": bool(mention_me),
+    }
+
+
+def take_reply_target(mention_only: bool = False) -> dict | None:
+    """取出最近的回应目标；过期或不符合条件时返回 None。
+
+    mention_only=True 时只返回“直接 @ 了机器人”的目标——普通群聊不主动 @ 人。
+    """
+    target = _reply_target
+    if not target:
+        return None
+    if time.time() - target.get("ts", 0) > _REPLY_TARGET_TTL:
+        return None
+    if mention_only and not target.get("mention_me"):
+        return None
+    return dict(target)
+
+
+def _at_cooldown_ok(group_id: str, qq: str, cooldown: float = 30.0) -> bool:
+    """同一个人 30 秒内最多被 @ 一次，避免连续回复时刷屏。"""
+    key = (str(group_id), str(qq))
+    now = time.time()
+    last = _last_at_time.get(key, 0.0)
+    if now - last < cooldown:
+        return False
+    _last_at_time[key] = now
+    return True
+
+
+def _resolve_at_mentions(text: str, group_id: str) -> tuple:
+    """把文本里的 @名字 解析成 OneBot at 消息段所需的信息。
+
+    只在名字命中群成员映射（含昵称）时才转换；未知名字保持原文，
+    绝不猜测 QQ 号。邮箱、URL、代码块里的 @ 一律忽略。
+
+    返回 (qq_list, cleaned_text)。
+    """
+    if not text or "@" not in text:
+        return [], text
+    mapping = manifest.name_map.get(str(group_id), {}) or {}
+    if not mapping:
+        return [], text
+
+    name_to_qq = {}
+    for qq, name in mapping.items():
+        if name:
+            name_to_qq[str(name)] = str(qq)
+
+    resolved = []
+    cleaned = text
+    # 用“@名字”最长匹配，避免 “@小王” 抢先匹配 “@小王同学” 的前缀
+    for name in sorted(name_to_qq, key=len, reverse=True):
+        token = f"@{name}"
+        if token not in cleaned:
+            continue
+        pattern = re.escape(token) + r"(?![0-9A-Za-z_\u4e00-\u9fff])"
+        if not re.search(pattern, cleaned):
+            continue
+        qq = name_to_qq[name]
+        if qq == get_bot_qq() or qq == "all":
+            continue
+        resolved.append(qq)
+        cleaned = re.sub(pattern, "", cleaned, count=1)
+    return resolved, cleaned.strip()
+
+
 async def handle_group_message(data: dict):
     """处理单条群消息
 
     睡眠期间的策略：未被 @ 的消息直接忽略；被 @ 则唤醒后正常回应。
     """
+    import time as _time
+    _started = _time.perf_counter()
+    try:
+        await _handle_group_message_impl(data)
+    finally:
+        PROBE.record_ms("message.handle_ms", (_time.perf_counter() - _started) * 1000.0)
+
+
+async def _handle_group_message_impl(data: dict):
     group_id = str(data.get("group_id"))
     
     # 白名单过滤
     if group_id not in manifest.whitelist:
         logger.debug(f"群 {group_id} 不在白名单，忽略")
+        return
+
+    # 幂等：同一条消息重复投递时直接跳过，避免重复媒体下载与 LLM 调用
+    message_id = _message_id_of(data)
+    if _is_duplicate_message(message_id):
+        logger.info(f"重复消息已跳过（message_id={message_id}）")
         return
 
     # 记录外部活动：作息惯性靠"安静多久"判断是否容易入睡。
@@ -381,6 +568,16 @@ async def handle_group_message(data: dict):
 
     raw_str = data.get("raw_message", "")
     clean_text, mentions = parse_cq_code(raw_str)
+    # raw_message 可能只含 CQ 码（体积消息、多段消息），此时从结构化消息段补回正文。
+    # 否则文本+图片的复合消息会被误判成“纯媒体”，正文永久丢失。
+    segment_text = _text_from_segments(data.get("message", []))
+    if not clean_text and segment_text:
+        clean_text, seg_mentions = parse_cq_code(segment_text)
+        for qq in seg_mentions:
+            if qq not in mentions:
+                mentions.append(qq)
+        if not clean_text:
+            clean_text = segment_text
 
     # 从结构化 message 数组补充 @ 目标（处理 NapCat 未以标准 CQ 码上报或多段消息）
     for seg in data.get("message", []):
@@ -430,7 +627,44 @@ async def handle_group_message(data: dict):
             return
 
     # 多模态处理
+    # 媒体描述改为并发执行（最多 2 个），避免一条多图消息串行等待视觉模型；
+    # 同时保持 media_list 顺序与消息段顺序一致。
     media_list = []  # 收集 (type, description)
+    media_refs = []  # 与 media_list 对齐的暂存引用（无暂存时为 None）
+    media_tasks = [] # [(order, coroutine)]
+    _media_sem = asyncio.Semaphore(2)
+    _MAX_MEDIA_DESC = 3   # 单条消息最多描述 3 个媒体段，其余只记数量
+
+    async def _describe_one(order, seg_type, seg_data, tmp_path, file_format, owns_tmp_path):
+        try:
+            async with _media_sem:
+                if seg_type == "image":
+                    chk_gif = file_format == "gif"
+                    chk_mface = bool(seg_data.get("emoji_id") or seg_data.get("emoji_package_id") or seg_data.get("key"))
+                    chk_summary = "表情" in str(seg_data.get("summary") or "")
+                    chk_subtype = str(seg_data.get("sub_type")) == "1"
+                    is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
+                    media_type = "sticker" if is_sticker else "image"
+                    if is_sticker and seg_data.get("summary") and not chk_gif:
+                        # 商城表情包有官方摘要时优先用摘要，省掉一次视觉调用
+                        desc = str(seg_data.get("summary") or "").strip()
+                        desc = desc[:30]
+                    else:
+                        max_chars = 30 if is_sticker else 60
+                        desc = await describe_image_from_path(tmp_path, max_chars=max_chars)
+                    if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
+                        desc = seg_data.get("summary") or "表情包"
+                elif seg_type == "record":
+                    media_type = "record"
+                    desc = await describe_audio_from_path(tmp_path)
+                else:
+                    media_type = "video"
+                    desc = await describe_video_from_path(tmp_path)
+                return (order, media_type, desc, tmp_path, owns_tmp_path)
+        except Exception as e:
+            logger.warning(f"处理媒体失败: {e}")
+            return (order, None, None, tmp_path, owns_tmp_path)
+
     for seg in data.get("message", []):
         seg_type = seg.get("type")
         if seg_type not in ("image", "record", "video", "mface"):
@@ -440,7 +674,12 @@ async def handle_group_message(data: dict):
         if seg_type == "mface":
             # 商城表情包（NapCat 直报 mface）：无可下载媒体，直接用摘要描述
             summary = seg_data.get("summary") or seg_data.get("key") or "商城表情包"
-            media_list.append(("sticker", summary))
+            media_list.append(("sticker", str(summary)[:30]))
+            media_refs.append(None)
+            continue
+
+        # 超出描述上限的媒体不再下载：只记录数量，避免一条消息打爆视觉调用
+        if len(media_tasks) + len(media_list) >= _MAX_MEDIA_DESC:
             continue
 
         # NapCat 常直接给出本地文件路径（QQ 缓存目录）。命中时优先复制本地文件，
@@ -529,47 +768,43 @@ async def handle_group_message(data: dict):
                             owns_tmp_path = True
             else:
                 tmp_path = str(file_url)
-
-            if seg_type == "image":
-                # 表情包判定（多路并列）：
-                # 1. GIF 动画图
-                # 2. NapCat 将商城表情以 image 上报时附带 emoji_id/emoji_package_id/key 字段
-                # 3. summary 含"表情"字样（如 "[动画表情]"）
-                # 4. sub_type == 1（OneBot 图片子类型 1 = 表情包）
-                chk_gif = file_format == "gif"
-                chk_mface = bool(seg_data.get("emoji_id") or seg_data.get("emoji_package_id") or seg_data.get("key"))
-                chk_summary = "表情" in str(seg_data.get("summary") or "")
-                chk_subtype = str(seg_data.get("sub_type")) == "1"
-                is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
-                media_type = "sticker" if is_sticker else "image"
-                desc = await describe_image_from_path(tmp_path)
-                if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
-                    desc = seg_data.get("summary") or "表情包"
-            elif seg_type == "record":
-                media_type = "record"
-                desc = await describe_audio_from_path(tmp_path)
-            else:
-                media_type = "video"
-                desc = await describe_video_from_path(tmp_path)
-            if desc:
-                media_list.append((media_type, desc))
-                # 图片/表情包登记为暂存，供本轮动作抉择决定是否收藏
-                if media_type in ("image", "sticker"):
-                    try:
-                        from core.asset_library import register_pending
-                        ref = register_pending(media_type, tmp_path, desc)
-                        if ref:
-                            logger.info(f"媒体已登记暂存（{ref}）: {desc[:30]}")
-                    except Exception as e:
-                        logger.warning(f"登记暂存媒体失败: {e}")
         except Exception as e:
-            logger.warning(f"处理媒体失败: {e}")
-        finally:
+            logger.warning(f"媒体准备失败: {e}")
+            if tmp_path and owns_tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            continue
+
+        media_tasks.append(_describe_one(len(media_tasks), seg_type, seg_data, tmp_path, file_format, owns_tmp_path))
+
+    if media_tasks:
+        described = await asyncio.gather(*media_tasks)
+        for _order, media_type, desc, tmp_path, owns_tmp_path in sorted(described, key=lambda x: x[0]):
+            if not media_type or not desc:
+                continue
+            media_list.append((media_type, desc))
+            ref = None
+            # 图片/表情包登记为暂存，供本轮动作抉择决定是否收藏
+            # （必须在临时文件删除之前登记：暂存会复制一份副本）
+            if media_type in ("image", "sticker"):
+                try:
+                    from core.asset_library import register_pending
+                    ref = register_pending(media_type, tmp_path, desc)
+                    if ref:
+                        logger.info(f"媒体已登记暂存（{ref}）: {desc[:30]}")
+                except Exception as e:
+                    logger.warning(f"登记暂存媒体失败: {e}")
+            media_refs.append(ref)
             if tmp_path and owns_tmp_path:
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     logger.info(f"临时文件删除失败，请及时清理：{tmp_path}")
+
+    # 媒体描述异步执行，期间事件循环仍在处理其他消息；这里更新探针便于观测
+    PROBE.bump("message.media_count", len(media_list))
 
     # 若为纯多媒体消息（无正文文字），向事件总线广播媒体摘要供面板显示
     if not clean_text and media_list:
@@ -617,6 +852,13 @@ async def handle_group_message(data: dict):
         old_key = _recent_msg_list.pop(0)
         _recent_msg_set.discard(old_key)
 
+    # 空消息守卫：既无正文、也无媒体、也没有 @ 任何人的事件（如撤回、系统提示）
+    # 直接丢弃，绝不把“（没有说话）”送进理解层浪费一次 LLM。
+    if not clean_text and not media_list and not mentions and not is_mentioned_me:
+        logger.debug(f"空消息（无文本/无媒体/无@），已忽略: sender={sender_name}")
+        PROBE.bump("message.empty_dropped")
+        return
+
     # 纯@无文本（且无多媒体）→ 简单回复，记录对话并通知，不存入深层记忆
     if is_mentioned_me and not clean_text and not media_list and not mentions:
         # 判断是否处于刚被吵醒的迷糊锁定状态
@@ -632,7 +874,12 @@ async def handle_group_message(data: dict):
                 "怎么啦？我在这呢。",
                 "在的，找我有什么事吗？"
             ])
-        await send_group_msg(group_id, wake_reply)
+        # 被叫的人就在这一句里，直接 @ 回去，避免对方不知道在跟谁说话。
+        # 兼容旧发送签名：自定义/测试发送函数可能不接受 at_qq，退化为不带 @ 发送。
+        try:
+            await send_group_msg(group_id, wake_reply, at_qq=sender_id)
+        except TypeError:
+            await send_group_msg(group_id, wake_reply)
         from core.llm_interface import add_to_history
         add_to_history(sender_name, "（叫了辉夜一声）", wake_reply, "QQ", target=BOT_NAME)
         BUS.message.emit(BOT_NAME, wake_reply, "QQ")
@@ -658,34 +905,73 @@ async def handle_group_message(data: dict):
     from utils.dialogue_state import set_state
     from utils.persistence import save_state
 
+    # 记录本轮的回应目标：被 @ 时直接 @ 回发送者；其余情况不主动 @。
+    # 认知循环发言时从这里取“最近一条待回应的目标”。
+    _remember_reply_target(group_id, sender_id, sender_name, message_id, mention_me=is_mentioned_me)
+
+    media_text = "、".join(_media_phrase(m_type, d) for m_type, d in media_list)
+
+    user_mem_ids = []
+    # ========== 纯媒体快捷路径 ==========
+    # 没有正文的图片/表情包无需走理解层：视觉描述已经是完整信息。
+    # 这里直接写记忆 + 提取关键词，省掉一次 LLM 调用与一轮“（没有说话）”垃圾记忆。
+    if media_list and not clean_text:
+        half_life = 2 * 24 * 3600
+        target_clause = f"对{target_name}" if target_name else ""
+        for m_type, desc in media_list:
+            frag = f"{sender_name}{target_clause}发送了{_media_phrase(m_type, desc)}"
+            try:
+                user_mem_ids.append(create_memory(frag, half_life=half_life))
+            except Exception as e:
+                logger.warning(f"媒体记忆写入失败: {e}")
+        media_keywords = extract_keywords_jieba(media_text)
+        if media_keywords:
+            from core.cognition import inject_keywords
+            inject_keywords(media_keywords, "media")
+        # 媒体描述对应的记忆 ID 回填给暂存条目：收藏时据此贴近原图建链
+        _attach_media_memory_ids(media_list, user_mem_ids, media_refs)
+        history_content = f"（发送了{media_text}）"
+        add_to_history(sender_name, history_content, None, "QQ", quote=quote_info, target=target_name)
+        logger.info(f"纯媒体消息：0 次理解层，记忆入库 {len(user_mem_ids)} 条")
+        BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
+        return
+
     full_input = augmented_input
     if extra_context:
         full_input = f"{extra_context}\n{augmented_input}"
 
-    # ========== 理解层：将用户输入拆解为记忆片段（关键词改用 jieba）==========
-    mem_fragments, mode, new_state, _keywords, concept, time_intent = decompose_input(full_input)
+    # ========== 理解层：在解析单线程里执行，保证消息顺序且不阻塞事件循环 ==========
+    from core.parse_worker import run_in_parse_worker
+
+    def _parse_pipeline():
+        """理解层 + 记忆入库 + 概念归档，整段在解析线程里串行执行。
+
+        返回 (mem_fragments, mode, new_state, keywords, concept, time_intent, mem_ids)
+        """
+        fragments, parsed_mode, parsed_state, parsed_kws, parsed_concept, parsed_time = decompose_input(full_input)
+        from core.memory_engine import create_memory as _create
+        mem_ids = []
+        life = MODE_HALF_LIFE.get(parsed_mode, 2 * 24 * 3600)
+        for frag in fragments:
+            try:
+                mem_ids.append(_create(frag, half_life=life))
+            except Exception as exc:
+                logger.warning(f"记忆写入失败: {exc}")
+        if parsed_concept and mem_ids:
+            try:
+                from core.concept_store import record_concept
+                record_concept(parsed_concept, mem_ids)
+            except Exception as exc:
+                logger.warning(f"概念层写入失败: {exc}")
+        return fragments, parsed_mode, parsed_state, parsed_kws, parsed_concept, parsed_time, mem_ids
+
+    (mem_fragments, mode, new_state, llm_keywords,
+     concept, time_intent, user_mem_ids) = await run_in_parse_worker(_parse_pipeline)
 
     # 更新对话状态（写 JSON，轻量，保持原位）
     if new_state:
         set_state(new_state)
         save_state()
-
-    # 记忆入库（不去重）
-    from core.cognition import MODE_HALF_LIFE
-    half_life = MODE_HALF_LIFE.get(mode, 2 * 24 * 3600)
-    user_mem_ids = []
-    for frag in mem_fragments:
-        mid = create_memory(frag, half_life=half_life)
-        user_mem_ids.append(mid)
-
-    # 归入概念层：把本轮记忆挂到概念下，供日后定向检索与时间回溯。
-    # 概念抽不出来时不建概念，该批记忆仍走原有向量检索。
-    if concept and user_mem_ids:
-        try:
-            from core.concept_store import record_concept
-            record_concept(concept, user_mem_ids)
-        except Exception as e:
-            logger.warning(f"概念层写入失败: {e}")
 
     # 时间指代：交给认知循环，供概念路做时间窗筛选（不做词表解析）
     if time_intent and time_intent != "none":
@@ -695,32 +981,39 @@ async def handle_group_message(data: dict):
         except Exception as e:
             logger.warning(f"时间指代注入失败: {e}")
 
-    # 将关键词注入认知循环：直接对收到的消息 jieba 分词（搜索引擎模式）
-    msg_keywords = extract_keywords_jieba(clean_text)
-    if msg_keywords:
-        inject_message_keywords(msg_keywords)
+    # 将关键词追加进信箱：LLM 提取词 + 正文 jieba 词 + 媒体描述词
+    # （旧实现丢弃了 LLM 关键词、只用 jieba；这里两者合并，来源可追溯）
+    from core.cognition import inject_keywords
+    merged_keywords = []
+    for kw in (llm_keywords or []):
+        text = str(kw or "").strip()
+        if text:
+            merged_keywords.append(text)
+    for kw in extract_keywords_jieba(clean_text):
+        if kw not in merged_keywords:
+            merged_keywords.append(kw)
+    for kw in extract_keywords_jieba(media_text):
+        if kw not in merged_keywords:
+            merged_keywords.append(kw)
+    if merged_keywords:
+        inject_keywords(merged_keywords, "msg")
+        # 兼容旧入口（也进消费队列；信箱合并时会按内容去重）
+        inject_message_keywords(merged_keywords)
 
     # 记录用户消息到对话历史（回复由 cognitive_loop 异步补充）
     # 引用与提及对象以结构化字段随消息保存，短期上下文才能还原"对谁说/在回应什么"
     history_content = clean_text.strip()
     if media_list:
-        media_desc = "、".join(
-            f"一个表情包，内容是“{d}”" if m_type == "sticker" else
-            f"一张图片，内容是“{d}”" if m_type == "image" else
-            f"一段录音，内容是“{d}”" if m_type == "record" else
-            f"一个视频，内容是“{d}”"
-            for m_type, d in media_list
-        )
         if history_content:
-            history_content = f"{history_content}（发送了{media_desc}）"
+            history_content = f"{history_content}（发送了{media_text}）"
         else:
-            history_content = f"（发送了{media_desc}）"
+            history_content = f"（发送了{media_text}）"
     elif not history_content:
         history_content = "（没有说话）"
 
     add_to_history(sender_name, history_content, None, "QQ", quote=quote_info, target=target_name)
 
-    logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，jieba关键词: {msg_keywords}")
+    logger.info(f"理解层完成，记忆入库 {len(user_mem_ids)} 条，关键词: {merged_keywords}")
     BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
 
 SEND_ACK_TIMEOUT = 5.0   # 等待 NapCat 回执的秒数；超时即视为未送达
@@ -753,11 +1046,13 @@ async def _send_action_and_wait(websocket, payload: dict, echo: str) -> bool:
         _pending_actions.pop(echo, None)
 
 
-async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None) -> bool:
+async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None, at_qq=None) -> bool:
     """
-    发送群消息，支持引用回复。
+    发送群消息，支持引用回复与 @。
 
     reply_msg_id: 被引用消息的 message_id（整数）
+    at_qq: 要 @ 的 QQ 号（单个字符串/整数，或多个的列表）。
+           只接受数字 QQ；机器人自己与 "all" 会被剥离。
     返回：是否确认送达（NapCat 回执 status=ok 才算成功）
 
     调用方必须依据返回值决定是否记入历史：此前无条件记"我说"，
@@ -771,25 +1066,53 @@ async def send_group_msg(group_id: str, text: str, reply_msg_id: int = None) -> 
         logger.error("消息发送失败：当前没有连接的 NapCat WebSocket")
         return False
 
-    message_content = text
-    if reply_msg_id is not None:
-        message_content = f"[CQ:reply,id={reply_msg_id}]{text}"
+    # 文本中的 @名字 先解析成 at 段（只认群成员映射，绝不猜 QQ 号）
+    parsed_at, text = _resolve_at_mentions(str(text or ""), group_id)
+    # 只 @ 不说话时 NapCat 容易拒绝空文本段：给一个空格兜底
+    if not text and parsed_at:
+        text = " "
+
+    # 显式 at_qq 与文本解析出的 @ 合并去重
+    at_list = list(parsed_at)
+    if at_qq is not None:
+        candidates = at_qq if isinstance(at_qq, (list, tuple, set)) else [at_qq]
+        for item in candidates:
+            qq = str(item or "").strip()
+            if not qq or qq == get_bot_qq() or qq == "all":
+                continue
+            if not qq.isdigit():
+                continue
+            if qq not in at_list:
+                at_list.append(qq)
 
     global _action_counter
     _action_counter += 1
     echo = f"nascence-send-{_action_counter}"
+
+    if reply_msg_id is not None or at_list:
+        # 结构化消息段：引用 + @ + 正文。比 CQ 码更稳，也避免正文里出现 CQ 语法时被误解析。
+        segments = []
+        if reply_msg_id is not None:
+            segments.append({"type": "reply", "data": {"id": str(reply_msg_id)}})
+        for qq in at_list:
+            segments.append({"type": "at", "data": {"qq": qq}})
+        segments.append({"type": "text", "data": {"text": (" " if at_list else "") + text}})
+        message_payload = segments
+    else:
+        message_payload = text
+
     payload = {
         "action": "send_group_msg",
         "params": {
             "group_id": int(group_id),
-            "message": message_content,
+            "message": message_payload,
         },
         "echo": echo,
     }
 
     ok = await _send_action_and_wait(websocket, payload, echo)
     if ok:
-        logger.info(f"已发送并确认送达（echo={echo}，引用={reply_msg_id}）: {text}")
+        logger.info(f"已发送并确认送达（echo={echo}，引用={reply_msg_id}，@={at_list}）: {text}")
         from core.memory_engine import _bump_message_sent, _bump_self_ref
         _bump_message_sent()
         if "我" in text:
@@ -1039,17 +1362,38 @@ async def start_server():
 
     # ========== 后台定时保存任务 ==========
     async def auto_save():
-        """每10分钟自动保存一次记忆和状态"""
+        """每10分钟自动保存一次记忆和状态。
+
+        下沉不再在这里先做一遍：热集淘汰由 HotSetPlanner 定时规划、
+        MemoryWriter 统一落库，这里只负责保存快照。
+        """
         while True:
             try:
                 await asyncio.sleep(600)  # 10分钟
                 from utils.persistence import save_all_data, save_state
-                from core.memory_engine import _evict_cold_memories, _evict_cold_links
-                _evict_cold_memories()
-                _evict_cold_links()
+                from core.memory_writer import PLANNER
+                # 应用规划器算好的淘汰名单（若期间条目被访问，CAS 会跳过）
+                try:
+                    PLANNER.apply_plan(PLANNER.take_plan())
+                except Exception as e:
+                    logger.error(f"[定时下沉] 应用淘汰计划失败: {e}")
                 save_all_data()
                 save_state()
-                logger.info("定时保存与冷数据下沉完成")
+                logger.info("定时保存完成")
+                try:
+                    from utils.metrics_probe import PROBE
+                    snap = PROBE.snapshot()
+                    counters = snap.get("counters", {})
+                    logger.info(
+                        "[观测] LLM调用=%s 视觉=%s(缓存命中%s) 事件循环阻塞p95=%sms 锁等待p95=%sms",
+                        counters.get("llm.calls", 0),
+                        counters.get("vision.calls", 0),
+                        counters.get("vision.cache_hit", 0),
+                        snap.get("timings", {}).get("message.handle_ms", {}).get("p95_ms", 0),
+                        snap.get("timings", {}).get("lock.data.wait", {}).get("p95_ms", 0),
+                    )
+                except Exception:
+                    pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1150,6 +1494,17 @@ async def start_server():
             # 关停的最后一次保存必须落盘，绕过节流
             save_all_data(force=True)
             save_state()
+            # 写者/规划器/解析线程收尾：stop 会清空队列并等待 commit
+            try:
+                from core.memory_writer import stop_default_workers
+                stop_default_workers()
+            except Exception as e:
+                logger.warning(f"[服务停止] 记忆写者关闭失败: {e}")
+            try:
+                from core.parse_worker import stop_parse_worker
+                stop_parse_worker()
+            except Exception:
+                pass
             logger.info("最终保存：记忆和状态已持久化")
 
 # ---------- 启动入口 ----------
@@ -1161,6 +1516,8 @@ if __name__ == "__main__":
         from core.virtual_clock import clock
         from main import cold_start_batch_injection
         from utils.monitor import monitor_start
+        from core.memory_engine import log_metrics_status
+        from core.memory_writer import start_default_workers
 
         # 设置时间倍速（1倍）
         clock.enable_qq_mode()
@@ -1175,6 +1532,8 @@ if __name__ == "__main__":
         # 加载记忆和状态
         load_all_data()
         load_state()
+        log_metrics_status()
+        start_default_workers()
 
         # 加载短期对话历史
         from core.llm_interface import load_dialogue_history

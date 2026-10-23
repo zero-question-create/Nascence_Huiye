@@ -47,6 +47,62 @@ _shallow_pool = deque(maxlen=20)             # 浅层意识池
 _cognitive_running = False                   # 循环运行状态
 _graceful_stop = False                       # 优雅停止标志（完成当前轮，不复搜）
 
+
+class KeywordMailbox:
+    """关键词信箱：本轮在用的关键词 + 待并入的关键词。
+
+    旧实现每轮用新批次**替换** current_keywords，导致上一轮还在进行的
+    话题被瞬间丢掉。这里改为“追加合并”：新消息、上一轮回复、媒体描述
+    依次入 pending，每轮开始时并入 active 并去重、截断。
+
+    来源标记只用于日志与排障，不进入提示词。
+    """
+
+    def __init__(self, max_active: int = 12):
+        self.max_active = max(1, int(max_active))
+        self._pending = []          # [(source, keyword)]
+        self._active = []           # [keyword]
+
+    def add(self, keywords, source: str = "msg"):
+        for kw in keywords or []:
+            text = str(kw or "").strip()
+            if text:
+                self._pending.append((source, text))
+
+    def merge(self) -> tuple:
+        """把 pending 并入 active，返回 (本轮关键词, 来源摘要)。"""
+        if self._pending:
+            # 保留 active 里仍在队列的，优先本轮新增
+            merged = []
+            seen = set()
+            for _source, kw in self._pending:
+                if kw not in seen:
+                    seen.add(kw)
+                    merged.append(kw)
+            for kw in self._active:
+                if kw not in seen:
+                    seen.add(kw)
+                    merged.append(kw)
+            self._active = merged[:self.max_active]
+            sources = {}
+            for source, _kw in self._pending:
+                sources[source] = sources.get(source, 0) + 1
+            self._pending = []
+        else:
+            sources = {}
+        return list(self._active), sources
+
+    def retain(self, keywords):
+        """用实际参与检索的关键词回写 active（例如反刍抑制过滤之后）。"""
+        self._active = [str(k) for k in (keywords or []) if str(k).strip()][:self.max_active]
+
+    def clear(self):
+        self._pending = []
+        self._active = []
+
+    def __len__(self):
+        return len(self._active)
+
 # ========== 关键词抽取（jieba 搜索引擎模式）==========
 _KEYWORD_STOPWORDS = {
     "的", "了", "是", "在", "我", "你", "他", "她", "它", "我们", "你们", "他们",
@@ -83,6 +139,21 @@ def inject_message_keywords(keywords: list):
     """由消息处理层调用，将消息 jieba 分词后的关键词加入消费队列"""
     if keywords:
         _keyword_queue.append(keywords)
+
+
+# ========== 关键词信箱（模块级单例）==========
+# 认知循环每轮从这里取合并后的关键词；消息层/媒体层/上一轮回复都往这里追加。
+KEYWORDS = KeywordMailbox(max_active=12)
+
+
+def inject_keywords(keywords: list, source: str = "msg"):
+    """把关键词追加进信箱（不立即消费），供下一轮合并使用。"""
+    KEYWORDS.add(keywords, source)
+
+
+def keyword_snapshot() -> tuple:
+    """取出本轮应使用的关键词（pending 与 active 合并）。"""
+    return KEYWORDS.merge()
 
 
 # ========== 时间指代通道 ==========
@@ -128,10 +199,11 @@ DROWSY_MARGIN = 15              # 保留字段：兼容旧引用
 
 def _get_drowsy_memory() -> str:
     """
-    返回应注入的第一人称身体感受（困倦/疲惫/精神），由生物钟精力分档生成。
+    返回应注入的第一人称身体感受（睡前/刚醒），由生物钟状态生成。
     这是"内心感受"通道：让辉夜自己感到累，而不只是内部数值。
+    只作为 verbalize 的 body_state 提示行，不写成记忆。
     """
-    return BIORHYTHM.feeling_text()
+    return BIORHYTHM.body_state_text()
 
 
 def _strip_trailing_period(text: str) -> str:
@@ -461,13 +533,10 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
         timed_memories.append(f"[{phrase}] {mem['content']}")
         timestamps.append(real_ts)
 
-    drowsy = _get_drowsy_memory()
-    if drowsy:
-        timed_memories.insert(0, drowsy)
-        timestamps.insert(0, None)
-
     # 阶段D：LLM 拼接回复（传入关键词作为指引）
-    result = verbalize(timed_memories, keywords, new_state, user_input, timestamps=timestamps)
+    # 身体状态作为独立提示行，不再混进记忆列表（避免被排序/去重/随机轮次消耗）
+    result = verbalize(timed_memories, keywords, new_state, user_input,
+                       timestamps=timestamps, body_state=_get_drowsy_memory())
     reply = ""
     should_speak = False
     if isinstance(result, dict):
@@ -595,9 +664,23 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled()):
         return None
 
-    # 只在"刚说过话"或"有新消息进来"时给动作机会，避免纯内心轮次也冲动
-    if not (talk_sent or keywords):
-        return None
+    # 调用门槛：不再因为“有 keywords”就每轮都问一次动作层。
+    # 旧条件是 `talk_sent or keywords`，而关键词几乎每轮都有，等价于每轮必调。
+    # 现在只有三种情形会问：
+    #   1) 本轮收到新媒体（可能想收藏）；
+    #   2) 记事本刚被读写过（可能想继续整理）；
+    #   3) 刚说过话；没说上话的轮次只按 action_spontaneous_prob 小概率触发。
+    pending = ASSETS.list_pending()
+    spoke_now = bool(talk_sent)
+    note_changed = bool(_pending_note_memory)
+    if not pending and not note_changed and not spoke_now:
+        try:
+            from config.api_config import config as _cfg
+            prob = float(_cfg.get("action_spontaneous_prob", 0.25))
+        except (TypeError, ValueError):
+            prob = 0.25
+        if random.random() > max(0.0, min(1.0, prob)):
+            return None
 
     result = await loop.run_in_executor(
         None, lambda: decide_action(
@@ -651,20 +734,23 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         kind = saved.get("kind") or (ASSETS.IMAGE if action == "save_image" else ASSETS.STICKER)
         tag = "图片" if kind == ASSETS.IMAGE else "表情包"
         measure = "张" if kind == ASSETS.IMAGE else "个"
-        create_memory(f"我收藏了{measure}{tag}，内容是：{detail}")
+        favorite_mem_id = create_memory(f"我收藏了{measure}{tag}，内容是：{detail}")
+        # 收藏这件事紧贴在被收藏的图片记忆之后：同一时间戳 + 因果边，
+        # 让记忆图里“我看到这张图”与“我把它收下了”连成一段，而不是散落两处。
+        for media_mem_id in (result.get("memory_ids") or []):
+            try:
+                add_link(media_mem_id, favorite_mem_id, 1.0, "causal")
+            except Exception as e:
+                append_log(f"[认知循环] 收藏记忆建链失败: {e}")
         add_to_history(None, None, f"（我收藏了{measure}{tag}，内容是：{detail}）")
         BUS.message.emit(BOT_NAME, result.get("reply") or f"（收下了这个{tag}）", "QQ")
         return f"收藏{tag}: {detail}"
 
-    # -------- 记事本：写入/修改/翻开，内容留给下一轮特供记忆（不入库）--------
-    if action in ("write_txt", "edit_txt", "read_txt"):
+    # -------- 记事本：写入/修改/删除/翻开，内容留给下一轮特供记忆（不入库）--------
+    if action in ("write_txt", "edit_txt", "delete_txt", "read_txt"):
         name = result.get("note_name") or ""
         text = result.get("note_text") or ""
-        # F22：行为记录与"全文回看"解耦。
-        # 此前 `if not text: return None` 会在删除最后一行（文件变空、read_note
-        # 返回 None）时提前退出，文件已被修改却没有留下任何行为记忆——
-        # 违背"改动需留痕"。现在空文件只表示"没有可回看的内容"，
-        # 行为本身照常记录；只有 read_txt 在无内容时才无事可做。
+        # 行为记录与"全文回看"解耦：文件被改成空时，行为仍要留痕。
         if text:
             # 形如：[现在]我打开了我写的“xxx”文件，内容是：xxx
             _pending_note_memory = f"[现在]我打开了我写的“{name}”文件，内容是：{text}"
@@ -672,10 +758,10 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             return None
 
         if action == "write_txt":
-            # 写入这个行为本身值得记住，但只记"写过"，不把文件全文灌进记忆库
             written = result.get("written") or ""
-            create_memory(f"我在记事本「{name}」里写下：{written}")
-            add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}）")
+            suffix = "（内容过长，已截断）" if result.get("truncated") else ""
+            create_memory(f"我在记事本「{name}」里写下：{written}{suffix}")
+            add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}{suffix}）")
             BUS.message.emit(BOT_NAME, f"[笔记] {written}", "QQ")
             return f"写笔记: {name}"
 
@@ -683,15 +769,17 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             # 修改既有条目：记下"改了什么"，便于日后追溯（伦理上改动需留痕）
             old_text = result.get("old_text") or ""
             new_text = result.get("new_text") or ""
-            if result.get("deleted"):
-                create_memory(f"我把记事本「{name}」里的「{old_text}」划掉了")
-                add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」划掉了）")
-                BUS.message.emit(BOT_NAME, f"[笔记] 划掉了：{old_text}", "QQ")
-                return f"改笔记（删除）: {name}"
             create_memory(f"我把记事本「{name}」里的「{old_text}」改成了「{new_text}」")
             add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」改成了「{new_text}」）")
             BUS.message.emit(BOT_NAME, f"[笔记] {new_text}", "QQ")
             return f"改笔记: {name}"
+
+        if action == "delete_txt":
+            old_text = result.get("old_text") or ""
+            create_memory(f"我把记事本「{name}」里的「{old_text}」划掉了")
+            add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」划掉了）")
+            BUS.message.emit(BOT_NAME, f"[笔记] 划掉了：{old_text}", "QQ")
+            return f"删笔记行: {name}"
 
         append_log(f"[认知循环] 记事本「{name}」内容已载入下一轮特供记忆")
         return f"翻开笔记: {name}"
@@ -728,10 +816,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
     _inhibited_edges.clear()
     _inhibited_keywords.clear()
     _keyword_queue.clear()
+    KEYWORDS.clear()
     current_keywords = []
     prev_thought_text = None
     prev_should_speak = False
-    last_eviction_time = time.time()
 
     append_log("="*40)
     append_log("[认知循环] 永续认知循环启动")
@@ -747,22 +835,35 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 await asyncio.sleep(5)
                 BIORHYTHM.tick()
             append_log("[认知循环] 自然醒来（或被唤醒），认知循环恢复")
+            # 醒来即清掉睡前残留：睡前关键词、上一轮回复、反刍计数都不该带进新的一觉。
+            KEYWORDS.clear()
+            _keyword_queue.clear()
+            current_keywords = []
+            prev_thought_text = None
+            prev_should_speak = False
+            _keyword_continuity.clear()
+            _inhibited_seeds.clear()
+            _inhibited_edges.clear()
+            _inhibited_keywords.clear()
             continue
 
         try:
             loop = asyncio.get_event_loop()
 
             # ============================
-            # Step 1: 消费队列中的全部关键词（取空即清空队列）
+            # Step 1: 合并关键词信箱（追加，而不是整批替换）
             # ============================
-            new_kws_batch = []
             while _keyword_queue:
                 kws = _keyword_queue.popleft()
-                new_kws_batch.extend(kws)
+                KEYWORDS.add(kws, "queue")
 
-            if new_kws_batch:
-                current_keywords = list(dict.fromkeys(new_kws_batch))
-                append_log(f"[认知循环] 消费队列关键词: {current_keywords}")
+            merged_keywords, kw_sources = keyword_snapshot()
+            if merged_keywords:
+                current_keywords = merged_keywords
+                src_note = ""
+                if kw_sources:
+                    src_note = "（" + "，".join(f"{k}:{v}" for k, v in kw_sources.items()) + "）"
+                append_log(f"[认知循环] 合并关键词{src_note}: {current_keywords}")
 
             # ============================
             # Step 2: 若无关键词，从记忆库取种子（线程安全）
@@ -951,17 +1052,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 append_log(f"[认知循环] 上一轮回复并入: {prev_mem}")
 
             # ============================
-            # Step 3d: 困倦/刚醒记忆附加（即将睡觉 / 刚睡醒）
+            # Step 3d: 身体状态（睡前 / 刚醒）
+            # 只作为独立提示行传给 verbalize，不写成记忆，也不参与排序去重。
             # ============================
-            drowsy_mem = None
-            drowsy_ts = None
-            drowsy = _get_drowsy_memory()
-            if drowsy:
-                drowsy_ts = clock.to_real_time(clock.now())
-                drowsy_mem = drowsy
-                related_memories.append(drowsy)
-                related_ts.append(drowsy_ts)
-                append_log(f"[认知循环] 附加困倦/刚醒记忆: {drowsy}")
+            body_state = BIORHYTHM.body_state_text()
 
             # ============================
             # Step 3e: 记事本回看附加（一次性）
@@ -981,7 +1075,6 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             pinned_memories = (
                 dialogue_memories
                 + ([prev_mem] if prev_mem else [])
-                + ([drowsy_mem] if drowsy_mem else [])
                 + ([note_mem] if note_mem else [])
                 # 概念路带回的记忆作为特供：不参与评分、不被关键词过滤丢弃
                 + concept_texts
@@ -989,7 +1082,6 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             pinned_ts = (
                 dialogue_ts
                 + ([prev_ts] if prev_ts is not None else [])
-                + ([drowsy_ts] if drowsy_ts is not None else [])
                 + ([note_ts] if note_ts is not None else [])
                 + concept_ts
             )
@@ -999,7 +1091,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                     related_memories, current_keywords, state,
                     pinned=pinned_memories,
                     timestamps=related_ts,
-                    pinned_timestamps=pinned_ts
+                    pinned_timestamps=pinned_ts,
+                    body_state=body_state,
                 )
             )
 
@@ -1031,7 +1124,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 memory_text = f"我想：{thought_text}"
 
             # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环
-            mem_id = create_memory(memory_text)
+            mem_id = await loop.run_in_executor(None, lambda: create_memory(memory_text))
             _shallow_pool.append(mem_id)
 
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
@@ -1042,16 +1135,29 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             #   送达成功 → 记为"我说"，下一轮正常并入；
             #   未送达   → 仍记入历史但追加"（消息发送失败）"后缀，
             #              下一轮读到的是带标记的文本，不会被误当成"已经说出口"。
-            # 此前不看返回值就无条件 talk_sent=True 并记历史，
-            # 发送失败时会产生虚假的"说过"记忆（F20）。
             # ============================
             talk_sent = False
-            # F28：目标群动态解析。cognitive_loop 的 target_group_id 是启动时
-            # 捕获的局部参数，改配置后运行中的循环仍发旧群（而 UI 提示"已生效"）。
-            # 这里每轮重新向发送方要一次当前目标群，实现真正的热更新。
+            # 目标群动态解析（改配置后无需重启）
             target_group = _resolve_target_group(target_group_id)
+            at_qq = None
             if should_speak and thought_text and send_func and target_group:
-                delivered = await send_func(target_group, thought_text)
+                # 直接 @ 了机器人的消息，回复时 @ 回发送者；普通群聊不主动 @ 人。
+                try:
+                    import qq_bot as _qq
+                    reply_target = _qq.take_reply_target(mention_only=True)
+                    if reply_target and _qq._at_cooldown_ok(target_group, reply_target["qq"]):
+                        at_qq = reply_target["qq"]
+                except Exception as e:
+                    append_log(f"[认知循环] 解析 @ 目标失败: {e}")
+
+                if at_qq is None:
+                    delivered = await send_func(target_group, thought_text)
+                else:
+                    try:
+                        delivered = await send_func(target_group, thought_text, at_qq=at_qq)
+                    except TypeError:
+                        # 兼容旧发送签名（自定义发送函数不接受 at_qq）
+                        delivered = await send_func(target_group, thought_text)
                 talk_sent = delivered is not False     # 兼容未返回值的旧签名
                 if delivered is False:
                     append_log(f"[认知循环] 消息发送失败，历史标记为未送达: {thought_text[:30]}")
@@ -1088,15 +1194,16 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 break
 
             # ============================
-            # Step 7b: 关键词队列 —— 将本轮回复 jieba 分词后入队（下一轮消费）
+            # Step 7b: 关键词信箱 —— 本轮回复分词后追加（下一轮合并消费）
             # ============================
             reply_keywords = extract_keywords_jieba(thought_text)
             if reply_keywords:
-                _keyword_queue.append(reply_keywords)
-                append_log(f"[认知循环] 回复分词入队: {reply_keywords}")
+                KEYWORDS.add(reply_keywords, "reply")
+                append_log(f"[认知循环] 回复分词入信箱: {reply_keywords}")
 
-            # 本轮队列关键词已消费完毕，清空本轮的 current_keywords
-            current_keywords = []
+            # 本轮实际参与检索的关键词留在信箱里继续生效；
+            # 只有被抑制/被过滤掉的才去掉。下一轮会把新消息关键词追加进来。
+            KEYWORDS.retain(current_keywords)
 
             # ============================
             # Step 8: 休眠
@@ -1128,15 +1235,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
 
             # ============================
-            # 阶段6：定时冷热数据下沉（每10分钟）
+            # 阶段6：热记忆下沉交给 HotSetPlanner + MemoryWriter
+            # 认知循环不再自己触发淘汰（避免与 drift_loop、auto_save 三处重复）。
             # ============================
-            if time.time() - last_eviction_time >= 600:
-                last_eviction_time = time.time()
-                try:
-                    from .memory_engine import periodic_cold_eviction
-                    periodic_cold_eviction()
-                except Exception as e:
-                    append_log(f"[认知循环] 定时下沉异常: {e}")
 
             await asyncio.sleep(1)
 

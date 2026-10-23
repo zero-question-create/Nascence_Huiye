@@ -33,6 +33,7 @@ import time
 import threading
 
 from utils.monitor import append_log
+from utils.metrics_probe import PROBE
 from config.api_config import config
 
 STATE_FILE = "data/test/biorhythm.json"
@@ -54,6 +55,10 @@ AWAKE_LOCK = 20 * 60
 # 与 AWAKE_LOCK 是两个概念——后者是"不许马上睡回去"的保护锁，
 # 这里限的是"刚醒多久还值得提一句身体状态"。
 WAKE_FEELING_WINDOW = 5 * 60
+# wind-down：距离入睡阈值多近时进入“准备睡”状态（默认 0.04）
+PRE_SLEEP_MARGIN = 0.04
+# wind-down 期间推迟入睡的秒数：保证“快睡了/晚安”这类最后一轮有机会发出去
+PRE_SLEEP_HOLD = 60.0
 # 单次 tick 最大推进步长（秒），用于离线补算时的数值稳定
 MAX_STEP = 300.0
 
@@ -105,6 +110,7 @@ def _load_params():
     """从全局 config 读取可调参数（缺键时回落到本模块默认值）。"""
     global T_WAKE, T_SLEEP, ONSET_THRESHOLD, WAKE_THRESHOLD
     global RHYTHM_WEIGHT, IDLE_TO_SLEEP, RHYTHM_MIN_NIGHTS, RHYTHM_FULL_NIGHTS
+    global PRE_SLEEP_MARGIN, PRE_SLEEP_HOLD
     T_WAKE = float(config.get("biorhythm_wake_seconds", T_WAKE))
     T_SLEEP = float(config.get("biorhythm_sleep_seconds", T_SLEEP))
     ONSET_THRESHOLD = float(config.get("biorhythm_onset_threshold", ONSET_THRESHOLD))
@@ -113,13 +119,15 @@ def _load_params():
     IDLE_TO_SLEEP = float(config.get("biorhythm_idle_to_sleep", IDLE_TO_SLEEP))
     RHYTHM_MIN_NIGHTS = int(config.get("biorhythm_rhythm_min_nights", RHYTHM_MIN_NIGHTS))
     RHYTHM_FULL_NIGHTS = int(config.get("biorhythm_rhythm_full_nights", RHYTHM_FULL_NIGHTS))
+    PRE_SLEEP_MARGIN = float(config.get("pre_sleep_margin", PRE_SLEEP_MARGIN))
+    PRE_SLEEP_HOLD = float(config.get("pre_sleep_hold_seconds", PRE_SLEEP_HOLD))
 
 
 class Biorhythm:
     def __init__(self):
         self._lock = threading.RLock()
         self.s = 0.15               # 睡眠压力
-        self.state = "awake"        # "awake" | "asleep"
+        self.state = "awake"        # "awake" | "wind_down" | "asleep" | "waking"
         self.last_tick = time.time()
         # 记录
         self.onset_count = 0
@@ -130,6 +138,9 @@ class Biorhythm:
         self.last_wake = None
         self.awake_until = 0.0      # 清醒锁定到此时刻（被点名唤醒后）
         self.last_feeling_time = 0.0 # 上次注入身体感受的时刻（防每轮轰炸）
+        self.last_pre_sleep_time = 0.0  # 上次注入“快睡了”状态的时刻（一觉一次）
+        self.wake_generation = 0    # 醒来代数：每次醒来 +1，供认知循环判断“这是新的一觉”
+        self.sleep_hold_until = 0.0 # wind-down 期间推迟入睡到此刻，保证最后一轮能发出去
         self._replaying = False     # 离线补算中（跳过重量级睡眠维护）
         # ---- 作息惯性（学得的昼夜节律）----
         self.rhythm_hist = [0.0] * 24   # 24 小时直方图：她历史上在这些时段睡着的累积量
@@ -144,6 +155,7 @@ class Biorhythm:
         self.last_activity = time.time() # 最近一次外部活动（群消息）时刻，用于安静检测
         _load_params()
         self.load()
+
 
     # ---------- 核心推进 ----------
     def tick(self, now: float = None):
@@ -167,7 +179,7 @@ class Biorhythm:
 
     def _advance(self, dt: float, now: float):
         """推进 dt 秒（dt <= MAX_STEP），期间可能发生入睡/醒来转换。"""
-        if self.state == "awake":
+        if self.state in ("awake", "wind_down"):
             self.s = 1.0 - (1.0 - self.s) * math.exp(-dt / T_WAKE)
             self._maybe_sleep(now)
         else:
@@ -218,23 +230,43 @@ class Biorhythm:
         """入睡判定。
 
         两条路径都要求"安静"：群里正聊得热闹时她不会自顾自睡过去，
-        既保证在线参与，也让学到的作息反映"环境安静 + 她困了"的时段
-        （实测若允许疲劳直睡，会把下午被逼睡的时间学成作息）。
+        既保证在线参与，也让学到的作息反映"环境安静 + 她困了"的时段。
+
+        wind-down：在**接近但尚未越过**阈值时先进入"准备睡"状态，
+        让“快睡了”这句话有机会在睡着前说出去。真正越过阈值后仍立即入睡，
+        不拖延（否则会表现为明明很困却迟迟不睡）。
         """
         # 被点名唤醒后的锁定期内不重新入睡，以便完成回应
         if now < self.awake_until:
             return
         if now - self.last_activity < IDLE_TO_SLEEP:
             return
+
         # 1) 纯疲劳入睡：压力已越过阈值（不需要作息助攻）
         if self.s >= ONSET_THRESHOLD:
             self._sleep(now, by_rhythm=False)
             return
         # 2) 作息助攻入睡：睡意被节律抬到阈值
-        if self._rhythm_boost(now) <= 0:
-            return
-        if self.sleep_drive(now) >= ONSET_THRESHOLD:
+        rhythm_boost = self._rhythm_boost(now)
+        if rhythm_boost > 0 and self.sleep_drive(now) >= ONSET_THRESHOLD:
             self._sleep(now, by_rhythm=True)
+            return
+
+        # 3) 接近阈值的预警带：进入 wind-down（只提示，不入睡）
+        near = (
+            self.s >= ONSET_THRESHOLD - PRE_SLEEP_MARGIN
+            or (rhythm_boost > 0 and self.sleep_drive(now) >= ONSET_THRESHOLD - PRE_SLEEP_MARGIN)
+        )
+        if near:
+            if self.state == "awake":
+                self.state = "wind_down"
+                self.sleep_hold_until = now + PRE_SLEEP_HOLD
+                append_log(f"[生物钟] 进入 wind-down（压力={self.s:.2f}，"
+                           f"静默 {self.idle_seconds(now)/60:.1f}min）")
+            return
+        # 离开预警带（例如被消息打断后节律减弱）：回到清醒态
+        if self.state == "wind_down":
+            self.state = "awake"
 
     def _maybe_wake(self, now: float):
         """醒来判定。由作息助攻入睡的那一觉，在窗口内不易醒。"""
@@ -365,8 +397,13 @@ class Biorhythm:
         dur = (now - self.sleep_started_at) if self.sleep_started_at else 0
         self.state = "awake"
         self.wake_count += 1
+        self.wake_generation += 1
         self.sleep_started_at = None
         self.last_wake = now
+        # 醒后短暂锁定：保证第一轮“刚醒”状态与回复能完整走完，再重新判定入睡。
+        # 这里不引入持久化的 waking 态——是否“刚醒”由 last_wake 窗口推导即可，
+        # 少一个状态就少一处不一致。
+        self.sleep_hold_until = now + min(AWAKE_LOCK, 120.0)
         guard = "（安全阀）" if self._late_sleep_guard else ""
         append_log(f"[生物钟] 自然醒来{guard}（睡了 {dur/3600:.2f}h，压力={self.s:.2f}，"
                    f"作息入睡={self._by_rhythm}）")
@@ -386,11 +423,13 @@ class Biorhythm:
             dur = (now - self.sleep_started_at) if self.sleep_started_at else 0
             self.state = "awake"
             self.wake_count += 1
+            self.wake_generation += 1
             self.sleep_started_at = None
             self.last_wake = now
             self.woke_by_user = True
             # 清醒锁定：给足时间完成这次回应，不会话说到一半又睡回去
             self.awake_until = now + AWAKE_LOCK
+            self.sleep_hold_until = now + min(AWAKE_LOCK, 120.0)
             self._by_rhythm = False
             self._late_sleep_guard = False
             self._last_rhythm_sample = None
@@ -405,7 +444,7 @@ class Biorhythm:
     def force_sleep(self, reason: str = "manual"):
         """外部强制入睡（调试/面板用）。"""
         with self._lock:
-            if self.state == "awake":
+            if self.state != "asleep":
                 self._sleep()
 
     # ---------- 对外属性 ----------
@@ -417,9 +456,57 @@ class Biorhythm:
     def is_asleep(self) -> bool:
         return self.state == "asleep"
 
+    def is_winding_down(self) -> bool:
+        return self.state == "wind_down"
+
+    def is_waking(self, now: float = None) -> bool:
+        """是否处于“刚醒”窗口（由 last_wake 推导，不占用持久化状态）。"""
+        return self._in_wake_window(time.time() if now is None else now)
+
     def depth_factor(self) -> float:
         """精力 → 思考深度系数 ∈ [0.5, 1.0]。低精力时想得浅。"""
         return 0.5 + 0.5 * self.energy
+
+    def body_state_text(self) -> str | None:
+        """睡前 / 刚醒的身体状态，作为独立提示行返回（不写入记忆）。
+
+        - wind_down 且本觉未提过：返回“快睡了”状态；
+        - 醒来后 WAKE_FEELING_WINDOW 内且本觉未提过：返回“刚醒”状态；
+        - 其他时候返回 None。
+
+        与 feeling_text 的区别：feeling_text 仍保留给旧调用方可按记忆处理，
+        body_state_text 是“每觉最多一次”的提示通道，避免被随机轮次吞掉。
+        """
+        now = time.time()
+        with self._lock:
+            if self.state == "wind_down":
+                last_onset = self.last_onset or 0
+                if self.last_pre_sleep_time > last_onset:
+                    return None
+                self.last_pre_sleep_time = now
+                PROBE.bump("sleep.pre_sleep_injected")
+                if self.energy >= 0.25:
+                    return "[现在] 我有点困了，眼皮开始发沉"
+                return "[现在] 我快撑不住了，只想躺下"
+
+            if self._in_wake_window(now):
+                if self.last_feeling_time > (self.last_wake or 0) + 1e-6:
+                    return None
+                # 被叫醒：睡到一半被外部打断，比自然醒更迷糊
+                if self.woke_by_user:
+                    self.last_feeling_time = now
+                    PROBE.bump("sleep.post_wake_injected")
+                    return "[现在] 我刚被吵醒，脑子还发懵，有点迷糊"
+                # 自然醒：睡饱（精力充沛）不产生感受，也不占用本觉名额
+                e = self.energy
+                if e >= 0.4:
+                    return None
+                self.last_feeling_time = now
+                PROBE.bump("sleep.post_wake_injected")
+                if e >= 0.25:
+                    return "[现在] 我刚醒，还有点没睡够，脑子不太清醒"
+                return "[现在] 我刚醒，头还是沉的，很困"
+        return None
 
     def feeling_text(self, min_interval: float = None) -> str | None:
         """生成第一人称身体感受（纯字符串，不调 LLM）。
@@ -476,6 +563,8 @@ class Biorhythm:
             "sleep_drive": round(self.sleep_drive(), 3),
             "idle_min": round(self.idle_seconds() / 60, 1),
             "by_rhythm": self._by_rhythm,
+            "wake_generation": self.wake_generation,
+            "woke_by_user": self.woke_by_user,
         }
 
     # ---------- 持久化 ----------
@@ -492,6 +581,16 @@ class Biorhythm:
                 "wake_count": self.wake_count,
                 "sleep_started_at": self.sleep_started_at,
                 "awake_until": self.awake_until,
+                # 醒来方式与提示配额：重启后“刚醒/被叫醒”状态不能丢，
+                # 否则会重复播放同一句身体感受，或把被叫醒误当成自然醒。
+                "woke_by_user": self.woke_by_user,
+                "last_feeling_time": self.last_feeling_time,
+                "last_pre_sleep_time": self.last_pre_sleep_time,
+                "last_guard_wake": self.last_guard_wake,
+                "wake_generation": self.wake_generation,
+                "sleep_hold_until": self.sleep_hold_until,
+                "_sleep_samples": self._sleep_samples,
+                "_last_rhythm_sample": self._last_rhythm_sample,
                 # 作息惯性：直方图与统计量需要持久化，否则重启就忘了作息
                 "rhythm_hist": self.rhythm_hist,
                 "rhythm_nights": self.rhythm_nights,
@@ -520,6 +619,18 @@ class Biorhythm:
                 self.wake_count = int(data.get("wake_count", 0))
                 self.sleep_started_at = data.get("sleep_started_at", None)
                 self.awake_until = float(data.get("awake_until", 0.0))
+                self.woke_by_user = bool(data.get("woke_by_user", False))
+                self.last_feeling_time = float(data.get("last_feeling_time", 0.0) or 0.0)
+                self.last_pre_sleep_time = float(data.get("last_pre_sleep_time", 0.0) or 0.0)
+                self.last_guard_wake = bool(data.get("last_guard_wake", False))
+                self.wake_generation = int(data.get("wake_generation", 0) or 0)
+                self.sleep_hold_until = float(data.get("sleep_hold_until", 0.0) or 0.0)
+                self._sleep_samples = int(data.get("_sleep_samples", 0) or 0)
+                self._last_rhythm_sample = data.get("_last_rhythm_sample")
+                # 旧存档可能把 state 写成 awake/asleep；wind_down 是运行期预警态，
+                # 重启后回落到 awake，由 tick 重新判定。
+                if self.state not in ("awake", "asleep"):
+                    self.state = "awake"
                 # 作息惯性（旧存档没有这些字段，用默认值即可平滑过渡）
                 hist = data.get("rhythm_hist")
                 if isinstance(hist, list) and len(hist) == 24:

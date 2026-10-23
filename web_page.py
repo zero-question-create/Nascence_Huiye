@@ -96,6 +96,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div class="card"><div class="k">运行时间</div><div class="v" id="c-runtime">--</div></div>
       <div class="card"><div class="k">虚拟时间</div><div class="v" id="c-clock">--</div></div>
       <div class="card"><div class="k">精力</div><div class="v" id="c-energy">--</div><div class="c" id="c-rhythm"></div></div>
+      <div class="card"><div class="k">缓存命中</div><div class="v" id="c-cache">--</div><div class="c" id="c-cache-detail"></div></div>
     </div>
     <div class="panel" style="margin-top:14px">
       <h3>运行控制</h3>
@@ -291,7 +292,10 @@ async function refreshStats(){
     $('c-clock').textContent = d.clock_text ?? '--';
     if(d.energy !== undefined){
       const pct = Math.round(d.energy*100);
-      $('c-energy').textContent = pct + '% ' + (d.state === 'asleep' ? '睡眠中' : '清醒');
+      const stateText = d.state === 'asleep' ? '睡眠中'
+        : d.state === 'wind_down' ? '准备睡'
+        : (d.state === 'waking' ? '刚醒' : '清醒');
+      $('c-energy').textContent = pct + '% ' + stateText;
       let cap = '作息积累中';
       if(d.rhythm_nights > 0){
         const h = d.sleep_hours || [];
@@ -299,6 +303,30 @@ async function refreshStats(){
               (h.length ? ` 常睡${Math.min(...h)}-${Math.max(...h)}点` : '');
       }
       $('c-rhythm').textContent = cap;
+      // 缓存指标：图片描述缓存命中 + LLM token 缓存命中（供应方返回时才有）
+      try{
+        const probe = d.probe || {};
+        const c = probe.counters || {};
+        const visionCalls = c['vision.calls'] || 0;
+        const visionHits = c['vision.cache_hit'] || 0;
+        const hitTokens = Object.keys(c).filter(k => k.startsWith('tokens.') && k.endsWith('.cache_hit'))
+          .reduce((a, k) => a + c[k], 0);
+        const missTokens = Object.keys(c).filter(k => k.startsWith('tokens.') && k.endsWith('.cache_miss'))
+          .reduce((a, k) => a + c[k], 0);
+        let pctText = '--';
+        let detail = '';
+        if(visionCalls + visionHits > 0){
+          pctText = Math.round(100 * visionHits / (visionCalls + visionHits)) + '%';
+          detail = `视觉 ${visionHits}/${visionCalls + visionHits}`;
+        }
+        if(hitTokens + missTokens > 0){
+          const llmPct = Math.round(100 * hitTokens / (hitTokens + missTokens));
+          pctText = llmPct + '%';
+          detail += `${detail ? ' · ' : ''}token ${hitTokens}/${hitTokens + missTokens}`;
+        }
+        $('c-cache').textContent = pctText;
+        $('c-cache-detail').textContent = detail || '暂无数据';
+      }catch(e){}
       const b = $('stateBadge');
       sysState = d.state === 'asleep' ? '睡眠中' : '清醒';
       // 核心初始化期间显示具体阶段与已用时长，而不是笼统的"加载中"

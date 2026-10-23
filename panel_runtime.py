@@ -31,6 +31,7 @@ from pathlib import Path
 
 from config.api_config import DEFAULT_CONFIG
 from config.constants import BOT_NAME
+from utils.atomic_io import atomic_write_json
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DIR = PROJECT_DIR / "run"
@@ -444,6 +445,18 @@ class Runtime:
             load_state()
             load_dialogue_history()
             _init_metrics_counters()
+            # 启动自检：把计数器口径与数据规模写进日志（只读，不改计数）
+            try:
+                from core.memory_engine import log_metrics_status
+                log_metrics_status()
+            except Exception:
+                logging.exception("计数器自检失败（不影响启动）")
+            # 记忆写者与热集规划器：单写者线程 + 独立淘汰规划
+            try:
+                from core.memory_writer import start_default_workers
+                start_default_workers()
+            except Exception:
+                logging.exception("记忆写者启动失败，退化为直接同步写")
             # 预热失败不能拖住初始化：给足冷加载时间（首次拉取模型另计），
             # 超时后照常放行，后续首次向量化会自行重试。
             warm_thread.join(timeout=120)
@@ -654,8 +667,9 @@ def load_panel_config():
 
 def save_panel_config(cfg):
     path = PROJECT_DIR / "config" / "api_config.json"
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    # 原子写：运行中的 QQ 服务会热重载读取同一个文件，直接 open('w') 可能被读到半截
+    if not atomic_write_json(str(path), cfg):
+        raise OSError(f"配置写入失败: {path}")
 
 
 def reload_biorhythm_params():

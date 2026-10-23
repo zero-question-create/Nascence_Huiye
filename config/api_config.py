@@ -53,8 +53,28 @@ DEFAULT_CONFIG = {
     # ===== 动作抉择（本能冲动）=====
     "action_enabled": True,                 # 是否允许每轮末尾做动作抉择
     "action_max_pages": 4,                  # 单个动作类型的翻页上限
-    "action_page_size": 12,                 # 每页候选数量
-    "action_note_enabled": True             # 是否允许写 txt 笔记
+    "action_page_size": 8,                  # 每页候选数量
+    "action_note_enabled": True,            # 是否允许写 txt 笔记
+    "action_spontaneous_prob": 0.25,        # 没有新媒体时，每轮仍去问动作层的概率
+    # ===== 笔记限额（满了拒绝写入，不做 FIFO 淘汰）=====
+    "note_entry_max_chars": 200,            # 单条笔记字符上限
+    "note_file_max_chars": 8000,            # 单个笔记文件字符上限
+    "note_max_lines": 100,                  # 单个笔记文件条目上限
+    "note_read_max_chars": 2000,            # 单次读回上限
+    "note_brief_max_chars": 400,            # 动作层摘要总长
+    "note_brief_recent_lines": 5,           # 动作层摘要每本最近条目数
+    # ===== 媒体描述 =====
+    "image_desc_max_chars": 60,             # 图片描述最大字符数
+    "sticker_desc_max_chars": 30,           # 表情包描述最大字符数
+    "media_desc_cache_size": 500,           # 图片描述内容哈希缓存条数
+    # ===== 记忆写入 =====
+    "memory_writer_mode": "thread",         # process | thread | legacy
+    "memory_writer_batch": 100,             # 单批最多命令数
+    "memory_writer_flush_ms": 100,          # 攒批最长等待毫秒
+    "hot_planner_mode": "thread",           # process | thread（热集名单由独立进程/线程整理）
+    # ===== 睡眠提示 =====
+    "pre_sleep_margin": 0.04,               # 距入睡阈值多近时进入 wind-down
+    "pre_sleep_hold_seconds": 60,           # wind-down 期间推迟入睡的秒数
 }
 
 def load_config():

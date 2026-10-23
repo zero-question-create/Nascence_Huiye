@@ -21,6 +21,28 @@ _last_flush_time = 0.0
 _HISTORY_FILE = "data/test/message_history.log"
 _STATE_FILE = "data/test/message_state.json"
 
+# 写者身份：同一进程里只允许“QQ 服务线程”写磁盘快照。
+# 面板的伪造发送/思考等路径只更新内存并通过 Runtime 转发，避免多份内存副本互相覆盖。
+_WRITER_ROLE_LOCK = threading.Lock()
+_writer_role = None          # None | "qq"
+_local_writes = 0            # 本进程内已发生的写次数（供观测）
+
+
+def claim_write_role(role: str = "qq") -> bool:
+    """声明本进程承担消息历史的磁盘写者角色。"""
+    global _writer_role
+    with _WRITER_ROLE_LOCK:
+        if _writer_role is None or _writer_role == role:
+            _writer_role = role
+            return True
+        return False
+
+
+def _can_persist() -> bool:
+    """未声明角色时允许写（CLI/测试），已声明且不是本角色时跳过磁盘写。"""
+    role = _writer_role
+    return role is None or role == "qq"
+
 
 def add_message(sender, content, source, quote=None, target=None):
     """追加一条历史消息，返回其序号（seq）。
@@ -134,7 +156,10 @@ def save_state():
        短重试即可；重试仍失败则放弃本次保存（记录已在内存中，不应因此抛错
        打断调用方的写入流程）。
     """
-    global _flushed_seq
+    global _flushed_seq, _local_writes
+    if not _can_persist():
+        # 非写者进程：内存里的记录仍然有效，但不去覆盖磁盘上的权威快照。
+        return
     with _lock:
         data = list(_message_history)
         flushed = _flushed_seq
@@ -147,6 +172,8 @@ def save_state():
         for attempt in range(5):
             try:
                 os.replace(tmp_file, _STATE_FILE)
+                with _lock:
+                    _local_writes += 1
                 return
             except PermissionError:
                 if attempt == 4:
@@ -208,6 +235,8 @@ def flush_to_file(force: bool = False):
     """
     global _flushed_seq, _last_flush_time
     import time as _time
+    if not _can_persist():
+        return
     now = _time.time()
     if force is False and (now - _last_flush_time) < FLUSH_MIN_INTERVAL:
         return

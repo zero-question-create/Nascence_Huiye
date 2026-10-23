@@ -14,8 +14,9 @@ import random
 from collections import deque
 from .virtual_clock import clock
 from utils.monitor import append_log
+from utils.metrics_probe import PROBE, TimedRLock
 
-_data_lock = threading.RLock()
+_data_lock = TimedRLock("data")
 
 # ========== 配置常量 ==========
 from config.api_config import config
@@ -66,6 +67,9 @@ word_to_memories = {}               # {词: set(memory_id)}
 # 规模较大时（实测 9 万行）全量重写要十几秒，而绝大多数行并未变化。
 _dirty_links = set()                # {(src, tgt)}：新增或权重/类型有变化
 _deleted_links = set()              # {(src, tgt)}：已从内存移除，需要从 SQLite 删除
+# 热记忆里发生时间/半衰期变化的 ID。保存时只同步这些行，
+# 不再每次把全部热记忆 UPDATE 一遍（1500 行 × 每次保存）。
+_dirty_memory_ids = set()
 
 # ========== 每日指标计数器 ==========
 # 当日累计值（每次事件发生时 +1）
@@ -208,6 +212,67 @@ def _import_metrics_counters(data: dict):
     _count_active_attempt = data.get("active_attempt", _count_active_attempt)
     _count_active_success = data.get("active_success", _count_active_success)
 
+
+def log_metrics_status():
+    """启动自检：把计数器与数据规模写进日志，便于确认读取口径。
+
+    只读，不修改任何计数。每日文件允许多行（读取端按日期合并求和），
+    这里只报告“今日合并后的增量”，不判断重复。
+    """
+    counters = _export_metrics_counters()
+    baseline = {}
+    try:
+        if os.path.exists(METRICS_BASELINE_FILE):
+            with open(METRICS_BASELINE_FILE, "r", encoding="utf-8-sig") as f:
+                baseline = json.load(f)
+    except Exception as e:
+        append_log(f"[指标自检] 基线读取失败: {e}")
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    daily_today = {}
+    rows_today = 0
+    try:
+        if os.path.exists(METRICS_LOG_FILE):
+            with open(METRICS_LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(rec.get("date", "")) != today:
+                        continue
+                    rows_today += 1
+                    for key, _ in (
+                        ("mem_created", ""), ("mem_deleted", ""), ("link_created", ""),
+                        ("link_deleted", ""), ("wordweb_created", ""), ("msg_sent", ""),
+                        ("self_ref", ""), ("active_attempt", ""), ("active_success", ""),
+                    ):
+                        daily_today[key] = daily_today.get(key, 0) + int(rec.get(key, 0) or 0)
+    except Exception as e:
+        append_log(f"[指标自检] 每日日志读取失败: {e}")
+
+    db_count = _db_memory_count_safe()
+    faiss_count = getattr(_faiss_index, "ntotal", 0) if _faiss_index is not None else 0
+    append_log(
+        f"[指标自检] counters={counters} baseline={baseline} "
+        f"今日合并({rows_today}行)={daily_today} "
+        f"memories_db={db_count} hot={len(hot_ids)} links_hot={len(links)} "
+        f"faiss={faiss_count}"
+    )
+    PROBE.gauge("memory.db_rows", db_count)
+    PROBE.gauge("memory.hot", len(hot_ids))
+    PROBE.gauge("links.hot", len(links))
+    PROBE.gauge("faiss.ntotal", faiss_count)
+
+
+def _db_memory_count_safe() -> int:
+    try:
+        return int(_get_db().execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+    except Exception:
+        return 0
+
 # ========== 全局数据库 ==========
 def _get_db():
     """获取全局数据库连接（惰性初始化）"""
@@ -218,6 +283,8 @@ def _get_db():
         _db_conn.execute("PRAGMA journal_mode=WAL")  # 提高并发读性能
         # 记忆数据可容忍断电丢最后少量事务，换取明显更快的批量写入
         _db_conn.execute("PRAGMA synchronous=NORMAL")
+        # 概念层使用独立连接写同一个库；给主连接留出等待时间，避免瞬时报锁
+        _db_conn.execute("PRAGMA busy_timeout=5000")
         _db_conn.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -287,14 +354,19 @@ def _load_wordweb_from_db():
 
 
 def _load_memory_from_db(mem_id: str) -> dict:
-    """从 SQLite 加载一条记忆到内存，并标记为热数据"""
+    """从 SQLite 加载一条记忆到内存，并标记为热数据。
+
+    数据库查询在锁外，写内存字典在短锁内：此前整个函数不持锁，
+    会与下沉/保存线程并发修改 memories / hot_ids。
+    """
     db = _get_db()
     row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
     mem = _row_to_memory(row)
     if mem is None:
         return None
-    memories[mem_id] = mem
-    hot_ids.add(mem_id)
+    with _data_lock:
+        memories[mem_id] = mem
+        hot_ids.add(mem_id)
     _load_links_for_memory(mem_id)
     return mem
 
@@ -306,20 +378,27 @@ def _batch_load_memories(mem_ids: list):
     placeholders = ','.join('?' * len(mem_ids))
     sql = f"SELECT * FROM memories WHERE id IN ({placeholders})"
     rows = db.execute(sql, mem_ids).fetchall()
-    for row in rows:
-        mem_id = row[0]
-        if mem_id in memories:
-            continue
-        mem = _row_to_memory(row)
-        if mem is None:
-            continue
-        memories[mem_id] = mem
-        hot_ids.add(mem_id)
+    loaded = []
+    with _data_lock:
+        for row in rows:
+            mem_id = row[0]
+            if mem_id in memories:
+                continue
+            mem = _row_to_memory(row)
+            if mem is None:
+                continue
+            memories[mem_id] = mem
+            hot_ids.add(mem_id)
+            loaded.append(mem_id)
     for mem_id in mem_ids:
         _load_links_for_memory(mem_id)
 
 def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
-    """将最久未访问的热数据移出内存，保留 SQLite 和 faiss。使用批量事务提升性能与安全性。"""
+    """将最久未访问的热数据移出内存，保留 SQLite 和 faiss。
+
+    只做两件事：在短锁内挑出淘汰名单并从内存移除、把要落库的数据打包；
+    SQLite 写入放到锁外执行，避免磁盘抖动把整个认知循环卡住。
+    """
     with _data_lock:
         if len(hot_ids) <= max_hot:
             return
@@ -344,14 +423,14 @@ def _evict_cold_memories(max_hot=MAX_HOT_SIZE):
             ))
             del memories[mid]
             hot_ids.remove(mid)
+            _dirty_memory_ids.discard(mid)
+        mem_evicted = len(to_evict)
 
-        db = _get_db()
-        db.executemany(
-            """UPDATE memories SET last_accessed = ?, half_life = ?, last_strengthen_time = ?
-               WHERE id = ?""",
-            params
-        )
-        db.commit()
+    # 锁外交给写者落库（唯一 DB 写者）
+    if params:
+        from core.memory_writer import WRITER
+        WRITER.submit("update_times", wait=True, rows=params)
+    PROBE.bump("memory.evicted", mem_evicted)
 
 def _load_link_from_db(src_id: str, tgt_id: str):
     """从 SQLite 加载一条链接到内存（变热）。不存在返回 None。"""
@@ -395,7 +474,10 @@ def _load_links_for_memory(mem_id: str, limit: int = 200):
                 }
 
 def _evict_cold_links(max_hot=MAX_HOT_LINKS):
-    """将最久未访问的热链接移出内存（下沉到 SQLite），与热记忆淘汰对齐。"""
+    """将最久未访问的热链接移出内存（下沉到 SQLite）。
+
+    与热记忆一样：短锁内挑选并移出内存，批量写入放到锁外。
+    """
     with _data_lock:
         if len(links) <= max_hot:
             return
@@ -406,7 +488,6 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
         to_evict = sorted_keys[:len(links) - max_hot]
         if not to_evict:
             return
-        db = _get_db()
         params = []
         for (src, tgt) in to_evict:
             d = links[(src, tgt)]
@@ -419,14 +500,12 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
             # 已直接写入 SQLite，无需再算作待同步的脏数据
             _dirty_links.discard((src, tgt))
             _deleted_links.discard((src, tgt))
-        # 批量写入：存量库首次下沉可能有数十万条，逐条 execute 的 Python 侧
-        # 开销会累积成分钟级停顿（实测一次下沉 89 万条 ≈ 90s+）。
-        db.executemany(
-            """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            params,
-        )
-        db.commit()
+        link_evicted = len(to_evict)
+
+    if params:
+        from core.memory_writer import WRITER
+        WRITER.submit("upsert_links", wait=True, rows=params)
+    PROBE.bump("links.evicted", link_evicted)
 
 def periodic_cold_eviction(max_mem=MAX_HOT_SIZE, max_link=MAX_HOT_LINKS) -> dict:
     """定时热节点与热链接下沉检查。超出上限的部分下沉到 SQLite，维持内存稳定。"""
@@ -816,17 +895,27 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
         "concept_tag_ids": []
     }
 
-    with _data_lock:
-        db = _get_db()
+    db = _get_db()
+    row = (
+        mem_id, content, vec_arr.tobytes(),
+        half_life, now, now, now, json.dumps([]),
+    )
+    # 单写者：写库交给 MemoryWriter（进程/线程），主进程只维护内存与 faiss。
+    # 注意**不能在持有 _data_lock 时等待写者**：写者线程自己也要拿 _data_lock
+    # 做时间戳同步，持锁等待会形成 AB-BA 死锁。这里先在锁外提交，再短锁改内存。
+    from core.memory_writer import WRITER
+    result = WRITER.submit("insert_memory", wait=True, rows=[row])
+    if result is None:
+        # 写者未就绪或超时：退回直接写，绝不让新记忆悬空
         db.execute(
             """INSERT INTO memories (id, content, vector, half_life, last_accessed,
                creation_time, last_strengthen_time, concept_tag_ids)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mem_id, content, vec_arr.tobytes(),
-             half_life, now, now, now, json.dumps([]))
+            row,
         )
         db.commit()
 
+    with _data_lock:
         faiss.normalize_L2(vec_arr)
         _faiss_index.add(vec_arr)
         faiss_id = _faiss_index.ntotal - 1
@@ -857,6 +946,7 @@ def access_memory(mem_id: str):
         strengthen_amount = STRENGTHEN_BASE * discount
         mem["half_life"] += strengthen_amount
         mem["last_strengthen_time"] = now
+        _dirty_memory_ids.add(mem_id)
 
 def time_decay(delta_t: float, half_life: float) -> float:
     if half_life <= 0:
@@ -1114,16 +1204,20 @@ def provide_for_monitor() -> int:
 _init_faiss_index()
 
 def _flush_hot_memory_timestamps(db):
-    """把热记忆的内存时间字段同步到 SQLite（调用方需持有 _data_lock）。
+    """把热记忆中**发生过变化**的时间字段同步到 SQLite（调用方需持有 _data_lock）。
 
     为什么必须做：access_memory() 只改内存，SQLite 里的 last_accessed/half_life
     仍是旧值。而过期判定读的是 SQLite——若不在判定前同步，刚被召回强化的热记忆
     会按陈旧值被判定过期，随即被物理删除（实测可复现）。
+
+    只同步 _dirty_memory_ids：此前每次保存都 UPDATE 全部热记忆（1500 行），
+    绝大多数行其实没变。
     """
     params = []
-    for mid in list(hot_ids):
+    for mid in list(_dirty_memory_ids):
         mem = memories.get(mid)
         if not mem:
+            _dirty_memory_ids.discard(mid)
             continue
         creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
         params.append((
@@ -1138,6 +1232,8 @@ def _flush_hot_memory_timestamps(db):
             params
         )
         db.commit()
+        _dirty_memory_ids.clear()
+        PROBE.bump("memory.timestamps_flushed", len(params))
 
 
 def _purge_expired_memories(expiration_threshold=0.001):
@@ -1150,9 +1246,10 @@ def _purge_expired_memories(expiration_threshold=0.001):
     """
     db = _get_db()
     now = clock.now()
-    # 先把内存里最新的访问/强化结果落库，保证过期判定用的是最新值
-    _flush_hot_memory_timestamps(db)
-    # 从 SQLite 中查询所有记忆的ID、last_accessed、half_life
+    # 先把内存里最新的访问/强化结果落库，保证过期判定用的是最新值。
+    # 走单写者而不是主进程直接 UPDATE：DB 写只允许一个执行者。
+    from core.memory_writer import WRITER
+    WRITER.submit("sync_links", wait=True)
     rows = db.execute("SELECT id, last_accessed, half_life FROM memories").fetchall()
     expired_ids = []
     for mem_id, last_accessed, half_life in rows:
@@ -1166,30 +1263,22 @@ def _purge_expired_memories(expiration_threshold=0.001):
     if not expired_ids:
         return []
 
-    # 删除 SQLite 中的记录
-    placeholders = ','.join('?' * len(expired_ids))
-    db.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", expired_ids)
-    # 同时删除与过期记忆相关的链接（内存 + SQLite）
-    dead_links = [k for k in list(links.keys()) if k[0] in expired_ids or k[1] in expired_ids]
-    for k in dead_links:
-        del links[k]
-        _dirty_links.discard(k)
-        _deleted_links.add(k)
-    db.execute(
-        f"DELETE FROM links WHERE src IN ({placeholders}) OR tgt IN ({placeholders})",
-        expired_ids + expired_ids
-    )
-    db.commit()
-    # 上面已直接从 SQLite 删除，无需再走增量删除
+    # 删除交给写者（唯一 DB 写者）；同时清理内存与脏标记。
+    # 内存改动放在短锁内，等写者 ack 放在锁外（写者同步时自己也要拿 _data_lock）。
     expired_set = set(expired_ids)
-    for (src, tgt) in [k for k in _deleted_links if k[0] in expired_set or k[1] in expired_set]:
-        _deleted_links.discard((src, tgt))
+    with _data_lock:
+        dead_links = [k for k in list(links.keys()) if k[0] in expired_set or k[1] in expired_set]
+        for k in dead_links:
+            del links[k]
+            _dirty_links.discard(k)
+            _deleted_links.discard(k)
+        for mem_id in expired_ids:
+            memories.pop(mem_id, None)
+            hot_ids.discard(mem_id)
+            _dirty_memory_ids.discard(mem_id)
 
-    # 从内存字典和热数据集合中移除
-    for mem_id in expired_ids:
-        if mem_id in memories:
-            del memories[mem_id]
-        hot_ids.discard(mem_id)
+    from core.memory_writer import WRITER
+    WRITER.submit("delete_memories", wait=True, ids=expired_ids)
 
     # 倒排索引同步清理：否则已删记忆仍会通过关键词检索被"召回"（F11）
     global _count_mem_deleted

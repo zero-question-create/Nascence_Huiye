@@ -6,6 +6,8 @@ import time
 from core.memory_engine import memories, links, pending_deletion, wordweb, hot_ids
 from core.memory_engine import check_and_handle_expired, _evict_cold_memories
 from core.virtual_clock import clock
+from utils.atomic_io import atomic_write_json, atomic_write_text
+from utils.metrics_probe import PROBE
 
 _io_lock = threading.Lock()
 
@@ -16,6 +18,9 @@ _last_save_time = 0.0
 _save_count = 0                # 统计实际执行的保存次数（供测试与观测）
 
 MEMORY_FILE = "data/test/memory.json"
+MEMORY_BAK_FILE = "data/test/memory.json.migrated.bak"
+MEMORY_MIGRATED_FLAG = "data/test/memory_json_migrated.flag"
+WORDWEB_FILE = "data/test/wordweb.json"
 STATE_FILE = "data/test/dialogue_state.json"
 DIALOGUE_LOG_FILE = "data/test/dialogue_log.jsonl"
 FAISS_INDEX_FILE = "data/test/faiss.index"
@@ -47,44 +52,74 @@ def save_all_data(force: bool = False) -> bool:
         return True
 
 
-def _do_save_all_data():
-    """实际执行保存（调用方需持有 _io_lock）。"""
-    from core.memory_engine import _data_lock, _flush_hot_memory_timestamps, _get_db, hot_ids, memories
-    with _data_lock:
-        db = _get_db()
-        # 热记忆的最新时间/强化结果落库（与过期判定共用同一段逻辑，避免两处不一致）
-        _flush_hot_memory_timestamps(db)
+def _memory_json_disabled() -> bool:
+    """memory.json 是否已完成迁移（迁移后不再整份写这个 36MB 级文件）。"""
+    return os.path.exists(MEMORY_MIGRATED_FLAG)
 
-        os.makedirs("data/test", exist_ok=True)
-        serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in list(links.items())}
-        serializable_word_links = {f"{a}||{b}": val for (a, b), val in list(wordweb.items())}
-        data = {
-            "memories": {mid: memories[mid] for mid in list(hot_ids) if mid in memories},
+
+def _snapshot_hot_state():
+    """在短锁内取一份热数据快照，供锁外写盘使用。
+
+    此前 dump JSON、写 faiss、同步 links 全在 _data_lock 内完成，
+    36MB 序列化 + 磁盘抖动会把认知循环整段卡住。
+    """
+    from core.memory_engine import _data_lock, _faiss_index, _faiss_to_mem
+    with _data_lock:
+        mems = {mid: memories[mid] for mid in list(hot_ids) if mid in memories}
+        lks = dict(links)
+        words = dict(wordweb)
+        faiss_index = _faiss_index
+        faiss_mapping = list(_faiss_to_mem)
+    return mems, lks, words, faiss_index, faiss_mapping
+
+
+def _do_save_all_data():
+    """实际执行保存（调用方需持有 _io_lock）。I/O 全部在 _data_lock 之外。"""
+    import faiss
+
+    # 1) 热记忆时间字段 + 热链接增量：交给单写者（内部自行加短锁、写库）
+    from core.memory_writer import WRITER
+    WRITER.submit("sync_links", wait=True)
+
+    # 2) 锁外取快照并写派生文件
+    mems, lks, words, faiss_index, faiss_mapping = _snapshot_hot_state()
+    os.makedirs("data/test", exist_ok=True)
+
+    if not _memory_json_disabled():
+        # 未迁移的旧库仍写 memory.json，保持兼容；迁移后不再产生这个大文件。
+        serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in lks.items()}
+        serializable_word_links = {f"{a}||{b}": val for (a, b), val in words.items()}
+        atomic_write_json(MEMORY_FILE, {
+            "memories": mems,
             "links": serializable_sentence_links,
             "wordweb": serializable_word_links,
-        }
-        tmp_file = MEMORY_FILE + ".tmp"
-        with open(tmp_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_file, MEMORY_FILE)
+        })
 
-        # 热链接增量下沉到 SQLite（只写本轮发生变化的行）
-        from core.memory_engine import _sync_all_links_to_sqlite
-        _sync_all_links_to_sqlite()
+    # 字词网络单独落盘（memory.json 停写后它是唯一副本）
+    serializable_word_links = {f"{a}||{b}": val for (a, b), val in words.items()}
+    atomic_write_json(WORDWEB_FILE, serializable_word_links)
 
-        clock.save_state()
+    # 3) 热链接下沉已在上面由写者完成
 
-        from core.memory_engine import _faiss_index, _faiss_to_mem
-        import faiss
-        faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
-        with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_faiss_to_mem, f, ensure_ascii=False)
+    clock.save_state()
+
+    # faiss：先写临时文件再替换，避免主进程读到半截索引
+    if faiss_index is not None:
+        tmp_index = FAISS_INDEX_FILE + ".tmp"
+        try:
+            faiss.write_index(faiss_index, tmp_index)
+            os.replace(tmp_index, FAISS_INDEX_FILE)
+        finally:
+            try:
+                if os.path.exists(tmp_index):
+                    os.remove(tmp_index)
+            except OSError:
+                pass
+    atomic_write_json(FAISS_MAPPING_FILE, faiss_mapping)
 
     # 保存每日指标计数器快照
     from core.memory_engine import _export_metrics_counters
-    metrics = _export_metrics_counters()
-    with open(METRICS_COUNTERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(metrics, f, ensure_ascii=False)
+    atomic_write_json(METRICS_COUNTERS_FILE, _export_metrics_counters())
 
     # 保存生物钟状态（精力/睡眠压力/睡眠债）
     try:
@@ -92,6 +127,136 @@ def _do_save_all_data():
         BIORHYTHM.save()
     except Exception:
         pass
+
+    PROBE.gauge("memory.hot", len(mems))
+    PROBE.gauge("links.hot", len(lks))
+    PROBE.gauge("wordweb.size", len(words))
+
+def migrate_memory_json() -> dict:
+    """启动时把旧的 memory.json 数据并入 SQLite，然后停用该缓存文件。
+
+    顺序必须是“先恢复、再删除”：
+      1. 读 memory.json（存在时），把 memories / links 逐条写入 SQLite；
+      2. wordweb 没有 SQLite 表，单独写到 wordweb.json；
+      3. 提交事务并 fsync；
+      4. 成功后把 memory.json 改名为 .migrated.bak，并写下迁移标记；
+      5. 下一次启动看到标记 + .bak 时才真正删除 .bak。
+
+    返回 {"migrated": bool, "memories": n, "links": n, "wordweb": n, "reason": str}
+    """
+    result = {"migrated": False, "memories": 0, "links": 0, "wordweb": 0, "reason": ""}
+
+    # 已经迁移过：清理上一轮留下的备份即可
+    if _memory_json_disabled():
+        if os.path.exists(MEMORY_BAK_FILE):
+            try:
+                os.remove(MEMORY_BAK_FILE)
+                result["reason"] = "已迁移，清理备份"
+            except OSError as e:
+                result["reason"] = f"已迁移，备份清理失败: {e}"
+        else:
+            result["reason"] = "已迁移"
+        return result
+
+    if not os.path.exists(MEMORY_FILE):
+        # 从来没有 memory.json：直接打标记，之后不再产生它
+        atomic_write_text(MEMORY_MIGRATED_FLAG, json.dumps({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "source": "none",
+        }, ensure_ascii=False))
+        result["reason"] = "无 memory.json，跳过迁移"
+        return result
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        result["reason"] = f"memory.json 无法解析，保持原状: {e}"
+        return result
+
+    from core.memory_engine import _get_db
+    import numpy as np
+
+    db = _get_db()
+    mem_count = link_count = 0
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        for mem_id, mem in (data.get("memories") or {}).items():
+            if not isinstance(mem, dict) or not mem.get("content"):
+                continue
+            vector = mem.get("vector") or []
+            try:
+                vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError):
+                continue
+            if vec.size == 0:
+                continue
+            now = float(mem.get("last_accessed") or time.time())
+            db.execute(
+                """INSERT OR IGNORE INTO memories
+                   (id, content, vector, half_life, last_accessed, creation_time,
+                    last_strengthen_time, concept_tag_ids)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mem_id, str(mem["content"]), vec.tobytes(),
+                    float(mem.get("half_life") or 2 * 24 * 3600),
+                    now,
+                    float(mem.get("creation_time") or now),
+                    float(mem.get("last_strengthen_time") or now),
+                    json.dumps(mem.get("concept_tag_ids") or [], ensure_ascii=False),
+                ),
+            )
+            mem_count += 1
+
+        for key_str, val in (data.get("links") or {}).items():
+            if not isinstance(val, dict) or "||" not in str(key_str):
+                continue
+            src, tgt = str(key_str).split("||", 1)
+            db.execute(
+                """INSERT OR REPLACE INTO links
+                   (src, tgt, weight, type, last_accessed, creation_time)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    src, tgt,
+                    float(val.get("weight", 0.0)),
+                    str(val.get("type", "semantic")),
+                    float(val.get("last_accessed") or val.get("creation_time") or 0.0),
+                    float(val.get("creation_time") or 0.0),
+                ),
+            )
+            link_count += 1
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        result["reason"] = f"写入 SQLite 失败，保持 memory.json 原状: {e}"
+        return result
+
+    # wordweb：单独落盘（SQLite 无对应表）
+    wordweb_data = data.get("wordweb") or {}
+    if wordweb_data:
+        atomic_write_json(WORDWEB_FILE, wordweb_data)
+        result["wordweb"] = len(wordweb_data)
+
+    # 提交成功后才停用 source of truth
+    try:
+        os.replace(MEMORY_FILE, MEMORY_BAK_FILE)
+    except OSError as e:
+        result["reason"] = f"数据已入库，但重命名 memory.json 失败: {e}"
+        return result
+
+    atomic_write_text(MEMORY_MIGRATED_FLAG, json.dumps({
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "memories": mem_count,
+        "links": link_count,
+        "wordweb": result["wordweb"],
+    }, ensure_ascii=False))
+    result.update({"migrated": True, "memories": mem_count, "links": link_count,
+                   "reason": "迁移完成"})
+    return result
+
 
 def _db_memory_count() -> int:
     """SQLite 中的记忆条数（判断是否需要冷启动注入的依据）。"""
@@ -185,24 +350,33 @@ def _restore_links_from_db():
 def load_all_data():
     """加载记忆与链接。
 
-    **SQLite 是权威数据源**，JSON 仅是"热记忆的可重建缓存"：
-      - JSON 不存在（例如已执行过 migrate_json_to_sqlite，它会主动删除 JSON）
-        时，从 SQLite 恢复。
-      - JSON 存在时先加载它（快），随后按需从 SQLite 补齐。
+    顺序（按确认的方案）：
+      1. 先尝试从 memory.json 恢复并迁入 SQLite，成功后停用该文件；
+      2. 没有 memory.json（或已迁移）时，从 SQLite 恢复热记忆与链接；
+      3. wordweb 从 wordweb.json 恢复（memory.json 停写后它是唯一副本）。
 
-    注意：热集上限（MAX_HOT_SIZE）天然小于全库总量，因此"热记忆 < 全库"
-    是常态而非异常，不能据此判定 JSON 落后而每次全量重取——存量库上这一步
-    是分钟级的（实测服务端开机 636s 的主要来源）。JSON 未覆盖的记忆与链接
-    由 _load_memory_from_db / _load_links_for_memory 在访达时按需装入，
-    可达性不受影响。
+    **SQLite 是权威数据源**，JSON 只是历史遗留的热缓存。
+    热集上限（MAX_HOT_SIZE）天然小于全库总量，因此"热记忆 < 全库"
+    是常态而非异常；未覆盖的记忆由 _load_memory_from_db 在访达时按需装入。
     """
     global memories, links
     t_total = time.time()
     with _io_lock:
         from core.memory_engine import hot_ids
 
-        # 1) 先尝试 JSON 缓存（快路径）
+        # 0) memory.json → SQLite 迁移（只做一次；先恢复、再停用文件）
+        t_migrate = time.time()
+        try:
+            migration = migrate_memory_json()
+            print(f"[持久化] memory.json 迁移：{migration['reason']}"
+                  f"（记忆 {migration['memories']}，链接 {migration['links']}，"
+                  f"字词 {migration['wordweb']}，{time.time() - t_migrate:.1f}s）")
+        except Exception as e:
+            print(f"[持久化] memory.json 迁移失败，保留原文件并继续：{e}")
+
+        # 1) 兼容：迁移失败时 memory.json 仍存在，按旧路径先读它（快路径）
         t_json = time.time()
+        legacy_wordweb = None
         if os.path.exists(MEMORY_FILE):
             try:
                 with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
@@ -215,26 +389,39 @@ def load_all_data():
                 for key_str, val in data.get("links", {}).items():
                     src, tgt = key_str.split("||")
                     links[(src, tgt)] = val
-                wordweb.clear()
-                for key_str, val in data.get("wordweb", {}).items():
-                    a, b = key_str.split("||")
-                    wordweb[(a, b)] = val
-                print(f"[持久化] JSON 缓存加载完成：记忆 {len(memories)}，链接 {len(links)}，"
-                      f"字词 {len(wordweb)}（{time.time() - t_json:.1f}s）")
+                legacy_wordweb = data.get("wordweb") or None
+                print(f"[持久化] JSON 缓存加载完成：记忆 {len(memories)}，链接 {len(links)}"
+                      f"（{time.time() - t_json:.1f}s）")
             except Exception as e:
                 print(f"[持久化] JSON 缓存损坏，将从 SQLite 恢复：{e}")
                 memories.clear()
                 hot_ids.clear()
 
+        # 1b) 字词网络：优先 wordweb.json；迁移未完成时回退到 memory.json 里的副本
+        t_word = time.time()
+        if os.path.exists(WORDWEB_FILE) and not wordweb:
+            try:
+                with open(WORDWEB_FILE, "r", encoding="utf-8-sig") as f:
+                    raw = json.load(f)
+                wordweb.clear()
+                for key_str, val in (raw or {}).items():
+                    if "||" not in str(key_str):
+                        continue
+                    a, b = str(key_str).split("||", 1)
+                    wordweb[(a, b)] = val
+                print(f"[持久化] 字词网络恢复 {len(wordweb)} 条（{time.time() - t_word:.1f}s）")
+            except Exception as e:
+                print(f"[持久化] wordweb.json 读取失败，保持为空：{e}")
+        elif not wordweb and legacy_wordweb:
+            wordweb.clear()
+            for key_str, val in legacy_wordweb.items():
+                if "||" not in str(key_str):
+                    continue
+                a, b = str(key_str).split("||", 1)
+                wordweb[(a, b)] = val
+            print(f"[持久化] 字词网络从 memory.json 恢复 {len(wordweb)} 条（迁移尚未完成）")
+
         # 2) 判断是否需要从 SQLite 补载热记忆。
-        #
-        # 旧判据是 "len(memories) < db_total"，但热集上限（MAX_HOT_SIZE）天然
-        # 小于全库总量，该条件恒为真 —— 于是每次启动都做一次全表扫描 + 排序
-        # 的昂贵恢复（服务端 5 万级库实测数百秒），绝大多数时候纯属浪费。
-        #
-        # 现改为：JSON 不可用时才恢复；JSON 可用时，仅当数据库里存在比 JSON
-        # 更新的记忆（上次未及保存就退出）才补载。判据走 rowid（O(1)），
-        # 不做任何全表扫描、不依赖任何索引。
         t_check = time.time()
         db_total = _db_memory_count()
         need_restore = not memories
@@ -247,7 +434,7 @@ def load_all_data():
                 )
                 if db_newest > json_newest + 1.0:
                     need_restore = True
-                    print(f"[持久化] 数据库有比 JSON 更新的记忆"
+                    print(f"[持久化] 数据库有比内存更新的记忆"
                           f"（新 {db_newest - json_newest:.0f}s），补载热记忆")
             except Exception:
                 need_restore = False
@@ -256,7 +443,7 @@ def load_all_data():
               f"[持久化] 落后判定完成：{time.time() - t_check:.2f}s（将补载）")
         if need_restore:
             if not memories:
-                print(f"[持久化] 从 SQLite 恢复记忆（JSON 缺失或损坏），共 {db_total} 条")
+                print(f"[持久化] 从 SQLite 恢复记忆（JSON 缺失或已迁移），共 {db_total} 条")
             t_restore = time.time()
             _restore_hot_memories_from_db()
             print(f"[持久化] 热记忆恢复完成：{len(memories)} 条"
@@ -344,12 +531,11 @@ def _faiss_snapshot_is_valid(index, mapping, db_total: int) -> bool:
 # ========== 对话状态持久化 ==========
 
 def save_state():
-    """保存对话状态到 JSON 文件"""
+    """保存对话状态到 JSON 文件（原子写，避免被读到半截）"""
     with _io_lock:
         os.makedirs("data/test", exist_ok=True)
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            from utils.dialogue_state import current_state
-            json.dump(current_state, f, ensure_ascii=False, indent=2)
+        from utils.dialogue_state import current_state
+        atomic_write_json(STATE_FILE, current_state)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -386,92 +572,96 @@ def append_dialogue(user_input: str, bot_reply: str):
 # ========== 睡眠清理 ==========
 def sleep_cleanup():
     """
-    睡眠巩固阶段的全量维护（当前版本已恢复物理删除）：
+    睡眠巩固阶段的全量维护：
     1. 剪枝权重过低的链接
     2. 整理字词网络（衰减 + 剪枝）
     3. 物理删除衰变到极致的记忆
     4. 全量持久化（含重建 faiss 索引）
 
-    锁顺序：本函数**先取 _io_lock，再在其内部取 _data_lock**，
-    与 save_all_data 保持一致（它同样是 io→data）。
-    此前本函数是 data→io（在 _data_lock 内调用 save_all_data），
-    与 save_all_data 构成 AB-BA 环路，两个线程交错时会互相等待造成死锁。
+    锁顺序：**先 _io_lock，再取 _data_lock 做内存改动，随后释放 _data_lock 再落盘**。
+    此前整段维护（含全表扫描、faiss 重建、36MB JSON dump）都压在 _data_lock 内，
+    认知循环与消息处理会被整段卡住。
     """
-    from core.memory_engine import _data_lock
     with _io_lock:                    # 先 io
-        with _data_lock:              # 后 data
-            _do_sleep_cleanup_locked()
+        stats = _do_sleep_cleanup_locked()
+        _do_save_all_data()           # 锁外 I/O（_do_save_all_data 自己只短锁取快照）
+        _write_daily_metrics()
+    print(f"[睡眠维护] 链接剪枝 {stats['links']}，字词清理 {stats['words']}，"
+          f"物理删除 {stats['expired']} 条记忆")
 
 
-def _do_sleep_cleanup_locked():
-    """睡眠维护的实际工作。调用方需同时持有 _io_lock 与 _data_lock。"""
+def _do_sleep_cleanup_locked() -> dict:
+    """睡眠维护的内存改动部分（内部自行取/放 _data_lock）。
+
+    返回 {"links","words","expired"} 供上层打日志。
+    """
     from core.memory_engine import (
-        _get_db, _bump_link_deleted, _deleted_links, _dirty_links,
+        _data_lock, _get_db, _bump_link_deleted, _deleted_links, _dirty_links,
         _purge_expired_memories, _rebuild_faiss_index,
-        _evict_cold_memories, _evict_cold_links, _write_daily_metrics,
+        _evict_cold_memories, _evict_cold_links,
     )
     now = clock.now()
     removed_links = 0
     removed_wordweb = 0
 
-    # 1. 链接剪枝（内存热链接）
-    dead_links = []
-    for key, data in list(links.items()):
-        delta = now - data.get("last_accessed", data.get("creation_time", now))
-        decay = 2 ** (-delta / (7 * 24 * 3600))  # LINK_HALF_LIFE
-        if data["weight"] * decay < 0.01:
-            dead_links.append(key)
-    for key in dead_links:
-        del links[key]
-        removed_links += 1
-        _dirty_links.discard(key)
-        _deleted_links.add(key)
-        _bump_link_deleted()
-    # 剪枝 SQLite 中已下沉的冷链接（不在内存中的）
-    _cold_db = _get_db()
-    _cold_rows = _cold_db.execute(
-        "SELECT src, tgt, weight, last_accessed, creation_time FROM links"
-    ).fetchall()
-    _cold_dead = []
-    for src, tgt, weight, last_accessed, creation_time in _cold_rows:
-        if (src, tgt) in links:
-            continue  # 热链接跳过，交给内存管理
-        _delta = now - (last_accessed or creation_time or now)
-        if weight * (2 ** (-_delta / (7 * 24 * 3600))) < 0.01:
-            _cold_dead.append((src, tgt))
-    for src, tgt in _cold_dead:
-        _cold_db.execute("DELETE FROM links WHERE src = ? AND tgt = ?", (src, tgt))
-        removed_links += 1
-        _bump_link_deleted()
-    _cold_db.commit()
+    with _data_lock:
+        # 1. 链接剪枝（内存热链接）
+        dead_links = []
+        for key, data in list(links.items()):
+            delta = now - data.get("last_accessed", data.get("creation_time", now))
+            decay = 2 ** (-delta / (7 * 24 * 3600))  # LINK_HALF_LIFE
+            if data["weight"] * decay < 0.01:
+                dead_links.append(key)
+        for key in dead_links:
+            del links[key]
+            removed_links += 1
+            _dirty_links.discard(key)
+            _deleted_links.add(key)
+            _bump_link_deleted()
 
-    # 2. 字词网络剪枝（衰减后共现次数过低则删除）
-    dead_words = []
-    for (a, b), wdata in list(wordweb.items()):
-        delta = now - wdata.get("last_updated", now)
-        decay = 2 ** (-delta / (7 * 24 * 3600))
-        if wdata["forward_count"] * decay < 0.5:
-            dead_words.append((a, b))
-    for key in dead_words:
-        del wordweb[key]
-        removed_wordweb += 1
+        # 2. 字词网络剪枝（衰减后共现次数过低则删除）
+        dead_words = []
+        for (a, b), wdata in list(wordweb.items()):
+            delta = now - wdata.get("last_updated", now)
+            decay = 2 ** (-delta / (7 * 24 * 3600))
+            if wdata["forward_count"] * decay < 0.5:
+                dead_words.append((a, b))
+        for key in dead_words:
+            del wordweb[key]
+            removed_wordweb += 1
 
-    # 3. 物理删除衰变记忆，并重建 faiss 索引
+    # 3. 物理删除衰变记忆（内部自行加锁，并同步 SQLite）
     expired = _purge_expired_memories()
     if expired:
         _rebuild_faiss_index()          # faiss 全量重建（从 SQLite 剩余记忆重新构建）
         print(f"[睡眠维护] 物理删除 {len(expired)} 条衰变记忆，faiss 索引已重建")
 
-    # 3.5 冷记忆淘汰：将超出热记忆上限的最久未访问记忆移出内存（写入 SQLite）
+    # 3.5 冷记忆淘汰：挑名单在短锁内，写库在锁外
     _evict_cold_memories()
     _evict_cold_links()
 
-    # 4. 全量持久化（含热数据写入 JSON、faiss 索引、时钟状态）
-    #    此处已在 _io_lock 内，必须走不再取锁的内部实现，否则重入会死锁。
-    _do_save_all_data()
-    print(f"[睡眠维护] 链接剪枝 {removed_links}，字词清理 {removed_wordweb}，物理删除 {len(expired)} 条记忆")
+    # 4. 剪枝 SQLite 中已下沉的冷链接（不在内存中的）
+    #    这一步是全表扫描 + 逐条 DELETE，放在锁外执行。
+    _cold_db = _get_db()
+    _cold_rows = _cold_db.execute(
+        "SELECT src, tgt, weight, last_accessed, creation_time FROM links"
+    ).fetchall()
+    hot_keys = set(links.keys())
+    to_delete = []
+    for src, tgt, weight, last_accessed, creation_time in _cold_rows:
+        if (src, tgt) in hot_keys:
+            continue  # 热链接跳过，交给内存管理
+        _delta = now - (last_accessed or creation_time or now)
+        if weight * (2 ** (-_delta / (7 * 24 * 3600))) < 0.01:
+            to_delete.append((src, tgt))
+    if to_delete:
+        _cold_db.executemany("DELETE FROM links WHERE src = ? AND tgt = ?", to_delete)
+        _cold_db.commit()
+        for _ in to_delete:
+            removed_links += 1
+            _bump_link_deleted()
 
-    _write_daily_metrics()
+    return {"links": removed_links, "words": removed_wordweb, "expired": len(expired)}
 
 # ========== 临时数据迁移（将json导入SQLite） ==========
 def migrate_json_to_sqlite():

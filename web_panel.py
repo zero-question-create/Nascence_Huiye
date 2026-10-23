@@ -231,6 +231,12 @@ def _collect_stats() -> dict:
             data["clock_text"] = f"{days}d {hours:02d}:{mins:02d}  ×{clock.speed:g}"
     except Exception as e:
         data["stats_error"] = str(e)
+    # 观测探针：LLM 调用/耗时/token、锁等待、事件循环阻塞、缓存命中
+    try:
+        from utils.metrics_probe import PROBE
+        data["probe"] = PROBE.snapshot()
+    except Exception:
+        pass
     try:
         from core.biorhythm import BIORHYTHM
         snap = BIORHYTHM.snapshot()
