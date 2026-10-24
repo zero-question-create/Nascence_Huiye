@@ -432,29 +432,34 @@ def _attach_media_memory_ids(media_list: list, memory_ids: list, media_refs: lis
 
 
 # ---------- 回应目标 ----------
-# 最近一条等待回应的消息作者。认知循环发言时据此决定是否 @ 回去。
-_reply_target = None          # {"group_id","qq","name","message_id","ts","mention_me"}
+# 最近一条等待回应的消息。认知循环发言时据此决定 @ 谁、引用哪条。
+_reply_target = None          # {"group_id","qq","name","message_id","ts","mention_me","quoted_me"}
 _REPLY_TARGET_TTL = 180.0     # 3 分钟内的消息才视为“正在回应”
 _last_at_time = {}            # {(group_id, qq): 上次 @ 的时间}，防刷屏
+_quoted_messages = {}         # {(group_id, message_id): 上次引用的时间}，防重复引用
+_QUOTED_MESSAGES_MAX = 128    # 引用记录上限，避免长期运行无限增长
 
 
-def _remember_reply_target(group_id: str, qq: str, name: str, message_id: str, mention_me: bool = False):
-    """记录本轮消息的回应目标（供认知循环 @ 使用）。"""
+def _remember_reply_target(group_id: str, qq: str, name: str, message_id: str,
+                           mention_me: bool = False, quoted_me: bool = False):
+    """记录本轮消息的回应目标（供认知循环 @ 或引用）。"""
     global _reply_target
     _reply_target = {
         "group_id": str(group_id),
         "qq": str(qq),
         "name": str(name or ""),
-        "message_id": message_id,
+        "message_id": str(message_id or ""),
         "ts": time.time(),
         "mention_me": bool(mention_me),
+        "quoted_me": bool(quoted_me),
     }
 
 
-def take_reply_target(mention_only: bool = False) -> dict | None:
+def take_reply_target(mention_only: bool = False, directed_only: bool = False) -> dict | None:
     """取出最近的回应目标；过期或不符合条件时返回 None。
 
     mention_only=True 时只返回“直接 @ 了机器人”的目标——普通群聊不主动 @ 人。
+    directed_only=True 时返回“冲着机器人来的”目标：直接 @ 了它，或引用了它的话。
     """
     target = _reply_target
     if not target:
@@ -462,6 +467,8 @@ def take_reply_target(mention_only: bool = False) -> dict | None:
     if time.time() - target.get("ts", 0) > _REPLY_TARGET_TTL:
         return None
     if mention_only and not target.get("mention_me"):
+        return None
+    if directed_only and not (target.get("mention_me") or target.get("quoted_me")):
         return None
     return dict(target)
 
@@ -474,6 +481,30 @@ def _at_cooldown_ok(group_id: str, qq: str, cooldown: float = 30.0) -> bool:
     if now - last < cooldown:
         return False
     _last_at_time[key] = now
+    return True
+
+
+def _quote_once_ok(group_id: str, message_id: str, ttl: float = _REPLY_TARGET_TTL) -> bool:
+    """同一条消息在回应窗口内只引用一次。
+
+    与 @ 的冷却不同，这里按 message_id 而不是按人：同一条消息回第二遍时
+    再引用一次没有信息量，只会把聊天窗口挤满。
+    """
+    mid = str(message_id or "").strip()
+    if not mid:
+        return False
+    key = (str(group_id), mid)
+    now = time.time()
+    if now - _quoted_messages.get(key, 0.0) < ttl:
+        return False
+    if len(_quoted_messages) >= _QUOTED_MESSAGES_MAX:
+        for old_key in [k for k, ts in _quoted_messages.items() if now - ts >= ttl]:
+            _quoted_messages.pop(old_key, None)
+        # 清理后仍满（短时间内消息极多）：丢最早的一半，保证有界
+        if len(_quoted_messages) >= _QUOTED_MESSAGES_MAX:
+            for old_key in list(_quoted_messages)[: _QUOTED_MESSAGES_MAX // 2]:
+                _quoted_messages.pop(old_key, None)
+    _quoted_messages[key] = now
     return True
 
 
@@ -874,10 +905,11 @@ async def _handle_group_message_impl(data: dict):
                 "怎么啦？我在这呢。",
                 "在的，找我有什么事吗？"
             ])
-        # 被叫的人就在这一句里，直接 @ 回去，避免对方不知道在跟谁说话。
-        # 兼容旧发送签名：自定义/测试发送函数可能不接受 at_qq，退化为不带 @ 发送。
+        # 被叫的人就在这一句里，直接 @ 回去并引用这条呼叫，避免对方不知道在跟谁说话。
+        # 兼容旧发送签名：自定义/测试发送函数可能不接受新参数，退化为普通发送。
         try:
-            await send_group_msg(group_id, wake_reply, at_qq=sender_id)
+            await send_group_msg(group_id, wake_reply, at_qq=sender_id,
+                                 reply_msg_id=message_id or None)
         except TypeError:
             await send_group_msg(group_id, wake_reply)
         from core.llm_interface import add_to_history
@@ -889,10 +921,12 @@ async def _handle_group_message_impl(data: dict):
     quote_id = extract_quote_message_id(data.get("message", []))
     extra_context = ""
     quote_info = None
+    quoted_me = False          # 本条消息引用的是不是机器人自己说过的话
     if quote_id:
         quoted_message = await fetch_quoted_message(quote_id, group_id)
         if quoted_message:
-            quoted_sender, quoted_text = quoted_message
+            quoted_sender, quoted_text, quoted_sender_id = quoted_message
+            quoted_me = (quoted_sender_id == get_bot_qq())
             extra_context = f"{sender_name}引用了{quoted_sender}之前的一句话：'{quoted_text}'"
             # 结构化引用随历史一起保存，供短期上下文还原引用关系
             quote_info = {"sender": quoted_sender, "text": quoted_text}
@@ -905,9 +939,10 @@ async def _handle_group_message_impl(data: dict):
     from utils.dialogue_state import set_state
     from utils.persistence import save_state
 
-    # 记录本轮的回应目标：被 @ 时直接 @ 回发送者；其余情况不主动 @。
-    # 认知循环发言时从这里取“最近一条待回应的目标”。
-    _remember_reply_target(group_id, sender_id, sender_name, message_id, mention_me=is_mentioned_me)
+    # 记录本轮的回应目标：被 @ 时直接 @ 回发送者，被引用时引用回原消息；
+    # 其余情况既不 @ 人也不引用。认知循环发言时从这里取“最近一条待回应的目标”。
+    _remember_reply_target(group_id, sender_id, sender_name, message_id,
+                           mention_me=is_mentioned_me, quoted_me=quoted_me)
 
     media_text = "、".join(_media_phrase(m_type, d) for m_type, d in media_list)
 
@@ -1017,9 +1052,11 @@ async def _handle_group_message_impl(data: dict):
     BUS.message.emit(BOT_NAME, f"[思考中...]", "QQ")
 
 SEND_ACK_TIMEOUT = 5.0   # 等待 NapCat 回执的秒数；超时即视为未送达
+MEDIA_ACK_TIMEOUT = 15.0  # 图片/表情包要经 NapCat 上传到 QQ，5 秒经常不够
 
 
-async def _send_action_and_wait(websocket, payload: dict, echo: str) -> bool:
+async def _send_action_and_wait(websocket, payload: dict, echo: str,
+                                timeout: float = None) -> bool:
     """发送 OneBot Action 并等待 NapCat 回执，返回是否确认成功。
 
     与 fetch_quoted_message 复用同一套 echo→Future 机制（ws_handler 主循环
@@ -1027,17 +1064,27 @@ async def _send_action_and_wait(websocket, payload: dict, echo: str) -> bool:
     仅挂起当前协程，事件循环与其他消息处理照常运行。
 
     判定标准：response['status'] == 'ok'。超时/断线/异常一律视为未送达。
+    失败时把 NapCat 的 status/retcode/message 记下来——只写"未送达"时，
+    图片发不出去根本看不出是文件、格式还是尺寸被拒。
     """
+    wait = SEND_ACK_TIMEOUT if timeout is None else timeout
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     try:
         async with _action_lock:
             _pending_actions[echo] = future
             await websocket.send(json.dumps(payload, ensure_ascii=False))
-        response = await asyncio.wait_for(future, timeout=SEND_ACK_TIMEOUT)
-        return str(response.get("status") or "").lower() == "ok"
+        response = await asyncio.wait_for(future, timeout=wait)
+        ok = str(response.get("status") or "").lower() == "ok"
+        if not ok:
+            logger.warning(
+                f"NapCat 拒绝发送（echo={echo}，status={response.get('status')}，"
+                f"retcode={response.get('retcode')}，"
+                f"message={str(response.get('message'))[:200]}）"
+            )
+        return ok
     except asyncio.TimeoutError:
-        logger.warning(f"发送未收到回执（echo={echo}，超时 {SEND_ACK_TIMEOUT}s），按未送达处理")
+        logger.warning(f"发送未收到回执（echo={echo}，超时 {wait:g}s），按未送达处理")
         return False
     except Exception as e:
         logger.error(f"发送等待回执异常（echo={echo}）: {e}")
@@ -1147,9 +1194,18 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "", as_
     # 跨容器支持：采用 base64:// 协议发送二进制图片，完全不依赖容器间共享文件系统，
     # NapCat 无论在宿主机、其他容器或远程均可从 WebSocket 内存解码并上传至 QQ。
     try:
+        file_size = os.path.getsize(str(file_path))
+        if file_size <= 0:
+            logger.error(f"媒体发送失败：文件为空 {file_path}")
+            return False
         with open(str(file_path), "rb") as f:
             b64_content = base64.b64encode(f.read()).decode("utf-8")
         image_data = {"file": f"base64://{b64_content}"}
+        logger.info(
+            f"发送媒体：{os.path.basename(str(file_path))}"
+            f"（{file_size / 1048576:.2f} MB，base64 {len(b64_content) / 1048576:.2f} MB，"
+            f"sticker={as_sticker}）"
+        )
     except Exception as e:
         logger.error(f"媒体 Base64 编码失败 ({file_path}): {e}")
         return False
@@ -1168,7 +1224,7 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "", as_
     }
     # 与文本发送一样等待回执：此前只判断"本地 send 未抛异常"就返回 True，
     # NapCat 拒绝时也会被记为发送成功（F20）。
-    ok = await _send_action_and_wait(websocket, payload, echo)
+    ok = await _send_action_and_wait(websocket, payload, echo, timeout=MEDIA_ACK_TIMEOUT)
     if ok:
         logger.info(f"已发送并确认送达媒体（echo={echo}）: {file_path}")
         from core.memory_engine import _bump_message_sent
@@ -1177,8 +1233,8 @@ async def send_group_media(group_id: str, file_path: str, caption: str = "", as_
         logger.warning(f"媒体未确认送达（echo={echo}）: {file_path}")
     return ok
 
-async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Optional[Tuple[str, str]]:
-    """通过 WebSocket 获取引用消息，返回（原发送者名称，消息正文）。"""
+async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Optional[Tuple[str, str, str]]:
+    """通过 WebSocket 获取引用消息，返回（原发送者名称，消息正文，原发送者 QQ）。"""
     global _action_counter
     websocket = _napcat_websocket
     if websocket is None:
@@ -1241,7 +1297,7 @@ async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Opti
             quoted_sender,
             clean_msg,
         )
-        return quoted_sender, clean_msg
+        return quoted_sender, clean_msg, quoted_sender_id
     except asyncio.TimeoutError:
         logger.error("获取引用消息超时 (msg_id=%s)", msg_id)
     except Exception as e:

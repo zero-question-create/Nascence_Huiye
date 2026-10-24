@@ -1,4 +1,5 @@
 # core/cognition.py
+import inspect
 import re
 import datetime
 import time
@@ -654,6 +655,22 @@ def _resolve_target_group(fallback: str) -> str:
     return fallback
 
 
+def _send_kwargs_for(send_func, kwargs: dict) -> dict:
+    """按发送函数的真实签名裁剪可选参数。
+
+    send_func 可能是旧签名的自定义/测试发送函数，直接传 reply_msg_id/at_qq
+    会抛 TypeError。这里用签名过滤而不是 try/except 重试：发送中途抛 TypeError
+    时消息可能已经发出，重试会造成重复发言。
+    """
+    try:
+        params = inspect.signature(send_func).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 def _consume_note_memory():
     """取出并清空记事本回看通道，返回 (内容, 真实时间戳)；无内容时返回 (None, None)。
 
@@ -688,7 +705,8 @@ def _pick_seed_text() -> str | None:
 
 
 async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
-                               keywords, media_send_func, target_group_id):
+                               keywords, media_send_func, target_group_id,
+                               context_hint: str = ""):
     """执行一次动作抉择并落实动作。返回描述字符串（无动作时返回 None）。
 
     抉择本身是同步 LLM 调用，放进线程池执行；语义上仍属于本轮的最后一步。
@@ -738,7 +756,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             should_speak=should_speak,
             said_text=thought_text if talk_sent else "",
             keywords=keywords,
-            context_hint="刚刚有人在群里说话" if keywords else "",
+            context_hint=context_hint or ("刚刚有人在群里说话" if keywords else ""),
         )
     )
     if not result:
@@ -855,7 +873,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
     global _pending_note_memory
 
     from .llm_interface import add_to_history
-    from .memory_engine import memories, access_memory
+    # 强制转向分支要按 ID 取记忆内容，必须在本函数作用域内可见
+    from .memory_engine import memories, access_memory, get_memory_content
 
     # 重置停止标志和抑制状态，允许新会话启动
     _graceful_stop = False
@@ -1060,6 +1079,17 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             dialogue_count = random.randint(4, 6)
             selected_msgs = _select_dialogue_window(get_all(), dialogue_count)
 
+            # 动作层需要知道"刚才谁说了什么"。只给"有人在说话"时，
+            # "发点表情包呗"这类明确请求会被当成闲聊：动作层翻几页就选 none。
+            action_context = ""
+            for _msg in reversed(selected_msgs):
+                if _msg.get("sender") != BOT_NAME:
+                    action_context = (
+                        f"最近一条群消息：{_msg.get('sender')}说："
+                        f"{str(_msg.get('content') or '')[:80]}"
+                    )
+                    break
+
             dialogue_memories = []
             dialogue_ts = []
             for msg in selected_msgs:
@@ -1189,24 +1219,29 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 目标群动态解析（改配置后无需重启）
             target_group = _resolve_target_group(target_group_id)
             at_qq = None
+            quote_msg_id = None
             if should_speak and thought_text and send_func and target_group:
-                # 直接 @ 了机器人的消息，回复时 @ 回发送者；普通群聊不主动 @ 人。
+                # 只回应“冲着机器人来的”消息：直接 @ 了它，或引用了它的话。
+                # 普通群聊既不主动 @ 人，也不引用别人的消息。
                 try:
                     import qq_bot as _qq
-                    reply_target = _qq.take_reply_target(mention_only=True)
-                    if reply_target and _qq._at_cooldown_ok(target_group, reply_target["qq"]):
-                        at_qq = reply_target["qq"]
+                    reply_target = _qq.take_reply_target(directed_only=True)
+                    # 目标必须属于本轮发送的群：多群白名单时，把 A 群的消息
+                    # 引用/@ 进 B 群会被 NapCat 直接拒发。
+                    if reply_target and str(reply_target.get("group_id", "")).strip() \
+                            == str(target_group).strip():
+                        if reply_target.get("mention_me") and reply_target.get("qq") \
+                                and _qq._at_cooldown_ok(target_group, reply_target["qq"]):
+                            at_qq = reply_target["qq"]
+                        if _qq._quote_once_ok(target_group, reply_target.get("message_id")):
+                            quote_msg_id = reply_target.get("message_id")
                 except Exception as e:
-                    append_log(f"[认知循环] 解析 @ 目标失败: {e}")
+                    append_log(f"[认知循环] 解析回应目标失败: {e}")
 
-                if at_qq is None:
-                    delivered = await send_func(target_group, thought_text)
-                else:
-                    try:
-                        delivered = await send_func(target_group, thought_text, at_qq=at_qq)
-                    except TypeError:
-                        # 兼容旧发送签名（自定义发送函数不接受 at_qq）
-                        delivered = await send_func(target_group, thought_text)
+                delivered = await send_func(
+                    target_group, thought_text,
+                    **_send_kwargs_for(send_func, {"reply_msg_id": quote_msg_id, "at_qq": at_qq}),
+                )
                 talk_sent = delivered is not False     # 兼容未返回值的旧签名
                 if delivered is False:
                     append_log(f"[认知循环] 消息发送失败，历史标记为未送达: {thought_text[:30]}")
@@ -1228,7 +1263,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             try:
                 acted = await _run_action_decision(
                     loop, thought_text, should_speak, talk_sent, current_keywords,
-                    media_send_func, target_group_id
+                    media_send_func, target_group_id, action_context
                 )
                 if acted:
                     append_log(f"[认知循环] 动作抉择已执行: {acted}")
