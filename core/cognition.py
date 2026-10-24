@@ -182,6 +182,36 @@ _inhibited_seeds: dict = {}                         # {种子节点ID: 剩余抑
 _inhibited_edges: dict = {}                         # {(src_id, tgt_id): 剩余抑制轮数}
 _inhibited_keywords: dict = {}                      # {关键词: 剩余抑制轮数}
 
+
+def _decay_inhibition() -> None:
+    """推进一轮抑制计时，把到期的种子/边/关键词放出来。
+
+    必须每轮调用一次，包括“无相关记忆，跳过本轮”这类提前 continue 的轮次。
+    原先只在产出回复的轮末衰减：关键词被抑制后检索必然为空、那一轮直接跳过，
+    计数永远等不到归零，信箱又把这些词原样回灌，认知循环就卡在空转里。
+    """
+    expired_seeds = 0
+    for sid in list(_inhibited_seeds):
+        _inhibited_seeds[sid] -= 1
+        if _inhibited_seeds[sid] <= 0:
+            del _inhibited_seeds[sid]
+            expired_seeds += 1
+    expired_edges = 0
+    for edge in list(_inhibited_edges):
+        _inhibited_edges[edge] -= 1
+        if _inhibited_edges[edge] <= 0:
+            del _inhibited_edges[edge]
+            expired_edges += 1
+    expired_keywords = 0
+    for kw in list(_inhibited_keywords):
+        _inhibited_keywords[kw] -= 1
+        if _inhibited_keywords[kw] <= 0:
+            del _inhibited_keywords[kw]
+            expired_keywords += 1
+    if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
+        append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
+
+
 # ========== 记事本回看通道（一次性）==========
 # 读文件或写文件时，把文件内容留给下一轮作为特供记忆（pinned）呈现。
 # 只在这一轮有效，用过即清；内容不进记忆库（不入库）。
@@ -637,6 +667,26 @@ def _consume_note_memory():
     return mem, clock.to_real_time(clock.now())
 
 
+def _pick_seed_text() -> str | None:
+    """取一条记忆当检索种子：优先浅层意识池，池空或内容缺失时退回随机记忆。
+
+    返回截断到 50 字的内容；记忆库为空时返回 None。
+    """
+    from .memory_engine import get_random_memory_id, get_memory_content, access_memory
+    if _shallow_pool:
+        mem_id = random.choice(list(_shallow_pool))
+        content = get_memory_content(mem_id)
+        if content:
+            return content[:50]
+    mem_id = get_random_memory_id()
+    if mem_id:
+        content = get_memory_content(mem_id)
+        if content:
+            access_memory(mem_id)
+            return content[:50]
+    return None
+
+
 async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
                                keywords, media_send_func, target_group_id):
     """执行一次动作抉择并落实动作。返回描述字符串（无动作时返回 None）。
@@ -850,6 +900,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
         try:
             loop = asyncio.get_event_loop()
 
+            # 抑制计时每轮推进一次，跳过本轮（检索为空）的轮次也算一轮
+            _decay_inhibition()
+
             # ============================
             # Step 1: 合并关键词信箱（追加，而不是整批替换）
             # ============================
@@ -869,21 +922,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # Step 2: 若无关键词，从记忆库取种子（线程安全）
             # ============================
             if not current_keywords:
-                from .memory_engine import get_random_memory_id, get_memory_content
-                seed_text = None
-                if _shallow_pool:
-                    mem_id = random.choice(list(_shallow_pool))
-                    content = get_memory_content(mem_id)
-                    if content:
-                        seed_text = content[:50]
-                if not seed_text:
-                    mem_id = get_random_memory_id()
-                    if mem_id:
-                        content = get_memory_content(mem_id)
-                        if content:
-                            seed_text = content[:50]
-                            access_memory(mem_id)
-
+                seed_text = _pick_seed_text()
                 if seed_text:
                     current_keywords = [seed_text]
                     append_log(f"[认知循环] 无新消息，随机种子: {seed_text[:30]}...")
@@ -899,6 +938,14 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 current_keywords = [kw for kw in current_keywords if kw not in _inhibited_keywords]
                 if len(current_keywords) < old_len:
                     append_log(f"[反刍抑制] 过滤 {old_len - len(current_keywords)} 个被抑制关键词，剩余: {current_keywords}")
+                    # 被抑制的词不能留在信箱里：下一轮合并会把它们原样带回，形成空转
+                    KEYWORDS.retain(current_keywords)
+                    if not current_keywords:
+                        # 全被抑制光了，检索必然为空；换一个新种子，别硬跑空轮
+                        seed_text = _pick_seed_text()
+                        if seed_text:
+                            current_keywords = [seed_text]
+                            append_log(f"[反刍抑制] 关键词全部被抑制，改用新种子: {seed_text[:30]}...")
 
             # ============================
             # 阶段1：更新关键词计数器，检测反刍
@@ -994,6 +1041,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             if not related_pairs and not concept_memories:
                 append_log("[认知循环] 无相关记忆，跳过本轮")
                 current_keywords = []
+                # 检索不到东西的关键词留在信箱里，只会每 3 秒被原样回灌一次
+                KEYWORDS.retain(current_keywords)
                 await asyncio.sleep(3)
                 continue
 
@@ -1207,39 +1256,15 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             # ============================
             # Step 8: 休眠
+            # 抑制计数已在本轮开头推进（见 _decay_inhibition），不再在轮末衰减：
+            # 放在这里时，“跳过本轮”的分支会直接 continue，衰减永远走不到。
             # ============================
-            await asyncio.sleep(2)
-
-            # ============================
-            # 阶段5：抑制计数器衰减与清理
-            # ============================
-            expired_seeds = 0
-            for sid in list(_inhibited_seeds):
-                _inhibited_seeds[sid] -= 1
-                if _inhibited_seeds[sid] <= 0:
-                    del _inhibited_seeds[sid]
-                    expired_seeds += 1
-            expired_edges = 0
-            for edge in list(_inhibited_edges):
-                _inhibited_edges[edge] -= 1
-                if _inhibited_edges[edge] <= 0:
-                    del _inhibited_edges[edge]
-                    expired_edges += 1
-            expired_keywords = 0
-            for kw in list(_inhibited_keywords):
-                _inhibited_keywords[kw] -= 1
-                if _inhibited_keywords[kw] <= 0:
-                    del _inhibited_keywords[kw]
-                    expired_keywords += 1
-            if expired_seeds > 0 or expired_edges > 0 or expired_keywords > 0:
-                append_log(f"[反刍抑制] 解除：{expired_seeds} 个种子节点，{expired_edges} 条边，{expired_keywords} 个关键词已恢复")
+            await asyncio.sleep(3)
 
             # ============================
             # 阶段6：热记忆下沉交给 HotSetPlanner + MemoryWriter
             # 认知循环不再自己触发淘汰（避免与 drift_loop、auto_save 三处重复）。
             # ============================
-
-            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             append_log("[认知循环] 已停止")
