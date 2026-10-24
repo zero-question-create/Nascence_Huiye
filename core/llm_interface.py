@@ -461,7 +461,8 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
 
     now = datetime.datetime.now()
     state_hint = f"当前状态：{new_state}" if new_state else ""
-    time_hint = f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
+    # 回复层要能自己判断"今天几号/星期几"，只给时分会让它把日期记错
+    time_hint = f"现在时间为{now:%Y年%m月%d日 %H时%M分}"
 
     system_prompt = (
         f"你是{BOT_NAME}，正在思考。根据下面给出的记忆和情况，输出此刻的想法，并判断是否说出口。\n\n"
