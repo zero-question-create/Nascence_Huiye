@@ -91,10 +91,26 @@ def _record_usage(kind: str, response):
         usage = getattr(response, "usage", None)
         if usage is None:
             return
-        PROBE.bump(f"tokens.{kind}.prompt", int(getattr(usage, "prompt_tokens", 0) or 0))
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        PROBE.bump(f"tokens.{kind}.prompt", prompt_tokens)
         PROBE.bump(f"tokens.{kind}.completion", int(getattr(usage, "completion_tokens", 0) or 0))
+
+        # DeepSeek 风格：prompt_cache_hit_tokens / prompt_cache_miss_tokens
         hit = getattr(usage, "prompt_cache_hit_tokens", None)
         miss = getattr(usage, "prompt_cache_miss_tokens", None)
+        if hit is None:
+            # OpenAI/Gemini 兼容层：prompt_tokens_details.cached_tokens
+            details = getattr(usage, "prompt_tokens_details", None)
+            if isinstance(details, dict):
+                cached = details.get("cached_tokens")
+            else:
+                cached = getattr(details, "cached_tokens", None) if details is not None else None
+            if cached is not None:
+                hit = int(cached or 0)
+                miss = max(0, prompt_tokens - hit)
+        # 只回了命中数时，未命中数用 prompt 总数倒推
+        if hit is not None and miss is None and prompt_tokens:
+            miss = max(0, prompt_tokens - int(hit or 0))
         if hit is not None:
             PROBE.bump(f"tokens.{kind}.cache_hit", int(hit or 0))
         if miss is not None:
@@ -568,6 +584,25 @@ def _clip_desc(text: str, max_chars: int = None) -> str:
     return head.rstrip()
 
 
+def _sniff_image_mime(raw: bytes) -> str:
+    """按文件头判断图片类型，识别不了返回空串。
+
+    下载的临时文件后缀不可信：NapCat 的图片 URL 没有扩展名时，
+    调用方会按 "amr" 落盘，只看扩展名就会把 GIF 当 JPEG 发给视觉模型。
+    """
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw.startswith(b"BM"):
+        return "image/bmp"
+    return ""
+
+
 async def describe_image_from_path(image_path: str, prompt: str = None, max_chars: int = None) -> str:
     """从本地路径读取图片，返回简短客观描述。
 
@@ -610,7 +645,7 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
             '.png': 'image/png', '.gif': 'image/gif',
             '.webp': 'image/webp', '.bmp': 'image/bmp'
         }
-        mime_type = mime_map.get(ext, 'image/jpeg')
+        mime_type = _sniff_image_mime(raw_bytes) or mime_map.get(ext, 'image/jpeg')
 
         PROBE.bump("vision.calls")
         with PROBE.timed("vision.ms"):

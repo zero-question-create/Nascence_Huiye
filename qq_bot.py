@@ -410,6 +410,25 @@ def _media_phrase(media_type: str, desc: str) -> str:
     return f"一个视频，内容是“{desc}”"
 
 
+# NapCat 给群表情包的 summary 常常只是占位词，不是内容描述。
+_GENERIC_STICKER_SUMMARIES = {
+    "动画表情", "表情", "表情包", "图片", "图片表情", "动态表情",
+    "商城表情", "商城表情包", "图片消息", "gif", "mface",
+}
+
+
+def _sticker_desc_from_summary(summary: str) -> str | None:
+    """官方摘要能否直接当描述用；占位词返回 None，表示必须走图片解析。
+
+    之前只要摘要里带“表情”就直接采用，于是所有群表情包都叫“[动画表情]”：
+    既让记忆里全是同一个描述，也会让素材库按描述把它们去重成一条。
+    """
+    text = str(summary or "").strip().strip("[]【】（）()").strip()
+    if not text or text.lower() in _GENERIC_STICKER_SUMMARIES:
+        return None
+    return text[:30]
+
+
 def _attach_media_memory_ids(media_list: list, memory_ids: list, media_refs: list = None):
     """把本轮纯媒体记忆的 ID 回填到对应的暂存条目上。
 
@@ -672,19 +691,18 @@ async def _handle_group_message_impl(data: dict):
                 if seg_type == "image":
                     chk_gif = file_format == "gif"
                     chk_mface = bool(seg_data.get("emoji_id") or seg_data.get("emoji_package_id") or seg_data.get("key"))
-                    chk_summary = "表情" in str(seg_data.get("summary") or "")
+                    summary = str(seg_data.get("summary") or "").strip()
+                    chk_summary = "表情" in summary
                     chk_subtype = str(seg_data.get("sub_type")) == "1"
                     is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
                     media_type = "sticker" if is_sticker else "image"
-                    if is_sticker and seg_data.get("summary") and not chk_gif:
-                        # 商城表情包有官方摘要时优先用摘要，省掉一次视觉调用
-                        desc = str(seg_data.get("summary") or "").strip()
-                        desc = desc[:30]
-                    else:
+                    # 有真正的官方摘要才省掉视觉调用；占位摘要必须走图片解析
+                    desc = _sticker_desc_from_summary(summary) if (is_sticker and not chk_gif) else None
+                    if desc is None:
                         max_chars = 30 if is_sticker else 60
                         desc = await describe_image_from_path(tmp_path, max_chars=max_chars)
                     if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
-                        desc = seg_data.get("summary") or "表情包"
+                        desc = _sticker_desc_from_summary(summary) or "表情包"
                 elif seg_type == "record":
                     media_type = "record"
                     desc = await describe_audio_from_path(tmp_path)
@@ -703,9 +721,10 @@ async def _handle_group_message_impl(data: dict):
         seg_data = seg.get("data", {})
 
         if seg_type == "mface":
-            # 商城表情包（NapCat 直报 mface）：无可下载媒体，直接用摘要描述
-            summary = seg_data.get("summary") or seg_data.get("key") or "商城表情包"
-            media_list.append(("sticker", str(summary)[:30]))
+            # 商城表情包（NapCat 直报 mface）：没有可下载的图，只能用摘要；
+            # 摘要若只是“[动画表情]”这类占位词，退化为中性描述。
+            summary = str(seg_data.get("summary") or seg_data.get("key") or "")
+            media_list.append(("sticker", _sticker_desc_from_summary(summary) or "商城表情包"))
             media_refs.append(None)
             continue
 
@@ -1077,10 +1096,16 @@ async def _send_action_and_wait(websocket, payload: dict, echo: str,
         response = await asyncio.wait_for(future, timeout=wait)
         ok = str(response.get("status") or "").lower() == "ok"
         if not ok:
+            detail = str(response.get("message") or "")
+            hint = ""
+            if "EACCES" in detail or "permission denied" in detail.lower():
+                hint = (
+                    "（NapCat 无法写入自己的 temp 目录：检查 /app/.config/QQ/NapCat/temp "
+                    "的属主与权限，或给 NapCat 容器设置 NAPCAT_UID/NAPCAT_GID）"
+                )
             logger.warning(
                 f"NapCat 拒绝发送（echo={echo}，status={response.get('status')}，"
-                f"retcode={response.get('retcode')}，"
-                f"message={str(response.get('message'))[:200]}）"
+                f"retcode={response.get('retcode')}，message={detail[:200]}）{hint}"
             )
         return ok
     except asyncio.TimeoutError:

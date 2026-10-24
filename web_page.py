@@ -303,29 +303,34 @@ async function refreshStats(){
               (h.length ? ` 常睡${Math.min(...h)}-${Math.max(...h)}点` : '');
       }
       $('c-rhythm').textContent = cap;
-      // 缓存指标：图片描述缓存命中 + LLM token 缓存命中（供应方返回时才有）
+      // 缓存指标：文本（LLM token）缓存命中在前，图片描述缓存在后
       try{
         const probe = d.probe || {};
         const c = probe.counters || {};
         const visionCalls = c['vision.calls'] || 0;
         const visionHits = c['vision.cache_hit'] || 0;
-        const hitTokens = Object.keys(c).filter(k => k.startsWith('tokens.') && k.endsWith('.cache_hit'))
+        // 文本只统计对话调用；视觉调用自己的 token 缓存不计入文本
+        const sumTokens = suffix => Object.keys(c)
+          .filter(k => k.startsWith('tokens.') && k.endsWith(suffix) && !k.startsWith('tokens.vision.'))
           .reduce((a, k) => a + c[k], 0);
-        const missTokens = Object.keys(c).filter(k => k.startsWith('tokens.') && k.endsWith('.cache_miss'))
-          .reduce((a, k) => a + c[k], 0);
+        const hitTokens = sumTokens('.cache_hit');
+        const missTokens = sumTokens('.cache_miss');
+        const tokenTotal = hitTokens + missTokens;
+        const visionTotal = visionCalls + visionHits;
+
+        const parts = [];
         let pctText = '--';
-        let detail = '';
-        if(visionCalls + visionHits > 0){
-          pctText = Math.round(100 * visionHits / (visionCalls + visionHits)) + '%';
-          detail = `视觉 ${visionHits}/${visionCalls + visionHits}`;
+        if(tokenTotal > 0){
+          pctText = Math.round(100 * hitTokens / tokenTotal) + '%';
+          parts.push(`文本 ${hitTokens}/${tokenTotal}`);
+        }else{
+          parts.push('文本 暂无数据');
         }
-        if(hitTokens + missTokens > 0){
-          const llmPct = Math.round(100 * hitTokens / (hitTokens + missTokens));
-          pctText = llmPct + '%';
-          detail += `${detail ? ' · ' : ''}token ${hitTokens}/${hitTokens + missTokens}`;
+        if(visionTotal > 0){
+          parts.push(`视觉 ${Math.round(100 * visionHits / visionTotal)}% (${visionHits}/${visionTotal})`);
         }
         $('c-cache').textContent = pctText;
-        $('c-cache-detail').textContent = detail || '暂无数据';
+        $('c-cache-detail').textContent = parts.join(' · ') || '暂无数据';
       }catch(e){}
       const b = $('stateBadge');
       sysState = d.state === 'asleep' ? '睡眠中' : '清醒';
