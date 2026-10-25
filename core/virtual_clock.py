@@ -58,6 +58,12 @@ class VirtualClock:
         # 非QQ模式，如果虚拟时间已经是真实时间戳（例如基准为 time.time()），直接返回
         return virtual_timestamp
 
+    def from_real_time(self, real_timestamp: float) -> float:
+        """真实Unix时间戳 → 当前模式的内部时间轴（to_real_time 的逆运算）。"""
+        if self._qq_real_offset is not None:
+            return real_timestamp - self._qq_real_offset
+        return real_timestamp
+
     def now(self) -> float:
         """返回当前绝对虚拟时间（从基准起算，总真实时间按当前速度缩放）"""
         # 绝对虚拟时间 = 全局基准 + 累计真实运行时间 × 当前速度

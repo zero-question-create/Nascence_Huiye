@@ -12,7 +12,10 @@ venv/
 
 # 配置文件（只忽略敏感凭据，保留 API 读取类 + 示例框架）
 config/api_config.json
+config/plugins.json
 config/qq_manifest.json
+config/bilibili_credentials.json
+config/wechat_manifest.json
 config/__pycache__/
 
 # 运行数据（记忆、向量索引、日志等）

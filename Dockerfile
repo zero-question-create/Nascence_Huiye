@@ -44,7 +44,8 @@ RUN mkdir -p /app/data/test /app/run/logs /app/config \
 # 暴露端口：
 # - 32123: Web 控制面板
 # - 6700: NapCat 反向 WebSocket 服务端口
-EXPOSE 32123 6700
+# - 6701: 微信桥接 WebSocket 服务端口
+EXPOSE 32123 6700 6701
 
 # 容器健康检查（探测控制面板接口状态）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \

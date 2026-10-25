@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "secondary_model": "gpt-5.6-sol",
     "ollama_base_url": "http://localhost:11434",
     "ollama_embed_model": "shaw/dmeta-embedding-zh",
-    "bot_qq": "123456",
+    "bot_qq": "123456",                     # 兜底 QQ 号；连接后以 NapCat get_login_info 自动获取的为准
     "active_group_id": "123456",
     "napcat_token": "Nascence",
     "napcat_http_url": "http://127.0.0.1:5700",  # NapCat 正向 HTTP 服务地址（用于语音等文件下载）
@@ -63,6 +63,55 @@ DEFAULT_CONFIG = {
     "note_read_max_chars": 2000,            # 单次读回上限
     "note_brief_max_chars": 400,            # 动作层摘要总长
     "note_brief_recent_lines": 5,           # 动作层摘要每本最近条目数
+    # ===== 短期记忆与“软件”行为 =====
+    "short_term_thought_limit": 5,          # 本地短期记忆窗口：她自己最近 4~6 条想法
+    "app_context_max_lines": 40,            # 插件传入主进程的软件上下文上限（未读、对话内容等）
+    "qq_app_default_open": False,           # QQ 默认关闭：先累积未读，等动作层打开
+    # ===== 本地软件门控（打开/退出软件，不参与语言回复）=====
+    "app_router_mode": "rule",              # rule | local_llm | off
+    "app_router_base_url": "http://127.0.0.1:11434/v1",  # Ollama OpenAI 兼容接口
+    "app_router_api_key": "ollama",
+    "app_router_model": "",                 # local_llm 模式必填，例如 qwen2.5:3b
+    "app_router_timeout": 20,
+    "app_router_max_tokens": 160,
+    "app_open_after_unread_rounds": 2,      # 未读持续几轮后打开软件
+    "app_close_conversation_idle_rounds": 15,  # 对话空闲几轮后退出对话
+    "app_close_idle_rounds": 30,            # 软件空闲几轮后退出软件
+    "qq_unread_buffer_max": 200,            # 每个对话缓冲的未读消息上限（原始事件）
+    # ===== QQ 富消息（小程序 / 合并转发聊天记录）=====
+    "qq_mini_program_max_chars": 200,       # 小程序卡片解析后写入正文的最大字符数（不打开小程序）
+    "qq_chat_record_max_messages": 80,      # 单条聊天记录最多展开的消息条数（只向内一层）
+    "qq_chat_record_max_chars": 4000,       # 送进摘要 LLM 的聊天记录字符上限
+    "qq_chat_record_summary_max_chars": 160,  # 摘要最大字符数（写入短期上下文的内容）
+    # ===== 微信插件（本地桥接 WebSocket）=====
+    "wechat_ws_host": "0.0.0.0",
+    "wechat_ws_port": 6701,
+    "wechat_token": "Nascence",
+    "wechat_unread_buffer_max": 200,
+    "wechat_history_limit": 20,
+    # ===== Bilibili 插件 =====
+    "bilibili_credentials_file": "config/bilibili_credentials.json",
+    "bilibili_request_interval": 0.6,       # 请求间隔（秒）
+    "bilibili_timeout": 20,
+    "bilibili_feed_limit": 8,
+    "bilibili_comments_page_size": 20,
+    "bilibili_browse_cooldown_seconds": 1800,  # 关闭后多久再次出现“可浏览”提醒
+    # ===== 浏览器插件（网页解析）=====
+    "browser_mode": "static",               # static | dynamic
+    "browser_timeout": 20,
+    "browser_max_bytes": 2 * 1024 * 1024,
+    "browser_max_chars": 20000,
+    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    # 动态模式：DeepSeek Fetch 形态的网页解析接口
+    "browser_dynamic_url": "https://api.deepseek.com/v1/tools/fetch",
+    "browser_dynamic_api_key": "",          # 留空使用 primary_api_key
+    "browser_dynamic_timeout": 30,
+    # 摘要 LLM：留空字段使用 primary_*
+    "browser_summary_api_key": "",
+    "browser_summary_base_url": "",
+    "browser_summary_model": "",
+    "browser_summary_timeout": 30,
+    "browser_summary_max_chars": 400,
     # ===== 媒体描述 =====
     "image_desc_max_chars": 60,             # 图片描述最大字符数
     "sticker_desc_max_chars": 30,           # 表情包描述最大字符数
@@ -72,6 +121,8 @@ DEFAULT_CONFIG = {
     "memory_writer_batch": 100,             # 单批最多命令数
     "memory_writer_flush_ms": 100,          # 攒批最长等待毫秒
     "hot_planner_mode": "thread",           # process | thread（热集名单由独立进程/线程整理）
+    # ===== 概念召回 =====
+    "concept_recall_episodes": 5,           # 概念路每次带回的事件段数（回看类问题会额外补最早一段）
     # ===== 睡眠提示 =====
     "pre_sleep_margin": 0.04,               # 距入睡阈值多近时进入 wind-down
     "pre_sleep_hold_seconds": 60,           # wind-down 期间推迟入睡的秒数

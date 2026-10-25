@@ -878,19 +878,38 @@ def validate_vector(vec) -> np.ndarray:
     return arr
 
 
-def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
+def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE,
+                  occurred_at: float = None) -> str:
+    """写入一条记忆。
+
+    occurred_at: 可选的**真实 Unix 时间戳**（消息发生时间）。聊天记录用它作为
+    creation_time，记忆的时间前缀才会显示“当时/几天前”，而不是入库时刻。
+    last_accessed / last_strengthen_time 仍用当前时间，避免旧消息一入库就衰减。
+    """
     vec = text_to_vector(content)
     # 先校验（维度/有限值/非零），不合法直接拒绝写入，避免污染数据库与索引
     vec_arr = validate_vector(vec).reshape(1, -1)
     mem_id = generate_memory_id()
     now = clock.now()
+    created = now
+    if occurred_at is not None:
+        try:
+            real_ts = float(occurred_at)
+            if real_ts > 1e12:
+                real_ts /= 1000.0
+            if real_ts > 0:
+                created = clock.from_real_time(real_ts)
+                if created > now:
+                    created = now
+        except (TypeError, ValueError):
+            created = now
     memory_dict = {
         "id": mem_id,
         "content": content,
         "vector": vec,
         "half_life": half_life,
         "last_accessed": now,
-        "creation_time": now,
+        "creation_time": created,
         "last_strengthen_time": now,
         "concept_tag_ids": []
     }
@@ -898,7 +917,7 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
     db = _get_db()
     row = (
         mem_id, content, vec_arr.tobytes(),
-        half_life, now, now, now, json.dumps([]),
+        half_life, now, created, now, json.dumps([]),
     )
     # 单写者：写库交给 MemoryWriter（进程/线程），主进程只维护内存与 faiss。
     # 注意**不能在持有 _data_lock 时等待写者**：写者线程自己也要拿 _data_lock

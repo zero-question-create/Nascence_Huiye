@@ -1,4 +1,15 @@
 # core/cognition.py
+# ========================================================================
+# 本地认知循环（平台无关）。
+#
+# 这里只做本地计算：关键词信箱、概念/向量检索、图扩散、反刍抑制、
+# 短期想法窗口、软件上下文合并、记忆写入。它不知道 QQ/微信/网页的存在。
+#
+# 每一轮的“行为思考”通过 BehaviorEngine 交给当前插件配置的 LLM；
+# 插件负责软件读写（打开/关闭、对话内容）、行为通道与 LLM 连接信息，
+# 不得向行为提示词注入平台元数据（人格涌现约束，见 core/behavior.py）。
+# ========================================================================
+
 import inspect
 import re
 import datetime
@@ -13,6 +24,10 @@ from .memory_engine import (
     DEFAULT_HALF_LIFE
 )
 from .llm_interface import decompose_input, verbalize
+from .behavior import BehaviorEngine
+from .short_term import SHORT_TERM
+from .apps import APP_CONTEXT
+from .app_router import APP_ROUTER
 from .virtual_clock import clock
 from .biorhythm import BIORHYTHM
 from config.constants import BOT_NAME
@@ -176,6 +191,27 @@ def consume_time_intent() -> str:
     intent = _time_intent
     _time_intent = "none"
     return intent
+
+
+# ========== 当前输入通道 ==========
+# 消息层把这一轮的整句输入放进来，供概念路做整句向量召回。
+# 只存最近一次：整句描述的是"当前这句话"，跨轮沿用会把旧问题当成新问题。
+_pending_user_input: str = ""
+
+
+def inject_user_input(text: str):
+    """由消息处理层调用，记录本轮用户输入的整句原文。"""
+    global _pending_user_input
+    if text:
+        _pending_user_input = str(text).strip()
+
+
+def consume_user_input() -> str:
+    """取出并重置本轮整句输入（一次性）。"""
+    global _pending_user_input
+    text = _pending_user_input
+    _pending_user_input = ""
+    return text
 
 # ========== 反刍抑制状态 ==========
 _keyword_continuity: dict = {}                      # {关键词: 连续出现次数}
@@ -343,42 +379,61 @@ def retrieve_and_diffuse(keywords: list, max_memories: int = 10,
     return timed_memories
 
 
-def retrieve_by_concept(keywords: list, time_intent: str = "none") -> tuple:
-    """概念定向检索：关键词命中概念 → 取若干事件段 → 段内按时间倒序直读。
+def retrieve_by_concept(keywords: list, time_intent: str = "none",
+                        query_text: str = "", top_k: int = 2) -> tuple:
+    """概念定向检索：整句 + 关键词命中概念 → 取若干事件段 → 段内按时间倒序直读。
 
-    与向量检索的区别在于全程不做相似度排序：概念已经把话题定死，
+    与向量检索的区别在于段内不做相似度排序：概念已经把话题定死，
     段内记忆又是同一次交互里的连续内容，直接按时间读即可。
+    最多带回 top_k 个概念（不再 first-match-wins），各概念的段合并去重。
 
-    返回 (timed_memories, concept_name, degraded)：
+    返回 (timed_memories, concept_names, degraded)：
       timed_memories 形如 [(real_ts, "[时间短语] 内容"), ...]
-      concept_name 为命中的概念名；未命中时为 None
+      concept_names 为命中的概念名列表；未命中时为空列表
       degraded 表示时间窗内无记录、已降级为"最近若干段"
     """
-    if not keywords:
-        return [], None, False
+    q = str(query_text or "").strip()
+    if not keywords and not q:
+        return [], [], False
 
-    from .concept_store import match_concept, select_episodes, fetch_members
+    from .concept_store import match_concepts, select_episodes, fetch_members
     from utils.time_phrases import get_relative_time_phrase
 
-    # 长关键词更具体，优先用它匹配（如"物理作业"优于"作业"）
-    candidates = sorted({str(k) for k in keywords if k}, key=len, reverse=True)
-    cid = cname = None
-    for kw in candidates:
-        cid, cname, how = match_concept(kw)
-        if cid:
-            append_log(f"[概念路] 关键词「{kw}」命中概念「{cname}」（{how}）")
-            break
-    if not cid:
-        return [], None, False
-
     try:
-        episodes, degraded = select_episodes(cid, time_intent)
+        matches = match_concepts(q, keywords, top_k=top_k)
     except Exception as e:
-        append_log(f"[概念路] 事件段选择失败，跳过: {e}")
-        return [], None, False
+        append_log(f"[概念路] 概念匹配失败，跳过: {e}")
+        return [], [], False
+    if not matches:
+        return [], [], False
+
+    names = [m["name"] for m in matches]
+    for m in matches:
+        append_log(f"[概念路] 命中概念「{m['name']}」（{m['how']}）")
+    append_log("[概念路] 命中 %d 个概念：%s" % (
+        len(matches), "、".join(f"「{m['name']}」（{m['how']}）" for m in matches)))
+
+    episodes = []
+    seen_episode_ids = set()
+    degraded = False
+    for m in matches:
+        try:
+            selected, deg = select_episodes(m["id"], time_intent)
+        except Exception as e:
+            append_log(f"[概念路] 概念「{m['name']}」事件段选择失败，跳过: {e}")
+            continue
+        degraded = degraded or deg
+        for ep in selected:
+            if ep["id"] in seen_episode_ids:
+                continue
+            seen_episode_ids.add(ep["id"])
+            episodes.append(ep)
     if not episodes:
-        append_log(f"[概念路] 概念「{cname}」下没有事件段，跳过")
-        return [], None, False
+        append_log(f"[概念路] 命中的概念下没有事件段，跳过: {names}")
+        return [], names, degraded
+
+    # 多概念合并后按时间倒序，保证段间顺序与单概念时一致
+    episodes.sort(key=lambda e: e.get("end_time") or 0, reverse=True)
     if degraded:
         append_log(f"[概念路] 时间窗内无记录（意图={time_intent}），降级为最近 {len(episodes)} 段")
 
@@ -386,14 +441,20 @@ def retrieve_by_concept(keywords: list, time_intent: str = "none") -> tuple:
         members = fetch_members(episodes)
     except Exception as e:
         append_log(f"[概念路] 成员展开失败，跳过: {e}")
-        return [], None, False
+        return [], names, degraded
 
     timed = []
+    seen_texts = set()
     for mem, real_ts in members:
-        phrase = get_relative_time_phrase(real_ts)
-        timed.append((real_ts, f"[{phrase}] {mem['content']}"))
-    append_log(f"[概念路] 概念「{cname}」带回 {len(timed)} 条（{len(episodes)} 段，意图={time_intent}）")
-    return timed, cname, degraded
+        text = f"[{get_relative_time_phrase(real_ts)}] {mem['content']}"
+        key = (round(float(real_ts), 3), text)
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        timed.append((real_ts, text))
+    label = "、".join(names)
+    append_log(f"[概念路] 概念「{label}」带回 {len(timed)} 条（{len(episodes)} 段，意图={time_intent}）")
+    return timed, names, degraded
 
 
 def mask_brackets(text: str) -> str:
@@ -623,12 +684,12 @@ def request_graceful_stop():
 
 
 def _select_dialogue_window(history: list, dialogue_count: int) -> list:
-    """按"最近 N 条他人消息"定位起点，返回该起点之后的完整消息段。
+    """兼容旧调用保留：按“最近 N 条他人消息”定位对话窗口。
 
-    返回的段落里同时包含他人与自己的消息，从而保住一问一答的完整脉络；
-    只按他人消息定位，是为了让"窗口长度"由外部输入量决定，
-    不会被自己频繁插话稀释成一小截。
-    没有他人消息时返回空列表（此时无从定位对话起点）。
+    新的认知循环已经不再使用这个窗口：
+      - 短期记忆只保留她自己的 4~6 条近期想法（core/short_term.py）；
+      - 插件内容通过 AppContext 传入（core/apps.py）。
+    函数保留给历史测试与外部调用方，避免一次性删除造成兼容问题。
     """
     other_idx = [i for i, m in enumerate(history) if m.get("sender") != BOT_NAME]
     if not other_idx:
@@ -640,14 +701,14 @@ def _select_dialogue_window(history: list, dialogue_count: int) -> list:
 
 
 def _resolve_target_group(fallback: str) -> str:
-    """解析本轮主动发言的目标群：优先取当前配置（支持热更新），失败回落到启动值。
+    """解析本轮主动发言的目标（兼容无插件的旧调用路径）。
 
-    F28：cognitive_loop 启动时把 get_active_group_id() 的结果固化成了局部参数，
-    之后在控制面板改目标群，运行中的循环仍往旧群发送。改为每轮重新解析。
+    插件通道会用自己的 resolve_target（例如 QQ 动态读取 active_group_id）；
+    这里只在没有 channel 时兜底，直接读配置，避免认知层反向依赖平台模块。
     """
     try:
-        import qq_bot
-        current = qq_bot.get_active_group_id()
+        from config.api_config import config as _cfg
+        current = str(_cfg.get("active_group_id") or "").strip()
         if current:
             return current
     except Exception:
@@ -669,6 +730,57 @@ def _send_kwargs_for(send_func, kwargs: dict) -> dict:
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in params}
+
+
+class _LegacyChannel:
+    """没有插件时，把旧的 send_func/media_send_func 包成行为通道。
+
+    只保留最基础的发送能力；@/引用属于 QQ 插件的平台语义，由插件通道提供。
+    这层用于 CLI 调试、旧测试与外部调用方的平滑迁移。
+    """
+
+    plugin_id = "legacy"
+    source = "QQ"
+
+    def __init__(self, send_func=None, media_send_func=None):
+        self.send_func = send_func
+        self.media_send_func = media_send_func
+
+    def llm_profile(self):
+        # None 表示走全局 primary 模型（旧行为）
+        return None
+
+    def resolve_target(self, fallback=None):
+        return _resolve_target_group(fallback)
+
+    def outbound_options(self, target):
+        return {}
+
+    async def send_text(self, target, text, **kwargs) -> bool:
+        if not self.send_func:
+            return False
+        return await self.send_func(target, text, **_send_kwargs_for(self.send_func, kwargs))
+
+    async def send_media(self, target, path, as_sticker: bool = False) -> bool:
+        if not self.media_send_func:
+            return False
+        return await self.media_send_func(target, path, as_sticker=as_sticker)
+
+    def emit_outbound(self, text, kind: str = "text"):
+        from utils.event_bus import BUS
+        BUS.message.emit(BOT_NAME, text, self.source)
+
+
+def _emit_outbound(channel, text, kind: str = "text"):
+    """把行为结果广播给面板；无插件时沿用 QQ 来源。"""
+    if channel is not None:
+        try:
+            channel.emit_outbound(text, kind)
+            return
+        except Exception as e:
+            append_log(f"[认知循环] 行为通道广播失败: {e}")
+    from utils.event_bus import BUS
+    BUS.message.emit(BOT_NAME, text, "QQ")
 
 
 def _consume_note_memory():
@@ -706,14 +818,16 @@ def _pick_seed_text() -> str | None:
 
 async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
                                keywords, media_send_func, target_group_id,
-                               context_hint: str = ""):
+                               context_hint: str = "", channel=None,
+                               reasoning: str = ""):
     """执行一次动作抉择并落实动作。返回描述字符串（无动作时返回 None）。
 
     抉择本身是同步 LLM 调用，放进线程池执行；语义上仍属于本轮的最后一步。
+    channel 为插件行为通道；为 None 时退化为旧的 send_func/media_send_func。
+    软件未打开时，插件动作层不参与；打开软件由本地 AppRouter 负责。
     """
-    from .action_layer import decide_action, action_enabled
+    from .action_layer import decide_action, action_enabled, APP_ACTIONS
     from .llm_interface import add_to_history
-    from utils.event_bus import BUS
 
     global _pending_note_memory
 
@@ -725,12 +839,19 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     if not action_enabled():
         return None
 
-    # 本轮手里有没有可用的东西：收藏、刚收到的媒体，或记事本功能
+    # 本轮手里有没有可用的东西：收藏、刚收到的媒体、记事本，或软件状态
     # 记事本允许从零开始写，故开启时即便收藏为空也值得询问一次
     from . import asset_library as ASSETS
     from .action_layer import note_enabled
-    if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled()):
+    apps = APP_CONTEXT.prompt_state() if channel is not None else []
+    open_apps = [app for app in apps if app.get("open")]
+    # 只有软件已经打开，插件动作层才参与；打开/退出软件由本地 AppRouter 负责。
+    if apps and not open_apps:
         return None
+    has_app_action = bool(open_apps)
+    if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled() or has_app_action):
+        return None
+    action_apps = open_apps
 
     # 调用门槛：不再因为“有 keywords”就每轮都问一次动作层。
     # 旧条件是 `talk_sent or keywords`，而关键词几乎每轮都有，等价于每轮必调。
@@ -741,7 +862,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     pending = ASSETS.list_pending()
     spoke_now = bool(talk_sent)
     note_changed = bool(_pending_note_memory)
-    if not pending and not note_changed and not spoke_now:
+    if not pending and not note_changed and not spoke_now and not has_app_action:
         try:
             from config.api_config import config as _cfg
             prob = float(_cfg.get("action_spontaneous_prob", 0.25))
@@ -750,13 +871,29 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         if random.random() > max(0.0, min(1.0, prob)):
             return None
 
+    # 动作模型属于“当前打开的软件”；没有打开软件时沿用通道的默认动作模型。
+    try:
+        fallback_profile = channel.action_llm_profile() if channel is not None else None
+        profile = APP_CONTEXT.action_llm_profile(fallback=fallback_profile)
+    except Exception as e:
+        append_log(f"[动作抉择] 读取插件动作 LLM 失败，回落 primary: {e}")
+        profile = None
+    try:
+        fallback_reasoning = bool(channel and channel.action_include_reasoning())
+        use_reasoning = APP_CONTEXT.action_include_reasoning(fallback=fallback_reasoning)
+        language_trace = reasoning if use_reasoning else ""
+    except Exception:
+        language_trace = ""
     result = await loop.run_in_executor(
         None, lambda: decide_action(
             thought_text=thought_text,
             should_speak=should_speak,
             said_text=thought_text if talk_sent else "",
             keywords=keywords,
-            context_hint=context_hint or ("刚刚有人在群里说话" if keywords else ""),
+            context_hint=context_hint or ("刚刚有人在群里说话" if keywords and not action_apps else ""),
+            profile=profile,
+            apps=action_apps,
+            language_trace=language_trace,
         )
     )
     if not result:
@@ -766,6 +903,14 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         return None
     detail = result.get("detail") or ""
 
+    # -------- 软件动作：打开/关闭软件、点开对话、翻看更早 --------
+    if action in APP_ACTIONS:
+        outcome = await APP_CONTEXT.execute(action, result)
+        if outcome:
+            append_log(f"[动作抉择] 软件动作 {action}: {outcome}")
+            return outcome
+        return None
+
     # -------- 发送类：把描述直接补进历史记忆 --------
     if action in ("image", "sticker"):
         entry = result.get("entry") or {}
@@ -774,15 +919,22 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         tag = "图片" if kind == ASSETS.IMAGE else "表情包"
         if not path:
             return None
-        # 目标群同样动态解析（F28）
-        target_group = _resolve_target_group(target_group_id)
-        if media_send_func is None or not target_group:
-            append_log("[动作抉择] 没有可用的媒体发送通道，放弃")
+        # 目标由插件通道动态解析（QQ 插件会重新读取 active_group_id）
+        target_group = (
+            channel.resolve_target(target_group_id) if channel is not None
+            else _resolve_target_group(target_group_id)
+        )
+        if not target_group:
+            append_log("[动作抉择] 没有可用的发送目标，放弃")
             return None
         # 按类型走对应发送方式：表情包需带 sub_type，否则 QQ 会当普通图片显示
-        ok = await media_send_func(
-            target_group, path, as_sticker=(kind == ASSETS.STICKER)
-        )
+        if channel is not None:
+            ok = await channel.send_media(target_group, path, as_sticker=(kind == ASSETS.STICKER))
+        elif media_send_func is not None:
+            ok = await media_send_func(target_group, path, as_sticker=(kind == ASSETS.STICKER))
+        else:
+            append_log("[动作抉择] 没有可用的媒体发送通道，放弃")
+            return None
         if not ok:
             append_log("[动作抉择] 媒体发送失败，未记入历史")
             return None
@@ -790,7 +942,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         measure = "张" if kind == ASSETS.IMAGE else "个"
         create_memory(f"我发了{measure}{tag}，内容是：{detail}")
         add_to_history(None, None, f"（我发了{measure}{tag}，内容是：{detail}）")
-        BUS.message.emit(BOT_NAME, f"[{tag}] {detail}", "QQ")
+        _emit_outbound(channel, f"[{tag}] {detail}", "media")
         return f"发送{tag}: {detail}"
 
     # -------- 收藏类 --------
@@ -811,7 +963,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             except Exception as e:
                 append_log(f"[认知循环] 收藏记忆建链失败: {e}")
         add_to_history(None, None, f"（我收藏了{measure}{tag}，内容是：{detail}）")
-        BUS.message.emit(BOT_NAME, result.get("reply") or f"（收下了这个{tag}）", "QQ")
+        _emit_outbound(channel, result.get("reply") or f"（收下了这个{tag}）", "media")
         return f"收藏{tag}: {detail}"
 
     # -------- 记事本：写入/修改/删除/翻开，内容留给下一轮特供记忆（不入库）--------
@@ -830,7 +982,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             suffix = "（内容过长，已截断）" if result.get("truncated") else ""
             create_memory(f"我在记事本「{name}」里写下：{written}{suffix}")
             add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}{suffix}）")
-            BUS.message.emit(BOT_NAME, f"[笔记] {written}", "QQ")
+            _emit_outbound(channel, f"[笔记] {written}", "note")
             return f"写笔记: {name}"
 
         if action == "edit_txt":
@@ -839,14 +991,14 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             new_text = result.get("new_text") or ""
             create_memory(f"我把记事本「{name}」里的「{old_text}」改成了「{new_text}」")
             add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」改成了「{new_text}」）")
-            BUS.message.emit(BOT_NAME, f"[笔记] {new_text}", "QQ")
+            _emit_outbound(channel, f"[笔记] {new_text}", "note")
             return f"改笔记: {name}"
 
         if action == "delete_txt":
             old_text = result.get("old_text") or ""
             create_memory(f"我把记事本「{name}」里的「{old_text}」划掉了")
             add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」划掉了）")
-            BUS.message.emit(BOT_NAME, f"[笔记] 划掉了：{old_text}", "QQ")
+            _emit_outbound(channel, f"[笔记] 划掉了：{old_text}", "note")
             return f"删笔记行: {name}"
 
         append_log(f"[认知循环] 记事本「{name}」内容已载入下一轮特供记忆")
@@ -855,16 +1007,20 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     return None
 
 
-async def cognitive_loop(send_func=None, target_group_id: str = None, media_send_func=None):
+async def cognitive_loop(send_func=None, target_group_id: str = None, media_send_func=None,
+                         channel=None):
     """
-    永续认知循环 —— 辉夜的"默认模式网络"永远在线。
+    永续认知循环 —— 本地“默认模式网络”永远在线。
     无论是否有用户输入，循环始终运行：
-      消费队列关键词 → 检索扩散 → 拼接层(生成内心独白+发言决策)
+      消费队列关键词 → 本地检索/扩散 → 行为思考(生成内心独白+发言决策)
       → 存入记忆 → 回复jieba分词入队 → 检查新消息 → 循环
 
     关键词来源：上一轮的回复（心理活动或发送消息）与接收到的消息，
     均以 jieba 搜索引擎模式分词后进入消费队列，每轮取空队列处理全部关键词。
 
+    channel: 插件行为通道（plugins.base.BehaviorChannel）。本地认知与平台无关，
+             行为思考使用 channel.llm_profile() 指定的 LLM。为 None 时用
+             send_func/media_send_func 包成兼容通道（CLI/旧测试）。
     在 NapCat 连接后启动，断开时 request_graceful_stop 触发：
       当前轮继续执行到回复输出，跳过复搜后退出。
     """
@@ -886,12 +1042,18 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
     _inhibited_keywords.clear()
     _keyword_queue.clear()
     KEYWORDS.clear()
+    SHORT_TERM.clear()
+    APP_CONTEXT.clear()
+    APP_ROUTER.reset()
     current_keywords = []
-    prev_thought_text = None
-    prev_should_speak = False
+
+    # 没有插件时退化为旧的发送回调；有插件时由插件提供行为通道与 LLM。
+    if channel is None:
+        channel = _LegacyChannel(send_func=send_func, media_send_func=media_send_func)
 
     append_log("="*40)
-    append_log("[认知循环] 永续认知循环启动")
+    append_log("[认知循环] 本地永续认知循环启动"
+               f"（行为插件：{getattr(channel, 'plugin_id', 'legacy')}）")
     append_log("="*40)
 
     while not _graceful_stop:
@@ -907,9 +1069,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 醒来即清掉睡前残留：睡前关键词、上一轮回复、反刍计数都不该带进新的一觉。
             KEYWORDS.clear()
             _keyword_queue.clear()
+            SHORT_TERM.clear()
+            APP_CONTEXT.clear()
+            APP_ROUTER.reset()
             current_keywords = []
-            prev_thought_text = None
-            prev_should_speak = False
             _keyword_continuity.clear()
             _inhibited_seeds.clear()
             _inhibited_edges.clear()
@@ -921,6 +1084,30 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             # 抑制计时每轮推进一次，跳过本轮（检索为空）的轮次也算一轮
             _decay_inhibition()
+
+            # 软件状态每轮刷新：未打开时只留下“某软件有 N 条未读”的提醒；
+            # 打开后由插件把对话内容作为 AppContext 条目送进来。
+            try:
+                APP_CONTEXT.refresh()
+            except Exception as e:
+                append_log(f"[认知循环] 刷新软件状态失败: {e}")
+
+            # 本地软件门控：打开/退出软件由本地层决定，不经过插件动作 LLM。
+            # 打开后软件内容会立即进入 AppContext，供本轮语言思考使用。
+            try:
+                statuses = APP_CONTEXT.prompt_state()
+                decision = await loop.run_in_executor(
+                    None,
+                    APP_ROUTER.tick,
+                    statuses,
+                    SHORT_TERM.texts(),
+                    APP_CONTEXT.last_content_ts(),
+                )
+                if decision:
+                    outcome = await APP_CONTEXT.execute(decision.get("action"), decision)
+                    append_log(f"[认知循环] 软件门控: {decision} → {outcome}")
+            except Exception as e:
+                append_log(f"[认知循环] 软件门控异常: {e}")
 
             # ============================
             # Step 1: 合并关键词信箱（追加，而不是整批替换）
@@ -945,6 +1132,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 if seed_text:
                     current_keywords = [seed_text]
                     append_log(f"[认知循环] 无新消息，随机种子: {seed_text[:30]}...")
+                elif APP_CONTEXT.has_context():
+                    # 没有检索种子，但软件有未读提醒/打开着；仍然要进入行为思考，
+                    # 否则动作层永远没有机会“打开软件”。
+                    append_log("[认知循环] 无关键词/种子，但软件上下文存在，继续本轮")
                 else:
                     await asyncio.sleep(10)
                     continue
@@ -1043,8 +1234,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 关键词命中概念时，走"概念 → 事件段 → 段内直读"，不做相似度排序。
             # 这批记忆随后作为 pinned 进入提示词，不参与评分也不被关键词过滤丢弃。
             # ============================
-            concept_memories, concept_name, concept_degraded = retrieve_by_concept(
-                current_keywords, consume_time_intent()
+            concept_memories, concept_names, concept_degraded = retrieve_by_concept(
+                current_keywords, consume_time_intent(),
+                query_text=consume_user_input(), top_k=2,
             )
             concept_texts = [text for _, text in concept_memories]
             concept_ts = [ts for ts, _ in concept_memories]
@@ -1057,7 +1249,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 inhibited_seeds=set(_inhibited_seeds.keys()),
                 inhibited_edges=set(_inhibited_edges.keys())
             )
-            if not related_pairs and not concept_memories:
+            if not related_pairs and not concept_memories and not APP_CONTEXT.has_context():
                 append_log("[认知循环] 无相关记忆，跳过本轮")
                 current_keywords = []
                 # 检索不到东西的关键词留在信箱里，只会每 3 秒被原样回灌一次
@@ -1069,70 +1261,22 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             related_ts = [ts for ts, _ in related_pairs]
 
             # ============================
-            # Step 3b: 历史对话作为记忆并入
-            # 先定位最近 4~6 条他人消息在完整历史中的起点，再取该起点之后的全部消息
-            # （包含自己的），这样窗口内是一段完整的对话往来，而不是只有对方的单方发言。
+            # Step 3b: 软件上下文（插件传入主进程）
+            # 不再按“最近 4~6 条别人的消息”截短期窗口：
+            #   - 她自己的近期想法由 SHORT_TERM 保存（4~6 条）；
+            #   - 软件未读提醒、打开的对话内容由 APP_CONTEXT 保存；
+            #   - 两者随后作为 pinned 进入行为思考，不参与关键词过滤。
             # ============================
-            from utils.message_history import get_all, quote_suffix
-            from utils.time_phrases import get_relative_time_phrase
-
-            dialogue_count = random.randint(4, 6)
-            selected_msgs = _select_dialogue_window(get_all(), dialogue_count)
-
-            # 动作层需要知道"刚才谁说了什么"。只给"有人在说话"时，
-            # "发点表情包呗"这类明确请求会被当成闲聊：动作层翻几页就选 none。
-            action_context = ""
-            for _msg in reversed(selected_msgs):
-                if _msg.get("sender") != BOT_NAME:
-                    action_context = (
-                        f"最近一条群消息：{_msg.get('sender')}说："
-                        f"{str(_msg.get('content') or '')[:80]}"
-                    )
-                    break
-
-            dialogue_memories = []
-            dialogue_ts = []
-            for msg in selected_msgs:
-                # 引用与提及目标还原"这句话对谁说/在回应什么"，短期上下文才连得上
-                suffix = quote_suffix(msg)
-                target = msg.get("target")
-                if msg["sender"] == BOT_NAME:
-                    prefix = f"我对{target}说：" if target else "我说："
-                else:
-                    prefix = f"{msg['sender']}对{target}说：" if target else f"{msg['sender']}说："
-                d_content = f"{prefix}{msg['content']}{suffix}"
-                d_msg_time = msg.get("time")
-                if d_msg_time is None:
-                    d_msg_time = clock.now()
-                d_real_ts = clock.to_real_time(d_msg_time)
-                d_phrase = get_relative_time_phrase(d_real_ts)
-                dialogue_memories.append(f"[{d_phrase}] {d_content}")
-                dialogue_ts.append(d_real_ts)
-
-            related_memories = related_memories + dialogue_memories
-            related_ts = related_ts + dialogue_ts
-            append_log(
-                f"[认知循环] 历史对话并入 {len(dialogue_memories)} 条"
-                f"（按最近 {dialogue_count} 条他人消息定位，含自己的消息）: {dialogue_memories}"
-            )
+            app_pairs = APP_CONTEXT.snapshot()
+            app_memories = [text for _, text in app_pairs]
+            app_ts = [ts for ts, _ in app_pairs]
+            action_context = APP_CONTEXT.latest_line()
+            if app_memories:
+                append_log(f"[认知循环] 软件上下文并入 {len(app_memories)} 条: {app_memories[:3]}")
 
             # ============================
-            # Step 3c: 上一轮回复并入（无论是否发出消息），带时间标签
-            # ============================
-            prev_mem = None
-            prev_ts = None
-            if prev_thought_text:
-                prev_real_ts = clock.to_real_time(clock.now())
-                prev_phrase = get_relative_time_phrase(prev_real_ts)
-                prev_mem = f"[{prev_phrase}] {'我说' if prev_should_speak else '我想'}：{prev_thought_text}"
-                prev_ts = prev_real_ts
-                related_memories.append(prev_mem)
-                related_ts.append(prev_ts)
-                append_log(f"[认知循环] 上一轮回复并入: {prev_mem}")
-
-            # ============================
-            # Step 3d: 身体状态（睡前 / 刚醒）
-            # 只作为独立提示行传给 verbalize，不写成记忆，也不参与排序去重。
+            # Step 3c: 身体状态（睡前 / 刚醒）
+            # 只作为独立提示行传给行为思考，不写成记忆，也不参与排序去重。
             # ============================
             body_state = BIORHYTHM.body_state_text()
 
@@ -1151,27 +1295,48 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             state = get_state()
 
+            short_pairs = SHORT_TERM.recent()
             pinned_memories = (
-                dialogue_memories
-                + ([prev_mem] if prev_mem else [])
+                [text for _, text in short_pairs]
+                + app_memories
                 + ([note_mem] if note_mem else [])
                 # 概念路带回的记忆作为特供：不参与评分、不被关键词过滤丢弃
                 + concept_texts
             )
             pinned_ts = (
-                dialogue_ts
-                + ([prev_ts] if prev_ts is not None else [])
+                [ts for ts, _ in short_pairs]
+                + app_ts
                 + ([note_ts] if note_ts is not None else [])
                 + concept_ts
             )
 
+            # 本地检索/扩散已完成；最后一步“行为思考”交给插件配置的 LLM。
+            # 提示词只包含名字与记忆（见 core/behavior.py），不注入平台信息。
+            try:
+                profile = channel.llm_profile()
+            except Exception as e:
+                append_log(f"[认知循环] 读取插件行为 LLM 失败，回落 primary: {e}")
+                profile = None
+            try:
+                fallback_reasoning = bool(channel and channel.action_include_reasoning())
+                include_reasoning = bool(
+                    APP_CONTEXT.any_app_open()
+                    and APP_CONTEXT.action_include_reasoning(fallback=fallback_reasoning)
+                )
+            except Exception:
+                include_reasoning = False
+
             result = await loop.run_in_executor(
-                None, lambda: verbalize(
+                None, lambda: BehaviorEngine(
+                    profile=profile,
+                    plugin_id=getattr(channel, "plugin_id", "core"),
+                ).think(
                     related_memories, current_keywords, state,
                     pinned=pinned_memories,
                     timestamps=related_ts,
                     pinned_timestamps=pinned_ts,
                     body_state=body_state,
+                    include_reasoning=include_reasoning,
                 )
             )
 
@@ -1182,28 +1347,46 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             thought_text = result.get("text", "").strip()
             should_speak = result.get("say", False)
+            reasoning = str(result.get("reasoning") or "") if include_reasoning else ""
 
             # 去掉句末句号（在做入库与对话历史之前，只去末尾这一个）
             thought_text = _strip_trailing_period(thought_text)
 
             if not thought_text:
-                append_log("[认知循环] verbalize 返回空，跳过")
+                append_log("[认知循环] 行为思考返回空，跳过")
                 #await asyncio.sleep(3)
                 continue
 
-            prev_thought_text = thought_text
-            prev_should_speak = should_speak
+            # 她自己的近期想法进入短期记忆窗口（4~6 条），
+            # 不再用“最近 4~6 条别人的消息”当短期窗口锚点。
+            # 发送结果要等 Step 6 才知道，所以“我说/我想”先按是否有发送目标判断；
+            # 真正的短期标签在发送后按 talk_sent 写入。
+            target_group = channel.resolve_target(target_group_id)
+            can_send = getattr(channel, "send_func", True) is not None
+            attempted_speech = bool(should_speak and target_group and can_send)
 
             # ============================
             # Step 5: 存入记忆库
             # ============================
-            if should_speak:
+            if attempted_speech:
                 memory_text = f"我说：{thought_text}"
             else:
                 memory_text = f"我想：{thought_text}"
 
-            # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环
-            mem_id = await loop.run_in_executor(None, lambda: create_memory(memory_text))
+            # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环；
+            # 同一次写入里把她的回复追加到刚刚归入的概念，让"你上次说什么"也能召回。
+            def _write_reply_memory():
+                mid = create_memory(memory_text)
+                try:
+                    from .concept_store import append_member, get_last_concept_id
+                    last_cid = get_last_concept_id()
+                    if last_cid:
+                        append_member(last_cid, mid)
+                except Exception as exc:
+                    append_log(f"[概念层] 回复追加失败: {exc}")
+                return mid
+
+            mem_id = await loop.run_in_executor(None, _write_reply_memory)
             _shallow_pool.append(mem_id)
 
             append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
@@ -1216,32 +1399,16 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             #              下一轮读到的是带标记的文本，不会被误当成"已经说出口"。
             # ============================
             talk_sent = False
-            # 目标群动态解析（改配置后无需重启）
-            target_group = _resolve_target_group(target_group_id)
-            at_qq = None
-            quote_msg_id = None
-            if should_speak and thought_text and send_func and target_group:
-                # 只回应“冲着机器人来的”消息：直接 @ 了它，或引用了它的话。
-                # 普通群聊既不主动 @ 人，也不引用别人的消息。
+            # target_group / can_send 在 Step 5 前已解析，本轮复用同一结果。
+            if should_speak and thought_text and target_group and can_send:
+                # @/引用等平台语义由插件决定（QQ 插件只回应冲她来的消息）
                 try:
-                    import qq_bot as _qq
-                    reply_target = _qq.take_reply_target(directed_only=True)
-                    # 目标必须属于本轮发送的群：多群白名单时，把 A 群的消息
-                    # 引用/@ 进 B 群会被 NapCat 直接拒发。
-                    if reply_target and str(reply_target.get("group_id", "")).strip() \
-                            == str(target_group).strip():
-                        if reply_target.get("mention_me") and reply_target.get("qq") \
-                                and _qq._at_cooldown_ok(target_group, reply_target["qq"]):
-                            at_qq = reply_target["qq"]
-                        if _qq._quote_once_ok(target_group, reply_target.get("message_id")):
-                            quote_msg_id = reply_target.get("message_id")
+                    options = channel.outbound_options(target_group) or {}
                 except Exception as e:
-                    append_log(f"[认知循环] 解析回应目标失败: {e}")
+                    append_log(f"[认知循环] 解析发送选项失败: {e}")
+                    options = {}
 
-                delivered = await send_func(
-                    target_group, thought_text,
-                    **_send_kwargs_for(send_func, {"reply_msg_id": quote_msg_id, "at_qq": at_qq}),
-                )
+                delivered = await channel.send_text(target_group, thought_text, **options)
                 talk_sent = delivered is not False     # 兼容未返回值的旧签名
                 if delivered is False:
                     append_log(f"[认知循环] 消息发送失败，历史标记为未送达: {thought_text[:30]}")
@@ -1252,8 +1419,11 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                         mark_delivery_failed(seq)
                     except Exception as e:
                         append_log(f"[认知循环] 标记发送失败时出错: {e}")
-                from utils.event_bus import BUS
-                BUS.message.emit(BOT_NAME, thought_text, "QQ")
+                _emit_outbound(channel, thought_text, "text")
+                APP_ROUTER.note_activity()
+
+            # 短期里的“我说/我想”以实际送达为准；没发出去就是只在心里想。
+            SHORT_TERM.add_thought(thought_text, bool(talk_sent))
 
             # ============================
             # Step 6b: 动作抉择（本能冲动，本轮最后一步）
@@ -1263,10 +1433,12 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             try:
                 acted = await _run_action_decision(
                     loop, thought_text, should_speak, talk_sent, current_keywords,
-                    media_send_func, target_group_id, action_context
+                    media_send_func, target_group_id, action_context, channel=channel,
+                    reasoning=reasoning,
                 )
                 if acted:
                     append_log(f"[认知循环] 动作抉择已执行: {acted}")
+                    APP_ROUTER.note_activity()
             except Exception as e:
                 append_log(f"[认知循环] 动作抉择异常: {e}")
 

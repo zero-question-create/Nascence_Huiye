@@ -26,6 +26,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import faiss
 import numpy as np
@@ -42,11 +43,24 @@ EPISODE_CAP = 20           # 单段成员上限
 # 概念归并阈值：概念层本就该归并同义，故比记忆层（0.92）宽松
 CONCEPT_MERGE_THRESHOLD = 0.88
 
+# 召回阈值：与合并分开。合并要求"同一件事"，召回只要"聊过相关话题"，
+# 所以明显低于 0.88；误召回由 top-k、泛词黑名单与分数排序兜底。
+CONCEPT_RECALL_THRESHOLD = 0.68
+
+# 泛词：单独出现指向不了任何具体概念，不参与 reverse 匹配；
+# 概念名本身是泛词时同样跳过，避免「大家」这类词抢占名额。
+GENERIC_CONCEPT_WORDS = {
+    "大家", "群里", "时候", "这个", "那个", "事情", "东西", "今天", "昨天",
+}
+
+# 别名命中权重：用户原话比概念名更贴近当下表达，仅次于 exact
+ALIAS_MATCH_WEIGHT = 0.9
+
 # occurrences 保留上限（避免单条记录无限增长；总数另记 total_count）
 MAX_OCCURRENCES = 20
 
-# 段选择：默认带最近几段
-DEFAULT_RECENT_EPISODES = 3
+# 段选择：默认带最近几段（可被 config.concept_recall_episodes 覆盖）
+DEFAULT_RECENT_EPISODES = 5
 MAX_RETURN_MEMBERS = 30    # 概念路单次带回成员数上限
 
 # 时间枚举 → 回溯窗口（秒）。None 表示不限时间（按最近优先）
@@ -63,6 +77,13 @@ _db_conn = None
 _concept_faiss = None      # 独立索引，与记忆 faiss 完全分离
 _faiss_to_concept = []     # faiss_id → concept_id
 _concept_to_faiss = {}     # concept_id → faiss_id
+_last_concept_id = None    # 最近一次写入的概念，供认知循环把她的回复追加进去
+
+# 召回每轮要把整句和多个关键词各查一次 faiss，关键词又常在轮次间重复；
+# 这里缓存文本向量，避免每 3 秒对同一批词反复请求 Ollama。
+_embed_cache = OrderedDict()
+_embed_cache_lock = threading.Lock()
+_EMBED_CACHE_MAX = 256
 
 
 # ---------- 数据库 ----------
@@ -89,7 +110,21 @@ def _get_db():
                 total_count INTEGER NOT NULL DEFAULT 0,
                 member_count INTEGER NOT NULL DEFAULT 0,
                 creation_time REAL NOT NULL,
-                last_accessed REAL NOT NULL
+                last_accessed REAL NOT NULL,
+                last_recalled REAL DEFAULT 0
+            )
+        """)
+        # 旧库迁移：last_recalled 是后加的列；新库建表已带上，重复列错误直接忽略
+        try:
+            _db_conn.execute("ALTER TABLE concepts ADD COLUMN last_recalled REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        _db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS concept_aliases (
+                concept_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (concept_id, alias)
             )
         """)
         _db_conn.execute("""
@@ -102,6 +137,7 @@ def _get_db():
             )
         """)
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_concept ON concept_events(concept_id)")
+        _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_aliases_concept ON concept_aliases(concept_id)")
         _db_conn.commit()
     return _db_conn
 
@@ -139,6 +175,19 @@ def _rebuild_concept_faiss():
 def _embed(text: str):
     """取文本向量并归一化（供内积索引当余弦用）。失败返回 None。"""
     from .memory_engine import text_to_vector
+
+    # 把向量模型名编进键：控制面板换模型后旧缓存自然失效
+    try:
+        from config.api_config import config as _cfg
+        model = str(_cfg.get("ollama_embed_model") or "")
+    except Exception:
+        model = ""
+    key = f"{model}\x00{text}"
+    with _embed_cache_lock:
+        cached = _embed_cache.get(key)
+        if cached is not None:
+            _embed_cache.move_to_end(key)
+            return cached
     try:
         vec = np.array(text_to_vector(text), dtype=np.float32).reshape(1, -1)
     except Exception as e:
@@ -148,6 +197,10 @@ def _embed(text: str):
         append_log(f"[概念层] 向量维度异常 {vec.shape[1]} != {EMBED_DIM}")
         return None
     faiss.normalize_L2(vec)
+    with _embed_cache_lock:
+        _embed_cache[key] = vec
+        if len(_embed_cache) > _EMBED_CACHE_MAX:
+            _embed_cache.popitem(last=False)
     return vec
 
 
@@ -280,13 +333,16 @@ def _insert_events(concept_id: str, segments: list) -> list:
 
 
 # ---------- 概念写入 ----------
-def record_concept(concept_name: str, member_ids: list, timestamp: float = None) -> str | None:
+def record_concept(concept_name: str, member_ids: list, timestamp: float = None,
+                   alias: str = None) -> str | None:
     """把一批记忆归入某个概念；必要时新建概念。
 
     concept_name 为空或成员为空时不做任何事（该批记忆不入概念层，
     与存量记忆一样只靠向量检索）。
+    alias 为用户原话（截 80 字），写入别名表供"换说法"以外的字面召回。
     返回命中的 concept_id；未处理时返回 None。
     """
+    global _last_concept_id
     if not concept_name or not str(concept_name).strip():
         return None
     member_ids = [m for m in (member_ids or []) if m]
@@ -320,6 +376,8 @@ def record_concept(concept_name: str, member_ids: list, timestamp: float = None)
                     (json.dumps(occurrences), len(member_ids), now, cid),
                 )
                 db.commit()
+                _write_alias(cid, alias, now)
+                _last_concept_id = cid
                 segments = _segment_members(cid, member_ids, now)
                 new_event_ids = _insert_events(cid, segments)
                 if new_event_ids:
@@ -336,6 +394,8 @@ def record_concept(concept_name: str, member_ids: list, timestamp: float = None)
             (cid, name, vec.tobytes(), json.dumps([now]), len(member_ids), now, now),
         )
         db.commit()
+        _write_alias(cid, alias, now)
+        _last_concept_id = cid
         segments = _segment_members(cid, member_ids, now)
         new_event_ids = _insert_events(cid, segments)
         if new_event_ids:
@@ -348,6 +408,68 @@ def record_concept(concept_name: str, member_ids: list, timestamp: float = None)
         _faiss_to_concept.append(cid)
         append_log(f"[概念层] 新建概念「{name}」（{len(member_ids)} 条/{len(new_event_ids)} 段）")
         return cid
+
+
+def _write_alias(concept_id: str, alias: str, now: float):
+    """把用户原话写进别名表（截 80 字）；空别名不写。"""
+    text = str(alias or "").strip()[:80]
+    if not text:
+        return
+    db = _get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO concept_aliases (concept_id, alias, created_at) "
+        "VALUES (?, ?, ?)",
+        (concept_id, text, now),
+    )
+    db.commit()
+
+
+def get_last_concept_id() -> str | None:
+    """最近一次写入的概念 ID；认知循环据此把她的回复追加进同一概念。"""
+    with _lock:
+        return _last_concept_id
+
+
+def append_member(concept_id: str, memory_id: str, ts: float = None) -> bool:
+    """把一条记忆追加到该概念最近的事件段（她的回复走这里）。
+
+    超过 EPISODE_CAP 就新开一段；概念不存在或参数为空时返回 False。
+    时间取记忆自身的 creation_time，保证与事件段的时间口径一致。
+    """
+    if not concept_id or not memory_id:
+        return False
+    with _lock:
+        if not get_concept(concept_id):
+            return False
+        db = _get_db()
+        if ts is None:
+            row = db.execute(
+                "SELECT creation_time FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            ts = float(row[0]) if row else time.time()
+        else:
+            ts = float(ts)
+
+        prev = _latest_event(concept_id)
+        if prev is not None and len(prev["member_ids"]) < EPISODE_CAP:
+            members = list(prev["member_ids"]) + [memory_id]
+            db.execute(
+                "UPDATE concept_events SET member_ids = ?, end_time = ? WHERE id = ?",
+                (json.dumps(members, ensure_ascii=False), ts, prev["id"]),
+            )
+        else:
+            eid = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO concept_events (id, concept_id, member_ids, start_time, end_time) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (eid, concept_id, json.dumps([memory_id], ensure_ascii=False), ts, ts),
+            )
+            _append_event_ids(concept_id, [eid])
+        db.execute(
+            "UPDATE concepts SET member_count = member_count + 1 WHERE id = ?", (concept_id,)
+        )
+        db.commit()
+    return True
 
 
 def _append_event_ids(concept_id: str, new_event_ids: list):
@@ -389,50 +511,184 @@ def get_concept(concept_id: str) -> dict | None:
     }
 
 
+def _keyword_list(keywords) -> list:
+    out = []
+    for kw in keywords or []:
+        text = str(kw or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+_HOW_PRIORITY = {"exact": 4, "alias": 3, "reverse": 2, "faiss": 1}
+
+
+def _bump(scores: dict, cid: str, name: str, contrib: float, how: str):
+    """给概念累加分数，并记住贡献最大的命中方式（供日志标识）。
+
+    float32 的余弦可能到 1.0000001，与 exact 的 1.0 打平时按通道优先级取
+    更可信的 exact/alias，日志才不会把字面命中标成 faiss。
+    """
+    entry = scores.get(cid)
+    if entry is None:
+        entry = {"id": cid, "name": name, "score": 0.0, "how": how,
+                 "best": 0.0, "how_priority": 0}
+        scores[cid] = entry
+    entry["score"] += contrib
+    priority = _HOW_PRIORITY.get(how, 0)
+    if (contrib > entry["best"] + 1e-6
+            or (abs(contrib - entry["best"]) <= 1e-6
+                and priority > entry["how_priority"])):
+        entry["best"] = contrib
+        entry["how"] = how
+        entry["how_priority"] = priority
+
+
+def match_concepts(query_text: str, keywords: list, top_k: int = 2) -> list:
+    """按整句与关键词给所有概念打分，返回分数最高的 top_k 个。
+
+    与旧 match_concept 的 first-match-wins 不同，这里把四个通道的分数累加后
+    统一排序，避免一个泛词把唯一名额抢走：
+      exact   概念名包含关键词           +1.0
+      alias   用户原话别名包含关键词      +0.9
+      reverse 关键词包含概念名            +0.45（概念名是泛词时跳过）
+      faiss   向量相似度 × 权重          整句 1.0 / 关键词 0.8，低于召回阈值不算
+    返回 [{"id", "name", "score", "how"}, ...]；同分时最近被想起的概念优先。
+    """
+    q = str(query_text or "").strip()
+    kws = _keyword_list(keywords)
+    if not q and not kws:
+        return []
+    try:
+        top_k = max(1, int(top_k or 1))
+    except (TypeError, ValueError):
+        top_k = 1
+
+    with _lock:
+        db = _get_db()
+        try:
+            rows = db.execute(
+                "SELECT id, name, COALESCE(last_recalled, 0) FROM concepts"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # 极端情况下迁移失败：退回不带 last_recalled 的查询，排序按 0 处理
+            rows = [(r[0], r[1], 0.0)
+                    for r in db.execute("SELECT id, name FROM concepts").fetchall()]
+        if not rows:
+            return []
+        names = {r[0]: r[1] for r in rows}
+        last_recalled = {r[0]: float(r[2] or 0.0) for r in rows}
+
+        scores = {}
+
+        # 1) exact：概念名包含关键词（单字词太泛，不参与）
+        for cid, name in names.items():
+            for kw in kws:
+                if len(kw) >= 2 and kw in name:
+                    _bump(scores, cid, name, 1.0, "exact")
+
+        # 2) reverse：关键词包含概念名；概念名是泛词时不参与
+        for cid, name in names.items():
+            if not name or name in GENERIC_CONCEPT_WORDS:
+                continue
+            for kw in kws:
+                if len(kw) >= 3 and kw != name and name in kw:
+                    _bump(scores, cid, name, 0.45, "reverse")
+
+        # 3) alias：用户原话被完整或部分写回这个关键词
+        try:
+            alias_rows = db.execute(
+                "SELECT concept_id, alias FROM concept_aliases"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            alias_rows = []
+        for ac_id, alias in alias_rows:
+            if ac_id not in names:
+                continue
+            alias = str(alias or "")
+            for kw in kws:
+                if len(kw) < 2 or kw in GENERIC_CONCEPT_WORDS:
+                    continue
+                if kw == alias or kw in alias:
+                    _bump(scores, ac_id, names[ac_id], ALIAS_MATCH_WEIGHT, "alias")
+                    break
+
+        # 4) faiss：整句权重 1.0，长关键词 0.8；低于召回阈值不参与
+        probes = []
+        if q:
+            probes.append((q, 1.0))
+        for kw in kws:
+            if len(kw) >= 2 and kw != q:
+                probes.append((kw, 0.8))
+        for text, weight in probes:
+            vec = _embed(text)
+            if vec is None:
+                continue
+            cid, score = find_similar_concept(vec)
+            if cid is None or cid not in names or score < CONCEPT_RECALL_THRESHOLD:
+                continue
+            _bump(scores, cid, names[cid], score * weight, "faiss")
+
+        ranked = sorted(
+            scores.values(),
+            key=lambda m: (-m["score"], -last_recalled.get(m["id"], 0.0), m["name"]),
+        )[:top_k]
+        if not ranked:
+            return []
+
+        # 召回命中后更新 last_recalled，供下次同分排序与人工排查
+        now = time.time()
+        try:
+            db.executemany(
+                "UPDATE concepts SET last_recalled = ? WHERE id = ?",
+                [(now, m["id"]) for m in ranked],
+            )
+            db.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        for m in ranked:
+            m.pop("best", None)
+            m.pop("how_priority", None)
+        return ranked
+
+
 def match_concept(query: str) -> tuple:
-    """按名称匹配概念：先精确名包含，再用 faiss 兜底。
+    """按名称匹配单个概念（兼容旧接口，内部走多概念打分）。
 
     返回 (concept_id, name, 命中方式)；未命中返回 (None, None, None)。
     """
-    if not query or not str(query).strip():
+    q = str(query or "").strip()
+    if not q:
         return None, None, None
-    q = str(query).strip()
-    with _lock:
-        db = _get_db()
-        # 1) 精确名匹配：概念名包含查询词，或查询词包含概念名
-        row = db.execute(
-            "SELECT id, name FROM concepts WHERE name = ? OR name LIKE ? "
-            "ORDER BY last_accessed DESC LIMIT 1",
-            (q, f"%{q}%"),
-        ).fetchone()
-        if row:
-            return row[0], row[1], "exact"
-        row = db.execute(
-            "SELECT id, name FROM concepts WHERE ? LIKE '%' || name || '%' "
-            "ORDER BY last_accessed DESC LIMIT 1",
-            (q,),
-        ).fetchone()
-        if row:
-            return row[0], row[1], "reverse"
+    matches = match_concepts(q, [q], top_k=1)
+    if not matches:
+        return None, None, None
+    m = matches[0]
+    return m["id"], m["name"], m["how"]
 
-        # 2) faiss 兜底
-        vec = _embed(q)
-        if vec is None:
-            return None, None, None
-        cid, score = find_similar_concept(vec)
-        if cid is not None and score >= CONCEPT_MERGE_THRESHOLD:
-            c = get_concept(cid)
-            return cid, (c or {}).get("name"), "faiss"
-    return None, None, None
+
+def _default_episode_limit() -> int:
+    """概念路默认带回的段数：config.concept_recall_episodes 优先。"""
+    try:
+        from config.api_config import config
+        return max(1, int(config.get("concept_recall_episodes", DEFAULT_RECENT_EPISODES)))
+    except Exception:
+        return DEFAULT_RECENT_EPISODES
 
 
 def select_episodes(concept_id: str, time_intent: str = "none",
-                    limit: int = DEFAULT_RECENT_EPISODES) -> tuple:
+                    limit: int = None) -> tuple:
     """按时间意图挑选事件段，返回 (段列表, 是否发生降级)。
 
     时间意图是理解层给出的闭合枚举，这里只做数值换算，不解析时间词。
     筛选为空时降级为"最近若干段"，保证辉夜仍有材料可回应。
+    回看类问题（earlier/any）在最近 N 段之外补上最早的一段，
+    避免同一个概念聊过三次以上后，最早那段永远不再出现。
     """
+    if limit is None:
+        limit = _default_episode_limit()
+    limit = max(1, int(limit))
     db = _get_db()
     rows = db.execute(
         "SELECT id, member_ids, start_time, end_time FROM concept_events "
@@ -476,6 +732,13 @@ def select_episodes(concept_id: str, time_intent: str = "none",
             # 该时间窗内没有记录：降级取最近若干段
             selected = events[:max(1, min(2, limit))]
             degraded = True
+
+    # 回看类问题：最近 N 段装不下全部时，额外补上该概念最早的一段。
+    # events 已按 end_time 倒序，所以 events[-1] 就是最早那段。
+    if intent in ("earlier", "any") and len(events) > len(selected):
+        earliest = events[-1]
+        if all(e["id"] != earliest["id"] for e in selected):
+            selected = selected + [earliest]
     return selected, degraded
 
 

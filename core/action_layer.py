@@ -27,11 +27,12 @@ from utils.monitor import append_log
 
 DEFAULT_MAX_PAGES = 4    # 单个动作类型的翻页上限，超过强制结束抉择
 DEFAULT_PAGE_SIZE = 8    # 每页候选数量
+APP_ACTIONS = {"open_conversation", "read_earlier", "scroll_to_bottom", "close_conversation", "close_app"}
 VALID_ACTIONS = {
     "none", "image", "sticker",
     "image_next_page", "sticker_next_page",
     "save_image", "save_sticker", "write_txt", "edit_txt", "delete_txt", "read_txt",
-}
+} | APP_ACTIONS
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
 
@@ -116,9 +117,9 @@ def _pending_text() -> str:
     return "\n".join(lines)
 
 
-def _system_prompt() -> str:
-    return (
-        f"你是{BOT_NAME}的冲动决策层，只决定此刻要不要做一个小动作。\n\n"
+def _system_prompt(has_apps: bool = False) -> str:
+    parts = [
+        f"你是{BOT_NAME}的冲动决策层，只决定此刻要不要做一个小动作。\n\n",
         "可用动作（每次只输出一个 JSON）：\n"
         "- {\"action\":\"none\"}\n"
         "- {\"action\":\"image\",\"id\":\"编号\"} / {\"action\":\"sticker\",\"id\":\"编号\"}\n"
@@ -127,14 +128,33 @@ def _system_prompt() -> str:
         "- {\"action\":\"read_txt\",\"name\":\"文件名\"}\n"
         "- {\"action\":\"write_txt\",\"name\":\"文件名\",\"text\":\"一条内容\"}\n"
         "- {\"action\":\"edit_txt\",\"name\":\"文件名\",\"old_text\":\"原来那条\",\"new_text\":\"改成什么\"}\n"
-        "- {\"action\":\"delete_txt\",\"name\":\"文件名\",\"old_text\":\"要划掉的那条\"}\n\n"
-        "规则：\n"
+        "- {\"action\":\"delete_txt\",\"name\":\"文件名\",\"old_text\":\"要划掉的那条\"}\n",
+    ]
+    if has_apps:
+        parts.append(
+            "\n软件内动作（软件已经打开时）：\n"
+            "- {\"action\":\"open_conversation\",\"id\":\"对话id\"}\n"
+            "- {\"action\":\"read_earlier\"}\n"
+            "- {\"action\":\"scroll_to_bottom\"}\n"
+            "- {\"action\":\"close_conversation\"}\n"
+            "- {\"action\":\"close_app\"}\n"
+        )
+    parts.append(
+        "\n规则：\n"
         "1. 只输出 JSON，不加解释、不加多余字段。\n"
         "2. 编号必须来自给出的清单或本轮媒体，禁止编造。\n"
         "3. 大多数时候选 none；只有当前念头明确需要时才动手，不要为了发而发。\n"
         "4. 一次只做一个动作，翻页时不要同时发送。\n"
         "5. 笔记一次只记一件事；修改/删除前先 read_txt，old_text 用看到的那条原句。\n"
     )
+    if has_apps:
+        parts.append(
+            "6. 只有软件已经打开时才会询问软件内动作；打开软件由本地层负责，不要输出 open_app。\n"
+            "7. 翻看更早用 read_earlier；不确定是否到底部时看【我的软件】里的状态，"
+            "不在底部可以用 scroll_to_bottom 回到最新消息。\n"
+            "8. 看完/不想看时先 close_conversation 回软件首页；长时间不用再 close_app 退出软件。\n"
+        )
+    return "".join(parts)
 
 
 def _notes_brief(notes: list, max_chars: int = None) -> str:
@@ -171,15 +191,55 @@ def _notes_brief(notes: list, max_chars: int = None) -> str:
     return text
 
 
+def _apps_text(apps: list) -> str:
+    """把软件状态渲染成动作层可读的清单；未打开时不暴露对话内容与列表。"""
+    if not apps:
+        return ""
+    lines = ["【我的软件】"]
+    for app in apps[:6]:
+        app_id = str(app.get("id") or "")
+        label = str(app.get("label") or app_id)
+        opened = bool(app.get("open"))
+        unread = int(app.get("unread") or 0)
+        head = f"- {label}（{app_id}）：{'已打开' if opened else '未打开'}"
+        if not opened and unread:
+            head += f"，{unread} 条未读"
+        lines.append(head)
+        if opened:
+            conversations = app.get("conversations") or []
+            if not conversations:
+                lines.append("    - （没有可打开的对话）")
+            for conv in conversations[:8]:
+                conv_id = str(conv.get("id") or "")
+                conv_label = str(conv.get("label") or conv_id)
+                current = "（当前）" if str(app.get("current_conversation") or "") == conv_id else ""
+                conv_unread = int(conv.get("unread") or 0)
+                tail = f"，{conv_unread} 条未读" if conv_unread else ""
+                lines.append(f"    - 对话 {conv_label}（{conv_id}）{current}{tail}")
+            if str(app.get("current_conversation") or ""):
+                at_bottom = app.get("at_bottom")
+                if at_bottom is not None:
+                    status = (
+                        "当前在群聊消息底部"
+                        if bool(at_bottom)
+                        else "当前不在群聊消息底部（可用 scroll_to_bottom 回到底部）"
+                    )
+                    lines.append(f"    当前状态：{status}")
+    return "\n".join(lines)
+
+
 def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
                  keywords: list, context_hint: str,
-                 images: list = None, stickers: list = None) -> str:
+                 images: list = None, stickers: list = None, apps: list = None,
+                 language_trace: str = "") -> str:
     parts = []
     if context_hint:
         parts.append(f"【此刻的情况】{context_hint}")
     if thought_text:
         think_line = f"【我此刻的念头】{thought_text}"
         parts.append(think_line)
+    if language_trace:
+        parts.append(f"【语言层的思考过程】{str(language_trace)[:1200]}")
     if should_speak and said_text:
         parts.append(f"【我刚说出口的话】{said_text}")
     elif should_speak:
@@ -190,6 +250,10 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
         kws = "、".join([str(k) for k in keywords[:8] if k])
         if kws:
             parts.append(f"【此刻萦绕的词】{kws}")
+
+    apps_text = _apps_text(apps)
+    if apps_text:
+        parts.append(apps_text)
 
     # 候选列表由调用方传入并**固定**，翻页复用同一份，避免重复或跳过。
     if images is None:
@@ -233,9 +297,15 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
 
 
 def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
-                  keywords: list = None, context_hint: str = "") -> dict:
+                  keywords: list = None, context_hint: str = "", profile=None,
+                  apps: list = None, language_trace: str = "") -> dict:
     """执行一次动作抉择（含翻页子对话）。阻塞式，请在线程池中调用。
 
+    profile: 插件配置的动作 LLM（core.llm_profile.LLMProfile）；None 走全局 primary。
+    apps: 当前已打开软件的状态与对话列表。
+    language_trace: 插件设置要求时，语言层的思考过程（不强制传入）。
+    提示词只使用“念头、刚说出口的话、记忆关键词、自己的收藏/记事本、软件状态”，
+    不包含平台协议细节（群号只在对话 id 里作为界面标识出现）。
     返回 {"action": <动作>, "detail": <执行结果描述>}；
     未通过校验或执行失败时统一回落为 {"action": "none", "detail": ""}。
     """
@@ -248,19 +318,20 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
     pending = ASSETS.list_pending()
     # 记事本允许从零开始写，所以"全空"不算无事可做；
     # 只有连记事本都关掉、且收藏与暂存皆空时，才没必要询问。
-    if not images and not stickers and not pending and not note_enabled():
+    if not images and not stickers and not pending and not note_enabled() and not apps:
         return {"action": "none", "detail": ""}
 
     messages = [
-        {"role": "system", "content": _system_prompt()},
+        {"role": "system", "content": _system_prompt(bool(apps))},
         {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords,
-                                                 context_hint, images=images, stickers=stickers)},
+                                                 context_hint, images=images, stickers=stickers,
+                                                 apps=apps, language_trace=language_trace)},
     ]
     from .llm_interface import fingerprint_prompt
-    fingerprint_prompt("action", messages[0]["content"])
+    fingerprint_prompt("action", messages[0]["content"], profile=profile)
 
     for turn in range(max_pages + 1):
-        raw = call_api_thinking(messages, max_tokens=800, thinking=False)
+        raw = call_api_thinking(messages, max_tokens=800, thinking=False, profile=profile)
         data = _parse_action(raw)
         action = str(data.get("action") or "").strip().lower()
         append_log(f"[动作抉择] 第{turn + 1}次询问返回: {raw}")
@@ -300,6 +371,20 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
     """校验并执行动作。发送类由调用方注入的发送函数完成（见 cognitive_loop）。"""
     if action == "none":
         return {"action": "none", "detail": ""}
+
+    if action in APP_ACTIONS:
+        # 软件内动作由认知循环异步执行（对话/翻读可能涉及平台 IO）。
+        app_id = str(data.get("app_id") or "")
+        conversation = str(data.get("conversation") or data.get("conversation_id") or "")
+        raw_id = str(data.get("id") or "")
+        if action == "open_conversation":
+            conversation = conversation or raw_id
+        return {
+            "action": action,
+            "detail": "",
+            "app_id": app_id,
+            "conversation": conversation,
+        }
 
     if action in ("image", "sticker"):
         kind = ASSETS.IMAGE if action == "image" else ASSETS.STICKER

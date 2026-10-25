@@ -266,7 +266,7 @@ class ControlPanel(QMainWindow):
         form.addRow("NapCat HTTP", QLabel("http://127.0.0.1:5700（Token 已配置）"))
         self.qq_bot_label = QLabel(str(config.get("bot_qq") or "123456"))
         self.qq_group_label = QLabel(str(config.get("active_group_id") or "123456"))
-        form.addRow("机器人QQ号", self.qq_bot_label)
+        form.addRow("机器人QQ号（连接后自动获取，此处为兜底）", self.qq_bot_label)
         form.addRow("主动发言群", self.qq_group_label)
         layout.addWidget(panel)
         buttons = QHBoxLayout()
@@ -296,7 +296,7 @@ class ControlPanel(QMainWindow):
             "<h3>NapCat 接入</h3>"
             f"<p>NapCat 应配置为主动 WebSocket 客户端，连接 <code>ws://127.0.0.1:6700/ws</code>，Token 为 <code>{token}</code>。群消息发送使用同一 WebSocket 的 OneBot Action。</p>"
             "<p>引用消息原文通过同一 WebSocket 的 <code>get_msg</code> Action 获取。HTTP 5700 已通过 Token 鉴权，用于无直链语音文件的兼容处理。</p>"
-            f"<p>图片、语音和视频由 <code>{secondary_model}</code> 处理；文本理解和回复由 <code>{primary_model}</code> 处理。</p>"
+            f"<p>图片、语音和视频由 <code>{secondary_model}</code> 处理；文本理解由 <code>{primary_model}</code> 处理。行为思考使用插件配置的 LLM（留空时回退到主模型）。</p>"
         )
 
     # _chat_page（对话测试页）已移除：

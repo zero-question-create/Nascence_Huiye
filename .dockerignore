@@ -20,7 +20,10 @@ build/
 
 # 敏感与私有配置（保护隐私与密钥，绝不打入镜像）
 config/api_config.json
+config/plugins.json
 config/qq_manifest.json
+config/bilibili_credentials.json
+config/wechat_manifest.json
 config/__pycache__/
 .env*
 

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import os
 import re
+import threading
 import aiofiles
 import asyncio
 import subprocess
@@ -18,6 +19,7 @@ from utils.dialogue_state import get_state, set_state
 
 from config.api_config import config
 from config.constants import BOT_NAME
+from .llm_profile import LLMProfile
 
 client = OpenAI(
     api_key=config["primary_api_key"],
@@ -31,6 +33,29 @@ client_ = OpenAI(
 
 MODEL = config["primary_model"]
 MODEL_ = config["secondary_model"]
+
+# 插件行为 LLM 的客户端缓存：{(base_url, api_key): OpenAI}
+# 同一插件每轮都会调用一次行为思考，不能每次都新建客户端。
+_profile_clients = {}
+_profile_clients_lock = threading.Lock()
+
+
+def _client_for(profile: LLMProfile = None) -> OpenAI:
+    """按行为 LLM 配置取客户端；未配置的字段回落到 primary。"""
+    if profile is None:
+        return client
+    resolved = profile.resolved()
+    base_url = resolved.base_url
+    api_key = resolved.api_key
+    if (base_url, api_key) == (config.get("primary_base_url"), config.get("primary_api_key")):
+        return client
+    key = (base_url, api_key)
+    with _profile_clients_lock:
+        cached = _profile_clients.get(key)
+        if cached is None:
+            cached = OpenAI(api_key=api_key, base_url=base_url)
+            _profile_clients[key] = cached
+        return cached
 
 
 def reload_clients():
@@ -51,6 +76,8 @@ def reload_clients():
     )
     MODEL = config.get("primary_model")
     MODEL_ = config.get("secondary_model")
+    with _profile_clients_lock:
+        _profile_clients.clear()
     append_log(f"[API] 配置已热重载：主模型={MODEL}，副模型={MODEL_}")
 
 
@@ -119,31 +146,55 @@ def _record_usage(kind: str, response):
         pass
 
 
-def fingerprint_prompt(kind: str, system_prompt: str) -> str:
+def fingerprint_prompt(kind: str, system_prompt: str, profile: LLMProfile = None) -> str:
     """记录静态 system prompt 的指纹，用于确认缓存前缀是否稳定。
 
     前缀缓存的前提是“每次请求的静态段逐字节相同”。这里只统计，不修改内容；
     指纹变化说明提示词被改过（应显式提升版本号，而不是悄悄漂移）。
+    插件行为 LLM 换模型时提示词本身不变，但缓存前缀不同，因此把模型名一起计入指纹。
     """
-    digest = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()[:16]
+    if profile is None:
+        payload = system_prompt or ""
+    else:
+        payload = f"{profile.model or ''}\x00{system_prompt or ''}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     PROBE.gauge(f"prompt.{kind}.fingerprint", digest)
     PROBE.bump(f"prompt.{kind}.calls")
     return digest
 
 
-def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
+def call_api_thinking(messages, max_tokens=None, thinking=True, timeout=None, profile: LLMProfile = None,
+                      return_reasoning: bool = False):
     """
     LLM思考模式唯一外部调用接口。
 
+    profile: 插件配置的行为 LLM（core.llm_profile.LLMProfile）。
+             为 None 时使用全局 primary 配置，保持旧调用方语义不变。
     thinking=False 时关闭推理（不发送 reasoning_effort / thinking 字段），
     用于“输出一句 JSON 短句”这类不需要推理的调用，可大幅降低输出 token。
+    return_reasoning=True 时返回 (content, reasoning)，供动作模型按插件设置读取
+    语言层的思考过程；默认仍只返回 content。
     timeout: 单次请求超时（秒）。默认 60 秒，避免网络挂起把认知循环与关停一起拖住。
     """
+    resolved = profile.resolved() if profile is not None else None
+    model = (resolved.model if resolved is not None else None) or MODEL
+    temperature = resolved.temperature if resolved is not None else 0.1
+    if temperature is None:
+        temperature = 0.1
+    profile_max_tokens = resolved.max_tokens if resolved is not None else None
+    if max_tokens is None:
+        max_tokens = profile_max_tokens or 8000
+    elif profile_max_tokens:
+        # 插件配置的 max_tokens 作为上限，不放大调用方为短 JSON 设定的预算
+        max_tokens = min(int(max_tokens), int(profile_max_tokens))
+    if timeout is None:
+        timeout = resolved.timeout if resolved is not None and resolved.timeout else 60.0
+
     kwargs = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.1,
+        "temperature": temperature,
         "stream": False,
         "timeout": timeout,
     }
@@ -153,14 +204,25 @@ def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
     PROBE.bump("llm.calls")
     try:
         with PROBE.timed("llm.call_ms"):
-            response = client.chat.completions.create(**kwargs)
+            response = _client_for(profile).chat.completions.create(**kwargs)
         _record_usage("thinking", response)
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
+        reasoning = ""
+        if return_reasoning:
+            reasoning = (
+                getattr(message, "reasoning_content", None)
+                or getattr(message, "reasoning", None)
+                or ""
+            )
+            reasoning = str(reasoning).strip()
+        if return_reasoning:
+            return (content.strip() if content else None, reasoning)
         return content.strip() if content else None
     except Exception as e:
         PROBE.bump("llm.errors")
         print(f"[API Error] {e}")
-        return None
+        return (None, "") if return_reasoning else None
 
 def decompose_input(user_input: str) -> tuple:
     """
@@ -387,7 +449,9 @@ def _safe_json_parse(text: str) -> dict:
     return result
 
 
-def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None, pinned: list = None, timestamps: list = None, pinned_timestamps: list = None, body_state: str = None) -> dict:
+def verbalize(memories: list, keywords: list = None, new_state: dict = None, user_input: str = None,
+              pinned: list = None, timestamps: list = None, pinned_timestamps: list = None,
+              body_state: str = None, profile: LLMProfile = None) -> dict:
     """
     根据记忆生成内心独白和发言决策。
     返回: {"say": bool, "text": str}
@@ -397,137 +461,21 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     - timestamps: 与 memories 对齐的真实时间戳列表；提供时按时间升序排序（越早越靠前），否则保持原顺序（最新在前）
     - pinned_timestamps: 与 pinned 对齐的时间戳列表
     - body_state: 身体状态文本（睡前/刚醒），作为独立提示行，不写成记忆
+    - profile: 插件配置的行为 LLM；None 表示全局 primary
+
+    实现已迁移到 core/behavior.py。这里保留同名入口，避免旧调用方与测试失效。
     """
-    if not memories and not pinned:
-        return {"say": False, "text": ""}
-
-    if keywords is None:
-        keywords = []
-    if user_input:
-        keywords.append(user_input)
-
-    ts = list(timestamps) if timestamps is not None else [None] * len(memories)
-
-    pinned = list(pinned or [])
-    pinned_set = set(pinned)
-    if pinned_timestamps is None:
-        pinned_ts_list = [None] * len(pinned)
-    else:
-        pinned_ts_list = list(pinned_timestamps) + [None] * max(0, len(pinned) - len(pinned_timestamps))
-
-    # 普通记忆：剔除 pinned 条目（pinned 后续无条件保留）
-    normal = []
-    normal_ts = []
-    for mem, t in zip(memories, ts):
-        if mem not in pinned_set:
-            normal.append(mem)
-            normal_ts.append(t)
-
-    # 关键词过滤：只作用于普通记忆
-    if keywords:
-        kw_hits = []
-        kw_hits_ts = []
-        for mem, t in zip(normal, normal_ts):
-            if any(kw in mem for kw in keywords):
-                kw_hits.append(mem)
-                kw_hits_ts.append(t)
-        if kw_hits:
-            normal = kw_hits
-            normal_ts = kw_hits_ts
-    normal = normal[:10]
-    normal_ts = normal_ts[:10]
-
-    # 合并：pinned（历史对话、上一轮回复）无条件保留，后接普通记忆
-    memories = [m for m in pinned] + normal
-    ts = [t for t in pinned_ts_list] + normal_ts
-
-    # 排序：越早越靠前（升序）；无时间戳（None）的条目排最后
-    if timestamps is not None:
-        indexed = sorted(
-            range(len(memories)),
-            key=lambda i: (ts[i] is None, ts[i] if ts[i] is not None else 0)
-        )
-        memories = [memories[i] for i in indexed]
-    else:
-        memories.reverse()
-
-    # 全局内容查重：pinned 条目优先保留；重复内容只保留一条
-    def _content_key(m):
-        return re.sub(r"^\[[^\]]*\]\s*", "", m)
-
-    seen_content = set()
-    deduped_memories = []
-    for m in memories:
-        key = _content_key(m)
-        if key in seen_content:
-            if m in pinned_set:
-                for i, existing in enumerate(deduped_memories):
-                    if _content_key(existing) == key:
-                        deduped_memories[i] = m
-                        break
-            continue
-        seen_content.add(key)
-        deduped_memories.append(m)
-    memories = deduped_memories
-
-    points = "\n".join([f"- {m}" for m in memories])
-
-    append_log("="*30+"LLM特供记忆"+"="*30)
-    append_log(points)
-
-    now = datetime.datetime.now()
-    state_hint = f"当前状态：{new_state}" if new_state else ""
-    # 回复层要能自己判断"今天几号/星期几"，只给时分会让它把日期记错
-    time_hint = f"现在时间为{now:%Y年%m月%d日 %H时%M分}"
-
-    system_prompt = (
-        f"你是{BOT_NAME}，正在思考。根据下面给出的记忆和情况，输出此刻的想法，并判断是否说出口。\n\n"
-        "规则：\n"
-        "- 如果有人在对你说什么，且你想回应，say 为 true；只是自然浮现的念头、联想，say 为 false\n"
-        "- say 为 true 时，text 是一句简短口语，尽量 20 字以内，只能使用给定记忆中的信息\n"
-        "- 不知道的事情不要提及，只能使用记忆或状态里明确给出的信息\n"
-        "- 不要复述记忆里已有的同一内容，也不要重复自己刚才说过的话\n"
-        "- 每条记忆开头的[刚刚]/[N天前]只是时间标签，表示这件事发生在何时，不是一条新消息\n"
-        "- 记忆按时间排序，可以直接引用、补充观点或提问，但不要添加动作、神态或括号补充\n"
-        "输出严格只包含 JSON：\n"
-        '{"say": true/false, "text": "..."}\n'
+    from .behavior import BehaviorEngine
+    return BehaviorEngine(profile=profile).think(
+        memories=memories,
+        keywords=keywords,
+        new_state=new_state,
+        user_input=user_input,
+        pinned=pinned,
+        timestamps=timestamps,
+        pinned_timestamps=pinned_timestamps,
+        body_state=body_state,
     )
-
-    body_hint = f"【身体状态】{body_state}\n\n" if body_state else ""
-    user_content = (
-        f"{state_hint}\n{time_hint}\n\n"
-        f"{body_hint}"
-        f"记忆片段（按时间排序）：\n{points}\n\n"
-        "请结合这些记忆和对话情况，输出你此刻的想法。"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-    fingerprint_prompt("verbalize", system_prompt)
-
-    # 认知循环高频调用：只需输出一句 JSON 短句，关闭推理以大幅降低输出 token
-    PROBE.bump("llm.verbalize.calls")
-    with PROBE.timed("llm.verbalize_ms"):
-        reply = call_api_thinking(messages, max_tokens=300, thinking=False)
-
-    append_log("="*30+"理解回复"+"="*30)
-    append_log(reply)
-
-    if not reply:
-        return {"say": False, "text": ""}
-
-    data = _safe_json_parse(reply)
-    if "say" in data or "text" in data:
-        return {
-            "say": _coerce_bool(data.get("say", False)),
-            "text": str(data.get("text", "")),
-        }
-
-    # 完全无法解析时降级
-    append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
-    return {"say": True, "text": reply}
 
 
 DEFAULT_IMAGE_PROMPT = (

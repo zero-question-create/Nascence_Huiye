@@ -708,6 +708,16 @@ def apply_config_hot_reload(cfg: dict):
     except Exception:
         logging.exception("API 客户端热重载失败（保存的配置仍会在下次启动生效）")
     try:
+        from plugins import registry as plugin_registry
+        plugin_registry.reload()
+    except Exception:
+        logging.exception("插件配置热重载失败（保存的配置仍会在下次启动生效）")
+    try:
+        from core.short_term import SHORT_TERM
+        SHORT_TERM.reset_limit()
+    except Exception:
+        logging.exception("短期记忆窗口热更新失败")
+    try:
         from core import memory_engine as me
         me.OLLAMA_BASE_URL = cfg.get("ollama_base_url", me.OLLAMA_BASE_URL)
         me.OLLAMA_EMBED_MODEL = cfg.get("ollama_embed_model", me.OLLAMA_EMBED_MODEL)

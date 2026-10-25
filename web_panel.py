@@ -255,8 +255,19 @@ def _collect_stats() -> dict:
     try:
         import qq_bot
         data["napcat_connected"] = qq_bot._napcat_websocket is not None
+        data["qq_identity"] = qq_bot.get_qq_identity()
+        data["qq_app"] = qq_bot.app_status()
     except Exception:
         data["napcat_connected"] = False
+        data["qq_identity"] = {}
+        data["qq_app"] = {}
+    try:
+        from plugins.registry import active_plugin, get_active_id
+        data["active_plugin"] = get_active_id()
+        active = active_plugin()
+        data["active_plugin_label"] = active.label if active else ""
+    except Exception as e:
+        data["plugin_error"] = str(e)
     return data
 
 
@@ -280,14 +291,23 @@ _CONFIG_STR_KEYS = (
     "primary_base_url", "primary_model", "secondary_base_url", "secondary_model",
     "ollama_base_url", "ollama_embed_model",
     "bot_qq", "active_group_id", "napcat_token", "napcat_http_url",
+    "app_router_mode", "app_router_base_url", "app_router_model",
+    "browser_mode", "browser_dynamic_url", "browser_summary_base_url", "browser_summary_model",
 )
-_CONFIG_KEY_KEYS = ("primary_api_key", "secondary_api_key")
+_CONFIG_KEY_KEYS = (
+    "primary_api_key", "secondary_api_key", "app_router_api_key",
+    "browser_dynamic_api_key", "browser_summary_api_key",
+)
 _CONFIG_FLOAT_KEYS = (
     "biorhythm_wake_seconds", "biorhythm_sleep_seconds",
     "biorhythm_onset_threshold", "biorhythm_wake_threshold",
     "biorhythm_rhythm_weight", "biorhythm_idle_to_sleep",
 )
-_CONFIG_INT_KEYS = ("biorhythm_rhythm_min_nights", "biorhythm_rhythm_full_nights", "panel_port")
+_CONFIG_INT_KEYS = (
+    "biorhythm_rhythm_min_nights", "biorhythm_rhythm_full_nights", "panel_port",
+    "app_open_after_unread_rounds", "app_close_conversation_idle_rounds",
+    "app_close_idle_rounds", "app_router_timeout", "app_router_max_tokens",
+)
 
 
 async def handle_config_post(request):
@@ -327,6 +347,80 @@ async def handle_qq_start(request):
         loop = asyncio.get_running_loop()
         # 初始化（启动 Ollama、加载记忆）可能耗时，放线程池避免卡住 HTTP
         await loop.run_in_executor(None, panel.RUNTIME.start_qq)
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugins_get(request):
+    """插件列表与行为 LLM 配置（API Key 不明文返回）。
+
+    首次访问会触发插件模块导入（QQ 运行时含 faiss 等重型依赖），
+    必须丢线程池，避免卡住面板事件循环。
+    """
+    def _collect():
+        from plugins import registry
+        return {
+            "ok": True,
+            "active": registry.get_active_id(),
+            "plugins": registry.list_plugins(),
+            "path": registry.plugin_config_path(),
+        }
+
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, _collect)
+        return web.json_response(data)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugins_post(request):
+    """保存插件启用状态 / 当前插件 / 行为 LLM。"""
+    try:
+        body = await request.json()
+        from plugins import registry
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, registry.update_from_panel, body
+        )
+        return web.json_response({"ok": True, **result})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugin_start(request):
+    """通用插件启动入口（QQ 会复用现有 QQ 服务线程）。"""
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        from plugins.registry import get_plugin, update_from_panel
+        plugin = get_plugin(plugin_id)
+        if plugin is None:
+            return web.json_response({"ok": False, "error": "插件不存在"}, status=404)
+        # 从插件页直接点“启动”时顺手启用，避免启动了一个未启用、不会进入软件门控的插件。
+        if not plugin.enabled:
+            await asyncio.get_running_loop().run_in_executor(
+                None, update_from_panel, {"plugin_id": plugin_id, "enabled": True}
+            )
+            plugin = get_plugin(plugin_id)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: asyncio.run(plugin.start()))
+        return web.json_response({"ok": True})
+    except NotImplementedError as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=501)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugin_stop(request):
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        from plugins.registry import get_plugin
+        plugin = get_plugin(plugin_id)
+        if plugin is None:
+            return web.json_response({"ok": False, "error": "插件不存在"}, status=404)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: asyncio.run(plugin.stop()))
         return web.json_response({"ok": True})
     except Exception as e:
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
@@ -431,6 +525,10 @@ def _build_app():
     app.router.add_post("/api/config", handle_config_post)
     app.router.add_post("/api/qq/start", handle_qq_start)
     app.router.add_post("/api/qq/stop", handle_qq_stop)
+    app.router.add_get("/api/plugins", handle_plugins_get)
+    app.router.add_post("/api/plugins", handle_plugins_post)
+    app.router.add_post("/api/plugins/start", handle_plugin_start)
+    app.router.add_post("/api/plugins/stop", handle_plugin_stop)
     app.router.add_post("/api/save", handle_save)
     app.router.add_post("/api/shutdown", handle_shutdown)
     app.router.add_post("/api/maintenance", handle_maintenance)

@@ -16,6 +16,8 @@ services:
       - "${PANEL_PORT:-32123}:32123"
       # NapCat 反向 WebSocket 端口（宿主机端口 : 容器端口）
       - "${NAPCAT_PORT:-6700}:6700"
+      # 微信桥接 WebSocket 端口（宿主机端口 : 容器端口）
+      - "${WECHAT_PORT:-6701}:6701"
     environment:
       # 容器内仅需传递 Web 端口变量，大模型/Ollama/QQ 等全部业务配置收敛在控制面板内可视化配置并保存至挂载卷
       - PANEL_PORT=32123

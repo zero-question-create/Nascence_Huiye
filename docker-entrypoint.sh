@@ -21,4 +21,20 @@ if [ ! -f /app/config/qq_manifest.json ] && [ -f /app/config/qq_manifest.example
     cp /app/config/qq_manifest.example.json /app/config/qq_manifest.json
 fi
 
+# 若缺少插件配置（含行为 LLM），自动从 example 复制生成
+if [ ! -f /app/config/plugins.json ] && [ -f /app/config/plugins.example.json ]; then
+    echo "[*] Creating default plugins.json from example..."
+    cp /app/config/plugins.example.json /app/config/plugins.json
+fi
+
+# 微信清单 / Bilibili 凭据：没有则从示例创建空模板
+if [ ! -f /app/config/wechat_manifest.json ] && [ -f /app/config/wechat_manifest.example.json ]; then
+    echo "[*] Creating default wechat_manifest.json from example..."
+    cp /app/config/wechat_manifest.example.json /app/config/wechat_manifest.json
+fi
+if [ ! -f /app/config/bilibili_credentials.json ] && [ -f /app/config/bilibili.example.json ]; then
+    echo "[*] Creating default bilibili_credentials.json from example..."
+    cp /app/config/bilibili.example.json /app/config/bilibili_credentials.json
+fi
+
 exec "$@"

@@ -1,0 +1,105 @@
+{
+  "active": "qq_napcat",
+  "plugins": {
+    "qq_napcat": {
+      "enabled": true,
+      "llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
+    },
+    "wechat": {
+      "enabled": false,
+      "llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
+    },
+    "web": {
+      "enabled": false,
+      "llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
+    },
+    "bilibili": {
+      "enabled": false,
+      "llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
+    },
+    "browser": {
+      "enabled": true,
+      "llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
+    }
+  }
+}
