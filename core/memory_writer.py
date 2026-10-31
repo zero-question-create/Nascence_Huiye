@@ -88,8 +88,12 @@ class MemoryWriter:
         mode = _writer_mode()
         if mode == "legacy":
             self._mode_actual = "legacy"
+            append_log("[记忆写者] memory_writer_mode=legacy，未启用独立写进程/工作线程")
             return
         if mode == "process":
+            if self._process is not None and self._process.is_alive():
+                self._mode_actual = "process"
+                return
             try:
                 self._start_process()
                 self._mode_actual = "process"
@@ -105,7 +109,7 @@ class MemoryWriter:
             self._thread = threading.Thread(target=self._run, name="MemoryWriter", daemon=True)
             self._thread.start()
             self._mode_actual = "thread"
-            append_log("[记忆写者] 已启动工作线程")
+            append_log("[记忆写者] memory_writer_mode=thread，已启动工作线程（未启用独立写进程）")
 
     def _start_process(self):
         from core.memory_engine import DB_FILE

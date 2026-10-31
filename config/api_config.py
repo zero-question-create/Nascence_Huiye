@@ -125,7 +125,7 @@ DEFAULT_CONFIG = {
     "sticker_desc_max_chars": 30,           # 表情包描述最大字符数
     "media_desc_cache_size": 500,           # 图片描述内容哈希缓存条数
     # ===== 记忆写入 =====
-    "memory_writer_mode": "thread",         # process | thread | legacy
+    "memory_writer_mode": "process",        # process | thread | legacy（process 失败自动退回 thread）
     "memory_writer_batch": 100,             # 单批最多命令数
     "memory_writer_flush_ms": 100,          # 攒批最长等待毫秒
     "hot_planner_mode": "thread",           # process | thread（热集名单由独立进程/线程整理）
