@@ -9,7 +9,7 @@
 # 设计约束（见实施文档第 5 章）：
 #   - 只替换"面板"这一层，核心逻辑一行不改（认知循环、记忆引擎、
 #     生物钟、概念层、动作层、QQ 接入均原样复用）。
-#   - 关闭浏览器**不应**停止 QQ 服务与认知循环：服务在独立线程的事件循环里跑。
+#   - 关闭浏览器**不应**停止插件服务与认知循环：服务在独立线程的事件循环里跑。
 #   - 不引入新的第三方依赖：只用 aiohttp（项目已有），且不依赖 PyQt5。
 #
 # 启动：python web_panel.py [--host 127.0.0.1] [--port 32123] [--open]
@@ -47,7 +47,7 @@ _MAX_EVENT_QUEUE = 500
 class EventHub:
     """把 EventBus 的事件转成可推送给浏览器的队列。
 
-    事件可能来自任意线程（QQ 服务线程、认知循环、面板线程），
+    事件可能来自任意线程（插件服务线程、认知循环、面板线程），
     这里统一入队；推送协程从队列取出发给所有已连接的 WebSocket。
     """
 
@@ -57,7 +57,11 @@ class EventHub:
         self._loop = None
         self._pending = []          # 尚无事件循环时先缓存
         # 订阅 EventBus：核心侧无需知道 Web 面板存在
-        BUS.log.connect(lambda cat, line: self._publish({"type": "log", "cat": cat, "line": line}))
+        BUS.log_event.connect(
+            lambda cat, line, level: self._publish(
+                {"type": "log", "cat": cat, "line": line, "level": level}
+            )
+        )
         BUS.status.connect(lambda text: self._publish({"type": "status", "text": text}))
         BUS.stage.connect(lambda text, done: self._publish(
             {"type": "stage", "text": text, "done": bool(done)}))
@@ -248,6 +252,9 @@ def _collect_stats() -> dict:
     except Exception as e:
         data["biorhythm_error"] = str(e)
     data["qq_running"] = bool(panel.RUNTIME.qq_thread and panel.RUNTIME.qq_thread.is_alive())
+    data["cognitive_running"] = bool(
+        panel.RUNTIME.cognitive_thread and panel.RUNTIME.cognitive_thread.is_alive()
+    )
     data["core_ready"] = panel.RUNTIME.initialized
     data["init_stage"] = panel.RUNTIME.init_stage
     data["init_elapsed"] = round(panel.RUNTIME.init_elapsed(), 1)
@@ -281,8 +288,10 @@ async def handle_stats(request):
 async def handle_config_get(request):
     cfg = panel.load_panel_config()
     safe = {k: v for k, v in cfg.items() if "key" not in k}
-    safe["_has_primary_key"] = bool(str(cfg.get("primary_api_key") or "").strip())
-    safe["_has_secondary_key"] = bool(str(cfg.get("secondary_api_key") or "").strip())
+    safe["_has_primary_key"] = str(cfg.get("primary_api_key") or "").strip() not in ("", "YOUR_API_KEY_HERE")
+    safe["_has_secondary_key"] = str(cfg.get("secondary_api_key") or "").strip() not in ("", "YOUR_API_KEY_HERE")
+    safe["_has_embedding_key"] = bool(str(cfg.get("embedding_api_key") or "").strip())
+    safe["_has_app_router_key"] = bool(str(cfg.get("app_router_api_key") or "").strip())
     return web.json_response(safe)
 
 
@@ -292,13 +301,18 @@ _CONFIG_STR_KEYS = (
     "behavior_base_url", "behavior_model",
     "secondary_base_url", "secondary_model",
     "ollama_base_url", "ollama_embed_model",
+    "embedding_api_mode",
     "bot_qq", "active_group_id", "napcat_token", "napcat_http_url",
     "app_router_mode", "app_router_base_url", "app_router_model",
     "browser_mode", "browser_dynamic_url", "browser_summary_base_url", "browser_summary_model",
 )
 _CONFIG_KEY_KEYS = (
-    "primary_api_key", "behavior_api_key", "secondary_api_key", "app_router_api_key",
+    "primary_api_key", "behavior_api_key", "secondary_api_key", "embedding_api_key",
+    "app_router_api_key",
     "browser_dynamic_api_key", "browser_summary_api_key",
+)
+_CONFIG_BOOL_KEYS = (
+    "app_router_follow_global_behavior",
 )
 _CONFIG_FLOAT_KEYS = (
     "biorhythm_wake_seconds", "biorhythm_sleep_seconds",
@@ -307,6 +321,7 @@ _CONFIG_FLOAT_KEYS = (
 )
 _CONFIG_INT_KEYS = (
     "biorhythm_rhythm_min_nights", "biorhythm_rhythm_full_nights", "panel_port",
+    "embedding_dim",
     "app_open_after_unread_rounds", "app_close_conversation_idle_rounds",
     "app_close_idle_rounds", "app_router_timeout", "app_router_max_tokens",
 )
@@ -323,6 +338,9 @@ async def handle_config_post(request):
     for key in _CONFIG_KEY_KEYS:
         if body.get(key):
             cfg[key] = str(body[key])
+    for key in _CONFIG_BOOL_KEYS:
+        if key in body:
+            cfg[key] = bool(body[key])
     for key in _CONFIG_FLOAT_KEYS:
         if key in body and body[key] not in (None, ""):
             try:
@@ -355,17 +373,30 @@ async def handle_qq_start(request):
 
 
 async def handle_plugins_get(request):
-    """插件列表与行为 LLM 配置（API Key 不明文返回）。
+    """插件运行状态与行为模型配置（API Key 不明文返回）。
 
     首次访问会触发插件模块导入（QQ 运行时含 faiss 等重型依赖），
     必须丢线程池，避免卡住面板事件循环。
     """
     def _collect():
         from plugins import registry
+        plugins = registry.list_plugins()
+        for item in plugins:
+            plugin_id = str(item.get("id") or "")
+            if plugin_id == "qq_napcat":
+                item["running"] = bool(
+                    panel.RUNTIME.qq_thread and panel.RUNTIME.qq_thread.is_alive()
+                )
+            elif plugin_id == "wechat":
+                status = item.get("status") or {}
+                item["running"] = bool(status.get("running"))
+            else:
+                # 工具型/只读插件没有常驻服务：启用即视为可用。
+                item["running"] = bool(item.get("enabled"))
         return {
             "ok": True,
             "active": registry.get_active_id(),
-            "plugins": registry.list_plugins(),
+            "plugins": plugins,
             "path": registry.plugin_config_path(),
         }
 
@@ -377,7 +408,7 @@ async def handle_plugins_get(request):
 
 
 async def handle_plugins_post(request):
-    """保存插件启用状态 / 当前插件 / 行为 LLM。"""
+    """保存插件启用状态与行为模型配置。"""
     try:
         body = await request.json()
         from plugins import registry
@@ -417,12 +448,36 @@ async def handle_plugin_stop(request):
     try:
         body = await request.json()
         plugin_id = str(body.get("id") or "").strip()
-        from plugins.registry import get_plugin
+        from plugins.registry import get_plugin, update_from_panel
         plugin = get_plugin(plugin_id)
         if plugin is None:
             return web.json_response({"ok": False, "error": "插件不存在"}, status=404)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: asyncio.run(plugin.stop()))
+        # 插件页只有“启动/停止”一个开关：停止即退出运行与软件门控。
+        await loop.run_in_executor(
+            None, update_from_panel, {"plugin_id": plugin_id, "enabled": False}
+        )
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_cognitive_start(request):
+    """总览页：启动全局认知循环。"""
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, panel.RUNTIME.start_cognitive)
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_cognitive_stop(request):
+    """总览页：停止全局认知循环（插件服务不受影响）。"""
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, panel.RUNTIME.stop_cognitive)
         return web.json_response({"ok": True})
     except Exception as e:
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
@@ -447,7 +502,7 @@ async def handle_save(request):
 
 
 async def handle_maintenance(request):
-    """维护动作：伪造发送 / 伪造思考 / 记忆注入。"""
+    """维护动作：伪造思考 / 管理员记忆注入。"""
     body = await request.json()
     kind = body.get("kind")
     text = str(body.get("text") or "").strip()
@@ -455,9 +510,6 @@ async def handle_maintenance(request):
         return web.json_response({"ok": False, "error": "内容为空"}, status=400)
     loop = asyncio.get_running_loop()
     try:
-        if kind == "fake_send":
-            mid = await loop.run_in_executor(None, panel.RUNTIME.fake_send, text)
-            return web.json_response({"ok": True, "detail": f"记忆ID {mid}"})
         if kind == "fake_think":
             reply = await loop.run_in_executor(None, panel.RUNTIME.fake_think, text)
             return web.json_response({"ok": True, "detail": reply})
@@ -484,11 +536,7 @@ async def handle_shutdown(request):
 
 
 async def _replay_log_tail(ws, max_lines: int = 200):
-    """连接建立时补发本次会话日志的尾部，避免刷新页面后日志页空白。
-
-    桌面面板直接读取日志文件回填，这里用同样的思路：只发尾部若干行，
-    分类沿用"运行日志"（与桌面面板的初始回填一致，不重新猜测分类）。
-    """
+    """连接建立时补发本次会话日志的尾部，避免刷新页面后日志页空白。"""
     try:
         if not panel.SESSION_LOG.exists():
             return
@@ -497,7 +545,10 @@ async def _replay_log_tail(ws, max_lines: int = 200):
         for line in lines:
             line = line.rstrip("\n")
             if line:
-                await ws.send_json({"type": "log", "cat": "runtime", "line": line})
+                cat, level = panel.classify_log_line(line)
+                await ws.send_json({
+                    "type": "log", "cat": cat, "line": line, "level": level,
+                })
     except Exception:
         logging.exception("日志回填失败")
 
@@ -531,6 +582,8 @@ def _build_app():
     app.router.add_post("/api/plugins", handle_plugins_post)
     app.router.add_post("/api/plugins/start", handle_plugin_start)
     app.router.add_post("/api/plugins/stop", handle_plugin_stop)
+    app.router.add_post("/api/cognitive/start", handle_cognitive_start)
+    app.router.add_post("/api/cognitive/stop", handle_cognitive_stop)
     app.router.add_post("/api/save", handle_save)
     app.router.add_post("/api/shutdown", handle_shutdown)
     app.router.add_post("/api/maintenance", handle_maintenance)
@@ -539,7 +592,7 @@ def _build_app():
 
 
 def run(host=None, port=None, open_browser=False):
-    """启动 Web 面板（阻塞）。QQ 服务在独立线程里运行，不受面板开关影响。"""
+    """启动 Web 面板（阻塞）。插件服务在独立线程里运行，不受面板开关影响。"""
     panel.configure_logging()
     # 每 5 秒一次的轮询统计不该刷满日志页：访问日志只保留告警以上
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)

@@ -22,6 +22,12 @@ _data_lock = TimedRLock("data")
 from config.api_config import config
 OLLAMA_BASE_URL = config["ollama_base_url"]
 OLLAMA_EMBED_MODEL = config["ollama_embed_model"]
+EMBEDDING_API_MODE = str(config.get("embedding_api_mode", "ollama") or "ollama").strip().lower()
+EMBEDDING_API_KEY = str(config.get("embedding_api_key") or "").strip()
+try:
+    EMBED_DIM = max(1, int(config.get("embedding_dim", 768)))
+except (TypeError, ValueError):
+    EMBED_DIM = 768
 DB_FILE = "data/test/memory.db"     # 冷热数据交换保存地址
 SIMILARITY_THRESHOLD = 0.22         # 建立语义链接的最低相似度
 DEDUP_THRESHOLD = 0.92              # 余弦相似度超过此值视为重复
@@ -35,7 +41,6 @@ RETRIEVAL_DEDUP_THRESHOLD = 0.75    # 检索结果去冗余弦相似度
 RETRIEVAL_MIN_EFFECTIVE = 0.02      # 有效相似度最低门槛
 WORDWEB_WINDOW_SIZE = 5             # 滑动窗口大小（以词为单位）
 WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与后期扩散
-EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
 MAX_HOT_SIZE = 1500                 # 热记忆节点硬上限，防止爆炸
@@ -623,7 +628,9 @@ def _build_word_to_memories():
 
 # ========== 模型加载 ==========
 def _ensure_embedding_model():
-    """确保 embedding 模型已拉取；缺失则通过 Ollama API 自动拉取。"""
+    """确保 Ollama embedding 模型已拉取；OpenAI 兼容网络接口无需拉取。"""
+    if EMBEDDING_API_MODE == "openai":
+        return
     import requests
     base_name = OLLAMA_EMBED_MODEL.split(":")[0]
     try:
@@ -658,12 +665,61 @@ def get_model():
     print("语义模型启动完成！")
 
 def text_to_vector(text: str) -> list:
+    """把文本转换为语义向量。
+
+    embedding_api_mode=ollama：走 Ollama 原生 /api/embed（旧端点自动回退）。
+    embedding_api_mode=openai：走任意 OpenAI 兼容 /v1/embeddings 网络接口，
+    地址可填 http://.../v1、https://api.openai.com/v1 或完整 /v1/embeddings。
     """
-    使用 Ollama 的 API 将文本转换为向量。
-    兼容新旧端点：新版 Ollama 用 /api/embed（旧 /api/embeddings 已移除），
-    先尝试新版，404 时回退旧版。
-    前提：Ollama 已在本地运行，且已通过 `ollama pull shaw/dmeta-embedding-zh` 拉取模型。
-    """
+    if EMBEDDING_API_MODE == "openai":
+        base = str(OLLAMA_BASE_URL or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("embedding_api_mode=openai 但未配置 embedding 服务地址")
+        if base.endswith("/embeddings"):
+            url = base
+        elif base.endswith("/v1"):
+            url = base + "/embeddings"
+        else:
+            url = base + "/v1/embeddings"
+        headers = {"Content-Type": "application/json"}
+        if EMBEDDING_API_KEY:
+            headers["Authorization"] = f"Bearer {EMBEDDING_API_KEY}"
+        try:
+            resp = requests.post(
+                url,
+                json={"model": OLLAMA_EMBED_MODEL, "input": text},
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("data") if isinstance(data, dict) else None
+            if items:
+                embedding = items[0].get("embedding")
+            else:
+                embedding = data.get("embedding") if isinstance(data, dict) else None
+            if embedding is None:
+                raise ValueError("网络 embedding 返回中未找到向量字段")
+            vec = list(embedding)
+            if len(vec) != EMBED_DIM:
+                raise ValueError(
+                    f"embedding 维度不匹配：配置 embedding_dim={EMBED_DIM}，"
+                    f"接口返回 {len(vec)}；请修改“向量维度”配置后重启"
+                )
+            return vec
+        except requests.exceptions.ConnectionError:
+            print("[Embedding] 网络连接失败，请检查 embedding 服务地址")
+            raise
+        except requests.exceptions.Timeout:
+            print("[Embedding] 网络请求超时")
+            raise
+        except requests.exceptions.HTTPError as e:
+            print(f"[Embedding] HTTP 错误: {e}")
+            raise
+        except (KeyError, ValueError, TypeError) as e:
+            print(f"[Embedding] 解析响应失败: {e}")
+            raise
+
     url_new = f"{OLLAMA_BASE_URL}/api/embed"
     url_old = f"{OLLAMA_BASE_URL}/api/embeddings"
     try:
@@ -673,7 +729,13 @@ def text_to_vector(text: str) -> list:
             data = resp.json()
             embeddings = data.get("embeddings")
             if embeddings:
-                return embeddings[0]
+                vec = list(embeddings[0])
+                if len(vec) != EMBED_DIM:
+                    raise ValueError(
+                        f"embedding 维度不匹配：配置 embedding_dim={EMBED_DIM}，"
+                        f"Ollama 返回 {len(vec)}；请修改“向量维度”配置后重启"
+                    )
+                return vec
         # 旧版端点 /api/embeddings（新版不可用时回退）
         resp = requests.post(url_old, json={"model": OLLAMA_EMBED_MODEL, "prompt": text}, timeout=30)
         resp.raise_for_status()
@@ -681,7 +743,13 @@ def text_to_vector(text: str) -> list:
         embedding = data.get("embedding")
         if embedding is None:
             raise ValueError("Ollama 返回的数据中未找到 'embedding' 字段")
-        return embedding
+        vec = list(embedding)
+        if len(vec) != EMBED_DIM:
+            raise ValueError(
+                f"embedding 维度不匹配：配置 embedding_dim={EMBED_DIM}，"
+                f"Ollama 返回 {len(vec)}；请修改“向量维度”配置后重启"
+            )
+        return vec
     except requests.exceptions.ConnectionError:
         print("[Ollama] 连接失败，请确认 Ollama 服务是否已启动（默认地址：http://localhost:11434）")
         raise
@@ -756,6 +824,11 @@ def _rebuild_faiss_index():
         rows = db.execute("SELECT id, vector FROM memories").fetchall()
         for mem_id, vec_blob in rows:
             vec = np.frombuffer(vec_blob, dtype=np.float32).reshape(1, -1)
+            if vec.shape[1] != EMBED_DIM:
+                raise ValueError(
+                    f"记忆库向量维度为 {vec.shape[1]}，当前 embedding_dim={EMBED_DIM}。"
+                    "更换向量模型后需要重建全部记忆向量，或恢复原向量维度。"
+                )
             faiss.normalize_L2(vec)
             _faiss_index.add(vec)
             faiss_id = _faiss_index.ntotal - 1

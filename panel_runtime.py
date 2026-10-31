@@ -3,8 +3,8 @@
 # 面板共享运行环境（无 GUI 依赖）。
 #
 # 桌面控制面板（control_panel.py，PyQt5）与 Web 控制面板（web_panel.py）
-# 共用这里的 Runtime：负责 Ollama 启停、QQ 服务线程、伪造发送/思考、
-# 记忆注入、落盘与关停。此前这些逻辑内嵌在 control_panel.py 里，
+# 共用这里的 Runtime：负责 Ollama 启停、插件服务线程、伪造思考、管理员消息注入、
+# 落盘与关停。此前这些逻辑内嵌在 control_panel.py 里，
 # 导致 Web 面板被迫 import PyQt5；抽出后两个面板互不依赖，
 # 核心代码（认知循环、记忆引擎、生物钟）仍一行不动。
 #
@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -41,8 +42,130 @@ PANEL_LOCK_FILE = RUN_DIR / "control_panel.lock"
 
 LOG_CAT_RUNTIME = "runtime"
 LOG_CAT_THINKING = "thinking"
-LOG_CAT_QQBOT = "qqbot"
+LOG_CAT_PLUGIN = "plugin"
 LOG_CAT_OLLAMA = "ollama"
+LOG_CAT_CONNECTION = "connection"
+_OLLAMA_EXTERNAL = False
+_OLLAMA_HINT = "ollama复用本地模型，无日志"
+_OLLAMA_HINT_SENT = False
+
+_LOG_LINE_RE = re.compile(
+    r"\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\]\s+\[[^\]]*\]\s+([^:]+):\s?(.*)"
+)
+_LEVEL_ERROR_RE = re.compile(r"(失败|异常|错误|无法|拒绝|traceback|critical|fatal|error)", re.I)
+_LEVEL_WARN_RE = re.compile(r"(警告|超时|未找到|跳过|未配置|缺失|warning|warn)", re.I)
+
+
+def _set_ollama_external(external: bool):
+    """记录 Ollama 是否复用外部/既有服务；外部模式只保留一条提示。"""
+    global _OLLAMA_EXTERNAL, _OLLAMA_HINT_SENT
+    _OLLAMA_EXTERNAL = bool(external)
+    if _OLLAMA_EXTERNAL and not _OLLAMA_HINT_SENT:
+        _OLLAMA_HINT_SENT = True
+        logging.info("[Ollama] %s", _OLLAMA_HINT)
+
+
+def ollama_external_mode() -> bool:
+    return bool(_OLLAMA_EXTERNAL)
+
+
+def _is_connection_log(name: str, msg: str) -> bool:
+    nl = str(name or "").lower()
+    text = str(msg or "").lower()
+    if nl in ("websockets", "websockets.server", "aiohttp.access", "webpanel"):
+        return True
+    if "websocket" in nl or "aiohttp" in nl:
+        return True
+    keywords = (
+        "websocket", "ws://", "wss://", "napcat", "qq bot", "qq 服务",
+        "微信桥", "已连接", "连接已断开", "连接失败", "连接超时",
+        "http://", "https://", "[api]", "api error", "embedding",
+        "发送信息", "llm理解", "llm特供记忆", "理解回复", "语言层思考过程",
+        "多模态理解", "模型调用", "请求失败", "请求超时", "prompt_tokens",
+    )
+    return any(k in text for k in keywords)
+
+
+def _is_plugin_log(name: str, msg: str) -> bool:
+    nl = str(name or "").lower()
+    text = str(msg or "").strip().lower()
+    if nl in ("qqbot", "wechat", "plugins", "bilibili", "browser", "web", "qq_napcat"):
+        return True
+    if "动作抉择" in text or "软件动作" in text:
+        return True
+    prefixes = (
+        "[qq软件]", "[qq", "[微信", "[插件", "[bilibili", "[浏览器",
+        "[动作抉择]", "[富消息]", "[聊天记录]", "[小程序]",
+    )
+    return any(text.startswith(p) for p in prefixes)
+
+
+def _is_thinking_log(name: str, msg: str) -> bool:
+    if str(name or "") != "Nascence.Processing":
+        return False
+    text = str(msg or "").strip()
+    if any(tag in text for tag in ("【内心】", "【发言】")):
+        return True
+    prefixes = (
+        "[认知循环]", "[反刍抑制]", "[概念层]", "[行为思考]",
+        "[记忆检索]", "[扩散]",
+    )
+    return any(text.startswith(p) for p in prefixes)
+
+
+def classify_log(name: str, msg: str, levelno: int = logging.INFO) -> str:
+    """把一条日志归入运行/思考/插件/Ollama/连接。"""
+    text = str(msg or "")
+    low = text.lower()
+    nl = str(name or "").lower()
+    if "ollama" in nl or "[ollama]" in low or "ollama" in low:
+        if _OLLAMA_EXTERNAL and _OLLAMA_HINT not in text:
+            return LOG_CAT_CONNECTION
+        return LOG_CAT_OLLAMA
+    if _is_connection_log(name, text):
+        return LOG_CAT_CONNECTION
+    if _is_plugin_log(name, text):
+        return LOG_CAT_PLUGIN
+    if _is_thinking_log(name, text):
+        return LOG_CAT_THINKING
+    return LOG_CAT_RUNTIME
+
+
+def log_level_name(levelno: int, msg: str = "") -> str:
+    text = str(msg or "")
+    if levelno >= logging.ERROR or _LEVEL_ERROR_RE.search(text):
+        return "error"
+    if levelno >= logging.WARNING or _LEVEL_WARN_RE.search(text):
+        return "warning"
+    return "info"
+
+
+def classify_log_line(line: str):
+    """解析日志文件行，返回 (分类, 等级)；用于 WebSocket 回填。"""
+    text = str(line or "")
+    match = _LOG_LINE_RE.search(text)
+    if match:
+        level_name, logger_name, message = match.groups()
+        levelno = getattr(logging, level_name, logging.INFO)
+    else:
+        logger_name, message, levelno = "", text, logging.INFO
+    return classify_log(logger_name, message, levelno), log_level_name(levelno, message)
+
+
+class SignalLogHandler(logging.Handler):
+    """把日志转发到事件总线，供面板（桌面或 Web）实时显示。"""
+
+    def emit(self, record):
+        try:
+            from utils.event_bus import BUS
+            message = record.getMessage() if hasattr(record, "getMessage") else str(record.msg)
+            cat = classify_log(record.name, message, record.levelno)
+            line = self.format(record)
+            level = log_level_name(record.levelno, message)
+            BUS.log.emit(cat, line)
+            BUS.log_event.emit(cat, line, level)
+        except Exception:
+            pass
 
 # 面板显示上限：只保留最近 N 个文本块，避免长时间运行后控件占用持续膨胀。
 # 注意这是"显示"上限，磁盘日志仍由 RotatingFileHandler 独立轮转。
@@ -70,34 +193,6 @@ def _check_clock_offset(clock):
             "相对时间短语可能失真（若为外部脚本写入的存档，重启一次即可重锚）",
             drift / 3600,
         )
-
-
-class SignalLogHandler(logging.Handler):
-    """把日志转发到事件总线，供面板（桌面或 Web）实时显示。"""
-
-    def emit(self, record):
-        try:
-            from utils.event_bus import BUS
-            cat = self._categorize(record)
-            BUS.log.emit(cat, self.format(record))
-        except Exception:
-            pass
-
-    @staticmethod
-    def _categorize(record):
-        name = record.name
-        # 自训练与世界生成已删除，对应的日志来源不再存在
-        if name == "Nascence.Processing":
-            return LOG_CAT_THINKING
-        msg = record.getMessage() if hasattr(record, "getMessage") else str(record.msg)
-        if "[Ollama]" in msg or msg.startswith("[Ollama]"):
-            return LOG_CAT_OLLAMA
-        if "[主动发言]" in msg:
-            return LOG_CAT_THINKING
-        qq_keywords = ("QQ 服务", "QQ Bot", "QQBot", "NapCat", "WebSocket")
-        if any(k in msg for k in qq_keywords):
-            return LOG_CAT_QQBOT
-        return LOG_CAT_RUNTIME
 
 
 class StreamToLogger:
@@ -258,12 +353,14 @@ class Runtime:
 
         # 优先探测目标 Ollama 服务（无论本地或外部）是否已经就绪
         if api_ready():
+            _set_ollama_external(True)
             logging.info("Ollama 服务已就绪（%s），直接复用", raw_base_url)
             return
 
         # 若目标地址为外部/宿主机（如 host.docker.internal / 局域网 IP），或当前运行在容器环境中：
         # 服务由外部或宿主机托管，容器内部绝不能去启动本地二进制，更不能因缺少二进制文件报错终止！
         if not is_local_host or is_container:
+            _set_ollama_external(True)
             logging.info("检测到配置的外部/宿主机 Ollama（%s），等待服务连通...", raw_base_url)
             for _ in range(6):
                 time.sleep(1.0)
@@ -285,6 +382,7 @@ class Runtime:
                 return sock.connect_ex((target_host, target_port)) == 0
 
         if port_in_use():
+            _set_ollama_external(True)
             logging.info("检测到 %s:%s 端口已有服务，等待 Ollama 完成启动", target_host, target_port)
             for _ in range(30):
                 if api_ready():
@@ -322,6 +420,7 @@ class Runtime:
             )
             return
 
+        _set_ollama_external(False)
         logging.info("正在启动本地 Ollama 服务: %s", binary)
         env = os.environ.copy()
         env["OLLAMA_HOME"] = str(PROJECT_DIR / "ollama" / "home")
@@ -345,6 +444,7 @@ class Runtime:
             if self.ollama_process.poll() is not None:
                 if api_ready():
                     self.ollama_process = None
+                    _set_ollama_external(True)
                     logging.info("检测到其他 Ollama 已接管服务，直接复用")
                     return
                 logging.warning("本地 Ollama 进程异常退出，跳过本地进程托管")
@@ -426,8 +526,23 @@ class Runtime:
             from utils.persistence import load_all_data, load_state, save_all_data, save_state
             from core.llm_interface import load_dialogue_history
 
-            stage("启动 Ollama")
-            self.start_ollama()
+            from config.api_config import config as _cfg
+            embedding_mode = str(_cfg.get("embedding_api_mode", "ollama") or "ollama").lower()
+            router_mode = str(_cfg.get("app_router_mode", "rule") or "rule").lower()
+            router_base = str(_cfg.get("app_router_base_url", "") or "").lower()
+            needs_local_ollama = (
+                embedding_mode != "openai"
+                or (
+                    router_mode == "local_llm"
+                    and any(h in router_base for h in ("127.0.0.1", "localhost", "::1"))
+                )
+            )
+            if needs_local_ollama:
+                stage("启动 Ollama")
+                self.start_ollama()
+            else:
+                stage("使用网络模型")
+                logging.info("embedding/门控使用网络模型，跳过本地 Ollama 启动")
 
             # 模型预热与记忆加载互不依赖：并行执行以缩短总时长
             #（Ollama 首次 embedding 调用需要几秒加载模型权重）。
@@ -635,45 +750,29 @@ class Runtime:
         logging.info("虚拟时间倍速已调整为 %s", value)
         return value
 
-    def fake_send(self, text):
-        self.initialize()
-        with self._fake_lock:
-            if not self.qq_loop or not self.qq_task or self.qq_task.done():
-                raise RuntimeError("QQ 服务未运行，无法通过 NapCat 发送消息")
-            import qq_bot
-            if qq_bot._napcat_websocket is None:
-                raise RuntimeError("NapCat 尚未连接，无法发送消息")
-            from core.memory_engine import create_memory
-            from utils.message_history import add_message
-            from utils.persistence import save_all_data
-
-            group_id = qq_bot.get_active_group_id()
-            fut = asyncio.run_coroutine_threadsafe(
-                qq_bot.send_group_msg(group_id, text), self.qq_loop
-            )
-            fut.result(timeout=10)
-            add_message(BOT_NAME, text, "伪造")
-            memory_id = create_memory(f"我说：{text}")
-            save_all_data()
-            logging.info("伪造发送成功：群=%s 内容=%s 记忆ID=%s", group_id, text, memory_id)
-            return memory_id
-
     def fake_think(self, text):
         self.initialize()
         with self._fake_lock:
-            from core.cognition import generate_response
+            from core.cognition import (
+                generate_response, inject_keywords, inject_user_input,
+                extract_keywords_jieba,
+            )
             from utils.message_history import add_message
             from utils.persistence import save_all_data, save_state
 
-            augmented = f"我（{BOT_NAME}）自己想着：{text}"
-            # 调用核心思考流程（LLM 拆解→检索→扩散→拼接）
-            # 返回 (reply, user_input, new_mem_ids, should_speak)
-            # "伪造思考"本身就是模拟内部想法，不区分 say（generate_response
-            # 内部已按 say 决定记为"我说"还是"我想"）
-            reply, _, _new_mem_ids, _should_speak = generate_response(augmented)
+            # 内部推演：即使语言层 say=true，也只作为“我想”，不会当作对外发言。
+            reply, _, _new_mem_ids, _should_speak = generate_response(text, internal=True)
             reply = str(reply or "（静默）").strip()
             memory_text = f"我想：{reply}"
             add_message(BOT_NAME, memory_text, "伪造思考")
+            # 让全局认知循环下一轮能继续围绕这段思考检索/联想。
+            try:
+                inject_user_input(text)
+                keywords = extract_keywords_jieba(text + " " + reply)
+                if keywords:
+                    inject_keywords(keywords, "fake_think")
+            except Exception:
+                pass
             save_all_data()
             save_state()
             logging.info("伪造思考完成：输入=%s 想法=%s", text, reply)
@@ -681,10 +780,22 @@ class Runtime:
 
     def inject_memory(self, content):
         self.initialize()
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("注入内容为空")
         from core.memory_engine import create_memory
+        from core.cognition import inject_keywords, inject_user_input, extract_keywords_jieba
         from utils.persistence import save_all_data
 
         memory_id = create_memory(content)
+        try:
+            # 让全局认知循环下一轮能检索到这条管理员注入的记忆。
+            inject_user_input(content)
+            keywords = extract_keywords_jieba(content)
+            if keywords:
+                inject_keywords(keywords, "admin_inject")
+        except Exception:
+            pass
         save_all_data()
         logging.info("管理员注入记忆成功，ID=%s，内容=%s", memory_id, content)
         return memory_id
@@ -800,9 +911,36 @@ def apply_config_hot_reload(cfg: dict):
     except Exception:
         logging.exception("短期记忆窗口热更新失败")
     try:
+        # 门控模型/跟随开关可能刚改过；清掉旧的失败锁定，让新配置立即生效。
+        from core.app_router import APP_ROUTER
+        APP_ROUTER.reset()
+    except Exception:
+        pass
+    try:
         from core import memory_engine as me
+        old_mode = getattr(me, "EMBEDDING_API_MODE", "")
+        old_model = getattr(me, "OLLAMA_EMBED_MODEL", "")
+        new_mode = str(cfg.get("embedding_api_mode", old_mode) or "ollama").strip().lower()
+        new_model = str(cfg.get("ollama_embed_model", old_model) or "").strip()
         me.OLLAMA_BASE_URL = cfg.get("ollama_base_url", me.OLLAMA_BASE_URL)
-        me.OLLAMA_EMBED_MODEL = cfg.get("ollama_embed_model", me.OLLAMA_EMBED_MODEL)
+        me.OLLAMA_EMBED_MODEL = new_model
+        me.EMBEDDING_API_MODE = new_mode
+        me.EMBEDDING_API_KEY = str(cfg.get("embedding_api_key") or "").strip()
+        try:
+            new_dim = max(1, int(cfg.get("embedding_dim", me.EMBED_DIM)))
+        except (TypeError, ValueError):
+            new_dim = me.EMBED_DIM
+        if new_dim != me.EMBED_DIM:
+            logging.warning(
+                "embedding_dim=%s 需要重启并重建向量索引；当前运行仍使用 %s",
+                new_dim, me.EMBED_DIM,
+            )
+        if (old_mode and new_mode != old_mode) or (old_model and new_model != old_model):
+            logging.warning(
+                "embedding 模式/模型已变更（%s/%s → %s/%s）；"
+                "已有记忆向量不会自动重算，请重建向量索引后再检索",
+                old_mode, old_model, new_mode, new_model,
+            )
     except Exception:
         pass
     reload_biorhythm_params()

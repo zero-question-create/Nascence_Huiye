@@ -509,9 +509,10 @@ def mask_brackets(text: str) -> str:
 
     return ''.join(result)
 
-def generate_response(user_input: str, current_speaker: str = None) -> tuple:
+def generate_response(user_input: str, current_speaker: str = None,
+                      internal: bool = False) -> tuple:
     """
-    核心回复逻辑：
+    本地命令窗 / 伪造思考的同步回复逻辑：
     1、预处理输入
     2、LLM拆解
     3、语义查找
@@ -524,6 +525,8 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
       new_mem_ids  —— **本轮**新建的记忆 ID 列表（按轮次返回，不依赖全局累加器）
       should_speak —— 本轮是否应把 reply 公开说出口；False 表示这是内心话，
                       调用方不应显示/发送，记忆里也已记为"我想"而非"我说"
+      internal     —— True 表示伪造思考/内部推演：即使模型说 say=true，
+                      也只记为"我想"，不当作对外发言
     """
     # 预处理
     #clear_log()     # 可选择不清空，不清空的话直接把这行注释掉
@@ -540,11 +543,13 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
         save_state()
 
     # 存储记忆（按模式设置半衰期），不去重
+    # 伪造思考/内部推演不是“别人告诉她的话”，不生成用户消息记忆。
     half_life = MODE_HALF_LIFE.get(mode, DEFAULT_HALF_LIFE)
     user_mem_ids = []
-    for frag in mem_fragments:
-        mid = create_memory(frag, half_life=half_life)
-        user_mem_ids.append(mid)
+    if not internal:
+        for frag in mem_fragments:
+            mid = create_memory(frag, half_life=half_life)
+            user_mem_ids.append(mid)
 
     # 阶段B：关键词驱动的语义检索（faiss）
     from core.memory_engine import memories
@@ -627,8 +632,15 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
 
     # 阶段D：LLM 拼接回复（传入关键词作为指引）
     # 身体状态作为独立提示行，不再混进记忆列表（避免被排序/去重/随机轮次消耗）
-    result = verbalize(timed_memories, keywords, new_state, user_input,
-                       timestamps=timestamps, body_state=_get_drowsy_memory())
+    # 她自己的近期想法必须一起带上，CLI 才有连续的人格与上下文。
+    short_pairs = SHORT_TERM.recent()
+    pinned = [text for _, text in short_pairs]
+    pinned_ts = [ts for ts, _ in short_pairs]
+    result = verbalize(
+        timed_memories, keywords, new_state, user_input,
+        pinned=pinned, timestamps=timestamps, pinned_timestamps=pinned_ts,
+        body_state=_get_drowsy_memory(),
+    )
     reply = ""
     should_speak = False
     if isinstance(result, dict):
@@ -637,6 +649,10 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
     elif result:
         reply = str(result)
         should_speak = True
+
+    if internal:
+        # 伪造思考/内部推演：可以产生“想说的话”，但不当作对外发言。
+        should_speak = False
 
     if reply:
         reply = reply.strip("“")
@@ -659,6 +675,8 @@ def generate_response(user_input: str, current_speaker: str = None) -> tuple:
         user_mem_ids.append(bot_mem_id)
         if len(user_mem_ids) > 1:
             add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
+        # 与全局认知循环一致：自己的近期想法进入 4~6 条短期窗口。
+        SHORT_TERM.add_thought(reply, bool(should_speak))
     return reply, user_input, user_mem_ids, should_speak
 
 def reset_dialogue():

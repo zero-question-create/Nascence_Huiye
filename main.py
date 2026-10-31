@@ -73,7 +73,10 @@ def cold_start_batch_injection():
 def main():
     monitor_start()
     get_model()
-    print(f"当前时间倍速：{clock.set_speed(144)}")
+    try:
+        print(f"当前时间倍速：{clock.set_speed(144)}")
+    except RuntimeError:
+        print("当前使用 QQ 同步时钟，保持真实时间")
     load_all_data()
     load_state()
     log_metrics_status()
@@ -83,7 +86,7 @@ def main():
         cold_start_batch_injection()
         save_all_data()
         save_state()
-    print(f"Nascence{BOT_NAME} v0.5.3")
+    print(f"Nascence{BOT_NAME} v0.8.6")
     print("输入 'exit' 退出")
     
     try:

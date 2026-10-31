@@ -170,6 +170,7 @@ class WeChatPlugin(Plugin):
     def status(self) -> dict:
         data = super().status()
         data.update(runtime.app_status())
+        data["running"] = bool(self._thread and self._thread.is_alive())
         data["bridge_connected"] = runtime._napcat_like_ws is not None
         data["identity"] = runtime.get_self_identity()
         return data

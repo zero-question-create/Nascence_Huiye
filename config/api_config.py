@@ -43,6 +43,10 @@ DEFAULT_CONFIG = {
     "behavior_timeout": None,
     "ollama_base_url": "http://localhost:11434",
     "ollama_embed_model": "shaw/dmeta-embedding-zh",
+    # 语义向量：ollama=原生 Ollama 接口；openai=OpenAI 兼容 /v1/embeddings 网络接口
+    "embedding_api_mode": "ollama",
+    "embedding_api_key": "",
+    "embedding_dim": 768,
     "bot_qq": "123456",                     # 兜底 QQ 号；连接后以 NapCat get_login_info 自动获取的为准
     "active_group_id": "123456",
     "napcat_token": "Nascence",
@@ -77,8 +81,9 @@ DEFAULT_CONFIG = {
     "qq_app_default_open": False,           # QQ 默认关闭：先累积未读，等动作层打开
     # ===== 本地软件门控（打开/退出软件，不参与语言回复）=====
     "app_router_mode": "rule",              # rule | local_llm | off
-    "app_router_base_url": "http://127.0.0.1:11434/v1",  # Ollama OpenAI 兼容接口
-    "app_router_api_key": "ollama",
+    "app_router_follow_global_behavior": False,  # 跟随全局 behavior_* 行为模型
+    "app_router_base_url": "http://127.0.0.1:11434/v1",  # OpenAI 兼容接口：本地 Ollama 或网络模型均可
+    "app_router_api_key": "ollama",             # 本地 Ollama 可填 ollama；网络模型填真实 Key
     "app_router_model": "",                 # local_llm 模式必填，例如 qwen2.5:3b
     "app_router_timeout": 20,
     "app_router_max_tokens": 160,

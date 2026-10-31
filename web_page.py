@@ -4,11 +4,11 @@
 # 由 web_panel.py 提供；{{BOT_NAME}} 会被替换成实际角色名。
 #
 # 页面结构对齐桌面面板（实施文档 5.3）：
-#   总览：记忆数/链接数/词网/运行时长/时钟/精力（含作息强度与常睡时段）
-#   QQ 服务：启停 + 连接状态 + NapCat 配置
+#   总览：记忆数/链接数/词网/运行时长/时钟/精力；启停全局认知循环
+#   插件：每个插件启动/停止；点击进入插件自己的配置
 #   日志：分栏（运行/思考/QQ/Ollama）+ 500 行上限 + 清空
 #   配置：API 配置 + 生物钟参数
-#   维护：伪造发送 / 伪造思考 / 记忆注入
+#   维护：伪造思考 / 管理员消息注入
 # ========================================================================
 
 PAGE_HTML = r"""<!DOCTYPE html>
@@ -47,6 +47,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
   input,textarea,select{width:100%;background:#0f1621;border:1px solid #2a3850;border-radius:7px;
                         padding:8px 10px;color:var(--text);font:inherit}
+  input.missing,textarea.missing,select.missing{border-color:var(--err);box-shadow:0 0 0 1px var(--err)}
   textarea{min-height:80px;resize:vertical}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 16px}
@@ -73,14 +74,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1>Nascence · {{BOT_NAME}}</h1>
-  <span id="qqBadge" class="badge off">QQ 服务：未运行</span>
+  <span id="cognitiveBadge" class="badge off">认知循环：已停止</span>
   <span id="stateBadge" class="badge wait">加载中</span>
-  <button id="shutdownBtn" title="停止 QQ 服务、保存全部数据并退出面板">关闭面板</button>
+  <button id="shutdownBtn" title="停止认知循环与全部插件服务、保存全部数据并退出面板">关闭面板</button>
 </header>
 
 <nav>
   <button class="active" data-page="overview">总览</button>
-  <button data-page="qq">QQ 服务</button>
   <button data-page="plugins">插件</button>
   <button data-page="logs">日志</button>
   <button data-page="config">配置</button>
@@ -102,59 +102,67 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="panel" style="margin-top:14px">
       <h3>运行控制</h3>
       <div class="row">
-        <button class="act" id="ovQQStart">启动 QQ 服务</button>
-        <button class="act sec" id="ovQQStop">停止 QQ 服务</button>
+        <button class="act" id="ovCognitiveStart">启动认知循环</button>
+        <button class="act sec" id="ovCognitiveStop">停止认知循环</button>
         <button class="act sec" id="btnSave">立即保存全部数据</button>
       </div>
-      <div class="hint">QQ 服务在后台线程独立运行；关闭浏览器不会停止服务与认知循环。</div>
+      <div class="hint">这里控制全局认知循环；插件服务在“插件”页分别启动/停止。停止认知循环不会断开已运行的插件，但不会产生新的思考与行为。</div>
     </div>
     <div class="panel">
-      <h3>最近的群消息</h3>
+      <h3>最近消息</h3>
       <div id="feed"><div class="hint">暂无消息</div></div>
-    </div>
-  </section>
-
-  <!-- QQ -->
-  <section class="page" id="page-qq">
-    <div class="panel">
-      <h3>服务控制</h3>
-      <div class="row">
-        <button class="act" id="btnQQStart">启动 QQ 服务</button>
-        <button class="act sec" id="btnQQStop">停止 QQ 服务</button>
-      </div>
-      <div class="kv" style="margin-top:12px">
-        <div class="k">服务状态</div><div id="q-status">未运行</div>
-        <div class="k">NapCat 连接</div><div id="q-napcat">未连接</div>
-        <div class="k">QQ 身份（自动获取）</div><div id="q-iden">未连接</div>
-        <div class="k">软件状态</div><div id="q-app">未打开</div>
-        <div class="k">当前对话</div><div id="q-conv">无</div>
-        <div class="k">WebSocket</div><div>ws://127.0.0.1:6700/ws（NapCat 作为主动客户端连入）</div>
-        <div class="k">消息发送</div><div>NapCat WebSocket Action</div>
-      </div>
-      <div class="hint">QQ 昵称与 QQ 号在连接后由 NapCat 的 get_login_info 自动获取；意识体名字（{{BOT_NAME}}）只用于记忆与思考，不在后台单独配置 QQ 昵称。</div>
-    </div>
-    <div class="panel">
-      <h3>NapCat 配置</h3>
-      <div class="grid2">
-        <div><label>机器人 QQ（连接后自动获取；此处仅作未连接时兜底）</label><input id="q-bot"></div>
-        <div><label>主动发言群号</label><input id="q-group"></div>
-        <div><label>NapCat 鉴权 Token</label><input id="q-token"></div>
-        <div><label>NapCat HTTP 接口地址（正向 HTTP，用于语音下载）</label><input id="q-http" placeholder="http://127.0.0.1:5700"></div>
-      </div>
-      <div class="row" style="margin-top:12px"><button class="act" id="btnSaveNapcat">保存并热刷新</button></div>
-      <div class="hint">保存后立即生效：运行中的 QQ 服务会直接使用新值，无需重启。</div>
     </div>
   </section>
 
   <!-- 插件 -->
   <section class="page" id="page-plugins">
-    <div class="panel">
-      <h3>行为插件</h3>
-      <div class="hint">所有插件可并行运行：启动后各自收消息、缓存未读；辉夜打开哪个软件，行为就落到哪个插件。语言模型始终是全局主模型，插件只提供软件动作与发送通道。提示词只包含名字与记忆，插件不得注入平台/群号/用户 ID 等信息。</div>
-      <div id="pluginList" style="margin-top:12px"></div>
-      <div class="row" style="margin-top:12px"><button class="act" id="btnSavePlugins">保存插件配置</button></div>
-      <div class="hint">语言模型统一使用“配置”页的主模型，插件不可覆盖。行为模型只在软件打开后参与，决定软件动作；是否发送这句话仍由语言层的 say 决定。全局行为模型默认使用主模型，可在“配置”页单独配置。</div>
-      <div class="hint">行为模型 API Key 留空表示不修改。勾选“跟随全局行为模型”时，插件自己的行为模型字段会被忽略。</div>
+    <div class="panel" id="pluginRunPanel">
+      <h3>插件运行</h3>
+      <div class="hint">每个插件只有启动/停止一个开关。启动后独立收消息、缓存未读；停止会同时退出软件门控。</div>
+      <div id="pluginRunList" style="margin-top:12px"></div>
+    </div>
+    <div class="panel" id="pluginConfigPanel" style="margin-top:14px">
+      <h3>插件配置</h3>
+      <div class="hint">点击插件进入它的具体配置。语言模型全局统一；这里只配置插件自己的行为模型。</div>
+      <div id="pluginConfigList" style="margin-top:12px"></div>
+    </div>
+    <div class="panel" id="pluginDetailPanel" style="display:none">
+      <div class="row">
+        <button class="act sec" id="btnPluginBack">← 返回插件列表</button>
+        <h3 id="pluginDetailTitle" style="margin:0"></h3>
+      </div>
+      <div class="hint" id="pluginDetailDesc"></div>
+      <div id="pluginCommonConfig" style="margin-top:12px">
+        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="pd-follow" style="width:auto" onchange="toggleDetailFollow()"> 跟随全局行为模型</label>
+        <div class="grid3" style="margin-top:8px">
+          <div><label>行为模型 Base URL（不跟随时使用）</label><input id="pd-abase"></div>
+          <div><label>行为模型名（不跟随时使用）</label><input id="pd-amodel"></div>
+          <div><label>行为 API Key</label><input id="pd-akey" type="password" placeholder="留空不修改"></div>
+        </div>
+        <div class="hint" style="margin-top:6px">留空字段回落到全局行为模型；全局行为模型未配置时使用主模型。行为模型只做软件动作，不决定是否发送。</div>
+        <label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pd-reasoning" style="width:auto"> 行为模型接收语言层思考过程（思维链）</label>
+        <div class="row" style="margin-top:12px"><button class="act" id="btnSavePluginDetail">保存插件配置</button></div>
+        <div class="hint">不跟随全局行为模型时，Base URL、模型名和 API Key 为必填；未填写保存会提示。</div>
+      </div>
+      <div id="pluginSpecificQQ" style="display:none;margin-top:16px">
+        <h4>QQ / NapCat</h4>
+        <div class="kv" style="margin-top:10px">
+          <div class="k">服务状态</div><div id="q-status">未运行</div>
+          <div class="k">NapCat 连接</div><div id="q-napcat">未连接</div>
+          <div class="k">QQ 身份（自动获取）</div><div id="q-iden">未连接</div>
+          <div class="k">软件状态</div><div id="q-app">未打开</div>
+          <div class="k">当前对话</div><div id="q-conv">无</div>
+        </div>
+        <div class="grid2" style="margin-top:12px">
+          <div><label>机器人 QQ（连接后自动获取；此处仅作未连接时兜底）</label><input id="q-bot"></div>
+          <div><label>主动发言群号</label><input id="q-group"></div>
+          <div><label>NapCat 鉴权 Token</label><input id="q-token"></div>
+          <div><label>NapCat HTTP 接口地址（正向 HTTP，用于语音下载）</label><input id="q-http" placeholder="http://127.0.0.1:5700"></div>
+        </div>
+        <div class="row" style="margin-top:12px"><button class="act" id="btnSaveNapcat">保存 QQ 配置</button></div>
+        <div class="hint">保存后立即生效。主动发言群号、NapCat Token、HTTP 地址为必填；机器人 QQ 可留空，连接后由 NapCat 自动获取。QQ 昵称与 QQ 号在连接后由 get_login_info 自动获取；意识体名字（{{BOT_NAME}}）只用于记忆与思考。</div>
+      </div>
+      <div class="hint" id="pluginSpecificHint" style="margin-top:12px"></div>
     </div>
   </section>
 
@@ -166,11 +174,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
           <option value="all">全部</option>
           <option value="runtime">运行日志</option>
           <option value="thinking">思考过程</option>
-          <option value="qqbot">QQbot</option>
+          <option value="plugin">插件</option>
           <option value="ollama">Ollama</option>
+          <option value="connection">连接</option>
+        </select>
+        <select id="logLevel" style="max-width:140px">
+          <option value="all">全部等级</option>
+          <option value="error">报错</option>
+          <option value="warning">警告</option>
+          <option value="info">日志</option>
         </select>
         <button class="act sec" id="btnClearLog">清空显示</button>
-        <span class="hint">仅保留最近 500 行，避免长时间运行占用内存</span>
+        <span class="hint">仅保留最近 500 行；网络连接、LLM 请求在“连接”，插件行为在“插件”</span>
       </div>
       <div id="logs" style="margin-top:10px"></div>
     </div>
@@ -222,29 +237,41 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
       <!-- 向量嵌入模型区块（独立换行展示） -->
       <div class="sub-box">
-        <h4>向量嵌入模型（Ollama Embedding）— 语义记忆向量化与检索</h4>
-        <div class="grid2">
-          <div><label>Ollama 服务地址（本地填 http://127.0.0.1:11434，容器访问宿主机填 http://host.docker.internal:11434）</label><input id="f-oburl" placeholder="http://127.0.0.1:11434"></div>
-          <div><label>嵌入模型名称（须已执行 ollama pull）</label><input id="f-omodel" placeholder="shaw/dmeta-embedding-zh"></div>
+        <h4>向量嵌入模型（Ollama / OpenAI 兼容网络）— 语义记忆向量化与检索</h4>
+        <div class="grid3">
+          <div><label>接口模式</label>
+            <select id="f-oemode">
+              <option value="ollama">Ollama 原生</option>
+              <option value="openai">OpenAI 兼容网络</option>
+            </select>
+          </div>
+          <div><label>服务地址（Ollama 原生填 http://host:11434；网络接口填 https://host/v1）</label><input id="f-oburl" placeholder="http://127.0.0.1:11434"></div>
+          <div><label>嵌入模型名称（Ollama 需已 pull；网络接口填 API 模型名）</label><input id="f-omodel" placeholder="shaw/dmeta-embedding-zh"></div>
+          <div><label>API Key（Ollama 可留空；网络接口通常必填）</label><input id="f-okey" type="password" placeholder="留空不修改"></div>
+          <div><label>向量维度（需与模型输出一致）</label><input id="f-odim" type="number" min="1" placeholder="768"></div>
         </div>
+        <div class="hint">OpenAI 兼容模式会请求“服务地址 + /embeddings”（地址以 /v1 结尾时直接拼接）。更换模型或维度后需重建向量索引；维度不一致会在启动时提示。</div>
       </div>
 
       <div class="row" style="margin-top:12px"><button class="act" id="btnSaveCfg">保存模型与 API 配置</button></div>
+      <div class="hint">红色边框为必填项；未填写时保存会提示。API Key 留空表示保留已配置的值。</div>
       <div class="hint">保存后立即生效：API 客户端与向量模型配置实时热刷新，无需重启面板或容器。</div>
     </div>
     <div class="panel">
       <h3>本地软件门控（打开/退出软件，不参与语言回复）</h3>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><input type="checkbox" id="f-ar-follow" style="width:auto" onchange="toggleRouterFollow()"> 跟随全局行为模型</label>
+      <div class="hint">勾选后使用“配置”页的全局行为模型（未配置行为模型时使用主模型），下面的门控模型字段会被忽略。</div>
       <div class="grid3">
         <div><label>模式</label>
           <select id="f-ar-mode">
             <option value="rule">规则</option>
-            <option value="local_llm">本地 LLM</option>
+            <option value="local_llm">LLM 门控（本地/网络）</option>
             <option value="off">关闭自动开关</option>
           </select>
         </div>
-        <div><label>本地模型 Base URL（Ollama OpenAI 兼容）</label><input id="f-ar-base" placeholder="http://127.0.0.1:11434/v1"></div>
-        <div><label>本地模型名（local_llm 模式必填，如 qwen2.5:3b）</label><input id="f-ar-model" placeholder="留空则规则模式"></div>
-        <div><label>本地模型 API Key（Ollama 可填 ollama）</label><input id="f-ar-key" type="password" placeholder="留空不修改"></div>
+        <div><label>门控模型 Base URL（OpenAI 兼容：本地 Ollama 或网络模型）</label><input id="f-ar-base" placeholder="http://127.0.0.1:11434/v1"></div>
+        <div><label>门控模型名（local_llm 模式必填）</label><input id="f-ar-model" placeholder="如 qwen2.5:3b / deepseek-chat"></div>
+        <div><label>门控模型 API Key（本地 Ollama 可填 ollama；网络模型填真实 Key）</label><input id="f-ar-key" type="password" placeholder="留空不修改"></div>
       </div>
       <div class="grid3" style="margin-top:8px">
         <div><label>未读持续几轮后打开软件</label><input id="f-ar-open" type="number" min="1"></div>
@@ -252,7 +279,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div><label>软件空闲几轮后退出软件</label><input id="f-ar-closeapp" type="number" min="1"></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSaveRouter">保存软件门控</button></div>
-      <div class="hint">规则模式不需要额外模型；local_llm 使用本地 Ollama 聊天模型，只决定 open_app / close_app / close_conversation / none，不参与语言回复。</div>
+      <div class="hint">规则模式不需要额外模型；local_llm 可使用本地 Ollama 或任意 OpenAI 兼容网络模型，只决定 open_app / close_app / close_conversation / none，不参与语言回复。</div>
     </div>
     <div class="panel">
       <h3>浏览器插件（网页解析）</h3>
@@ -290,22 +317,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <!-- 维护 -->
   <section class="page" id="page-maint">
     <div class="panel">
-      <h3>伪造发送</h3>
-      <div class="hint">以 {{BOT_NAME}} 身份向当前主动发言群发送消息，并写入历史对话与记忆库。</div>
-      <textarea id="m-send" placeholder="输入要以 {{BOT_NAME}} 身份发送的内容"></textarea>
-      <div class="row" style="margin-top:8px"><button class="act" id="btnFakeSend">伪造发送</button></div>
-    </div>
-    <div class="panel">
       <h3>伪造思考</h3>
-      <div class="hint">模拟内心思考流程（LLM 拆解→检索→扩散→拼接），不向 QQ 发送消息，仅写入历史与记忆库。</div>
+      <div class="hint">模拟一次内部思考：使用全局语言模型与近期想法，不向任何插件发送消息，只写入“我想”和历史。</div>
       <textarea id="m-think" placeholder="输入要让她思考的内容"></textarea>
       <div class="row" style="margin-top:8px"><button class="act" id="btnFakeThink">伪造思考</button></div>
     </div>
     <div class="panel">
-      <h3>管理员记忆注入</h3>
-      <div class="hint">直接写入记忆图并立即持久化。</div>
-      <textarea id="m-inject" placeholder="输入要植入的记忆（第一人称）"></textarea>
-      <div class="row" style="margin-top:8px"><button class="act" id="btnInject">注入并保存记忆</button></div>
+      <h3>管理员消息注入</h3>
+      <div class="hint">写入记忆图，并加入下一轮认知检索的关键词信箱；不会冒充她自己的发言。</div>
+      <textarea id="m-inject" placeholder="输入要注入的消息/记忆（第一人称）"></textarea>
+      <div class="row" style="margin-top:8px"><button class="act" id="btnInject">注入并保存</button></div>
     </div>
   </section>
 </main>
@@ -346,6 +367,46 @@ document.querySelectorAll('nav button').forEach(btn=>{
 let sysState = '';
 let shuttingDown = false;
 let statsInFlight = false;
+let hasPrimaryKey = false;
+let hasEmbeddingKey = false;
+let hasRouterKey = false;
+function ensureRequired(items, silent=false){
+  const missing = [];
+  let first = null;
+  for(const [id, label] of items){
+    const el = $(id);
+    if(!el) continue;
+    const empty = !String(el.value || '').trim();
+    el.classList.toggle('missing', empty);
+    if(empty){
+      missing.push(label);
+      if(!first) first = el;
+    }
+  }
+  if(missing.length){
+    if(!silent){
+      toast('请先填写：' + missing.join('、'));
+      if(first) first.focus();
+    }
+    return false;
+  }
+  return true;
+}
+function clearMissing(ids){
+  for(const id of ids){
+    const el = $(id);
+    if(el) el.classList.remove('missing');
+  }
+}
+function toggleRouterFollow(){
+  const follow = !!$('f-ar-follow').checked;
+  for(const id of ['f-ar-base', 'f-ar-model', 'f-ar-key']){
+    const el = $(id);
+    if(!el) continue;
+    el.disabled = follow;
+    if(follow) el.classList.remove('missing');
+  }
+}
 async function refreshStats(){
   // 0.5s 一轮且请求未返回时不叠加：避免慢响应把线程池堆满（表现为界面越来越卡）
   if(statsInFlight) return;
@@ -416,36 +477,47 @@ async function refreshStats(){
         ? ('核心加载：' + d.init_stage) : '生物钟未就绪';
       $('stateBadge').className = 'badge wait';
     }
-    const qb = $('qqBadge');
-    qb.textContent = 'QQ 服务：' + (d.qq_running ? '运行中' : '未运行');
-    qb.className = 'badge' + (d.qq_running ? '' : ' off');
-    $('q-status').textContent = d.qq_running ? '运行中' : '未运行';
-    $('q-napcat').textContent = d.napcat_connected ? '已连接' : (d.qq_running ? '等待 NapCat 连入…' : '未连接');
-    const ident = d.qq_identity || {};
-    if(ident.nickname){
-      $('q-iden').textContent = `${ident.nickname}（${ident.user_id || '?'}，${ident.source === 'napcat' ? 'NapCat 自动获取' : '兜底'}）`;
-    }else if(ident.user_id){
-      $('q-iden').textContent = `${ident.user_id}（未连接，使用配置兜底）`;
-    }else{
-      $('q-iden').textContent = '未获取';
+    const cb = $('cognitiveBadge');
+    const cogRunning = !!d.cognitive_running;
+    cb.textContent = '认知循环：' + (cogRunning ? '运行中' : '已停止');
+    cb.className = 'badge' + (cogRunning ? '' : ' off');
+    if($('q-status')){
+      $('q-status').textContent = d.qq_running ? '运行中' : '未运行';
+      $('q-napcat').textContent = d.napcat_connected ? '已连接' : (d.qq_running ? '等待 NapCat 连入…' : '未连接');
+      const ident = d.qq_identity || {};
+      if(ident.nickname){
+        $('q-iden').textContent = `${ident.nickname}（${ident.user_id || '?'}，${ident.source === 'napcat' ? 'NapCat 自动获取' : '兜底'}）`;
+      }else if(ident.user_id){
+        $('q-iden').textContent = `${ident.user_id}（未连接，使用配置兜底）`;
+      }else{
+        $('q-iden').textContent = '未获取';
+      }
+      const qapp = d.qq_app || {};
+      $('q-app').textContent = qapp.open
+        ? `已打开${qapp.unread ? `，另有 ${qapp.unread} 条未读` : ''}`
+        : `未打开${qapp.unread ? `，${qapp.unread} 条未读` : ''}`;
+      $('q-conv').textContent = qapp.current_conversation || '无';
     }
-    const qapp = d.qq_app || {};
-    $('q-app').textContent = qapp.open
-      ? `已打开${qapp.unread ? `，另有 ${qapp.unread} 条未读` : ''}`
-      : `未打开${qapp.unread ? `，${qapp.unread} 条未读` : ''}`;
-    $('q-conv').textContent = qapp.current_conversation || '无';
   }catch(e){ /* 面板不因统计失败而中断 */ }
   finally{ statsInFlight = false; }
 }
 async function loadConfig(){
   try{
     const c = await getJSON('/api/config');
+    hasPrimaryKey = !!c._has_primary_key;
+    hasEmbeddingKey = !!c._has_embedding_key;
+    hasRouterKey = !!c._has_app_router_key;
+    $('f-pkey').placeholder = hasPrimaryKey ? '已配置，留空不修改' : '必填';
+    $('f-okey').placeholder = hasEmbeddingKey ? '已配置，留空不修改' : '网络接口通常必填';
+    $('f-ar-key').placeholder = hasRouterKey ? '已配置，留空不修改' : '必填';
     $('f-pburl').value = c.primary_base_url || '';
     $('f-pmodel').value = c.primary_model || '';
     $('f-bburl').value = c.behavior_base_url || '';
     $('f-bmodel').value = c.behavior_model || '';
     $('f-sburl').value = c.secondary_base_url || '';
     $('f-smode').value = c.secondary_model || '';
+    $('f-oemode').value = c.embedding_api_mode || 'ollama';
+    $('f-odim').value = c.embedding_dim ?? 768;
     $('f-oburl').value = c.ollama_base_url || '';
     $('f-omodel').value = c.ollama_embed_model || '';
     $('q-bot').value = c.bot_qq || '';
@@ -460,8 +532,10 @@ async function loadConfig(){
     $('f-idle').value = c.biorhythm_idle_to_sleep ?? 300;
     $('f-panel-port').value = c.panel_port ?? 32123;
     $('f-ar-mode').value = c.app_router_mode || 'rule';
+    $('f-ar-follow').checked = !!c.app_router_follow_global_behavior;
     $('f-ar-base').value = c.app_router_base_url || '';
     $('f-ar-model').value = c.app_router_model || '';
+    toggleRouterFollow();
     $('f-ar-open').value = c.app_open_after_unread_rounds ?? 2;
     $('f-ar-closeconv').value = c.app_close_conversation_idle_rounds ?? 15;
     $('f-ar-closeapp').value = c.app_close_idle_rounds ?? 30;
@@ -469,7 +543,48 @@ async function loadConfig(){
     $('f-br-durl').value = c.browser_dynamic_url || '';
     $('f-br-surl').value = c.browser_summary_base_url || '';
     $('f-br-smode').value = c.browser_summary_model || '';
+    markLoadedRequired();
   }catch(e){}
+}
+function markLoadedRequired(){
+  const primary = [
+    ['f-pburl', '主模型 Base URL'],
+    ['f-pmodel', '主模型名称'],
+    ['f-oburl', 'Embedding 服务地址'],
+    ['f-omodel', 'Embedding 模型名称'],
+    ['f-odim', '向量维度'],
+  ];
+  if(!hasPrimaryKey) primary.push(['f-pkey', '主模型 API Key']);
+  if($('f-oemode').value === 'openai' && !hasEmbeddingKey && !$('f-okey').value.trim()){
+    primary.push(['f-okey', 'Embedding API Key']);
+  }
+  ensureRequired(primary, true);
+  if(hasPrimaryKey) clearMissing(['f-pkey']);
+  if($('f-oemode').value !== 'openai' || hasEmbeddingKey) clearMissing(['f-okey']);
+  ensureRequired([
+    ['q-group', '主动发言群号'],
+    ['q-token', 'NapCat 鉴权 Token'],
+    ['q-http', 'NapCat HTTP 接口地址'],
+  ], true);
+  if($('f-ar-mode').value === 'local_llm' && !$('f-ar-follow').checked){
+    const required = [
+      ['f-ar-base', '门控模型 Base URL'],
+      ['f-ar-model', '门控模型名'],
+    ];
+    if(!hasRouterKey) required.push(['f-ar-key', '门控模型 API Key']);
+    ensureRequired(required, true);
+  }else{
+    clearMissing(['f-ar-base', 'f-ar-model', 'f-ar-key']);
+  }
+  if($('f-br-mode').value === 'dynamic'){
+    ensureRequired([['f-br-durl', '动态解析接口']], true);
+  }else{
+    clearMissing(['f-br-durl', 'f-br-dkey']);
+  }
+  const bb = $('f-bburl').value.trim();
+  const bm = $('f-bmodel').value.trim();
+  $('f-bburl').classList.toggle('missing', !bb && !!bm);
+  $('f-bmodel').classList.toggle('missing', !!bb && !bm);
 }
 
 // ---------- 插件配置 ----------
@@ -479,110 +594,193 @@ const CAP_LABELS = {
   feed:'信息流', search:'搜索', proactive:'主动发言'
 };
 let pluginCache = [];
+let currentPluginDetailId = null;
+let currentPluginHasKey = false;
+const PLUGIN_EXTRA_HINTS = {
+  wechat: '微信桥接地址、Token 与会话白名单在“配置”页和 config/wechat_manifest.json；桥接协议见 plugins/wechat/BRIDGE.md。',
+  bilibili: 'Bilibili Cookie 在 config/bilibili_credentials.json；推荐、搜索、评论等参数在“配置”页。',
+  browser: '网页解析模式（static/dynamic）、DeepSeek Fetch 地址与摘要模型在“配置”页的浏览器插件区域。',
+  web: '网页/小程序读取接口尚未实现。',
+};
 function escHtml(value){
   return String(value ?? '').replace(/[&<>"']/g, c => (
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
   ));
 }
+function pluginRunning(p){
+  return p && p.running !== undefined ? !!p.running : !!(p && p.enabled);
+}
 async function loadPlugins(){
   try{
     const d = await getJSON('/api/plugins');
     pluginCache = d.plugins || [];
-    const list = $('pluginList');
-    list.innerHTML = '';
+    const runList = $('pluginRunList');
+    const cfgList = $('pluginConfigList');
+    runList.innerHTML = '';
+    cfgList.innerHTML = '';
     for(const p of pluginCache){
-      const al = p.action_llm || {};
-      const follow = p.follow_global_behavior !== false;
+      const running = pluginRunning(p);
       const caps = (p.capabilities || []).map(c => CAP_LABELS[c] || c).join(' · ');
-      const box = document.createElement('div');
-      box.className = 'sub-box';
-      box.innerHTML =
-        `<h4>${escHtml(p.label)} <span class="hint" style="font-weight:400">${escHtml(p.id)}${p.implemented ? '' : ' · 未实现'}</span></h4>` +
-        `<div class="hint">${escHtml(p.description || '')}${caps ? ' · 能力：' + escHtml(caps) : ''}</div>` +
-        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-enabled" ${p.enabled ? 'checked' : ''} style="width:auto"> 启用</label>` +
-        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-follow" ${follow ? 'checked' : ''} style="width:auto" onchange="toggleFollowBehavior('${escHtml(p.id)}')"> 跟随全局行为模型</label>` +
-        `<div class="grid3" style="margin-top:8px">` +
-          `<div><label>行为模型 Base URL（不跟随时使用）</label><input id="pl-${escHtml(p.id)}-abase" value="${escHtml(al.base_url || '')}" ${follow ? 'disabled' : ''}></div>` +
-          `<div><label>行为模型名（不跟随时使用）</label><input id="pl-${escHtml(p.id)}-amodel" value="${escHtml(al.model || '')}" ${follow ? 'disabled' : ''}></div>` +
-          `<div><label>行为 API Key（${al._has_api_key ? '已配置，留空不修改' : '未配置'}）</label><input id="pl-${escHtml(p.id)}-akey" type="password" placeholder="留空不修改" ${follow ? 'disabled' : ''}></div>` +
-        `</div>` +
-        `<div class="hint" style="margin-top:6px">留空字段回落到全局行为模型；全局行为模型未配置时使用主模型。行为模型只做软件动作，不决定是否发送。</div>` +
-        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-reasoning" ${p.action_include_reasoning ? 'checked' : ''} style="width:auto"> 行为模型接收语言层思考过程（思维链）</label>` +
-        `<div class="row" style="margin-top:8px">` +
-          `<button class="act sec" onclick="pluginAction('${escHtml(p.id)}','start')">启动软件</button>` +
-          `<button class="act sec" onclick="pluginAction('${escHtml(p.id)}','stop')">停止软件</button>` +
-          `<span class="hint">${p.is_app ? '软件型插件' : '工具型插件'}${p.status && p.status.app && p.status.app.open ? ' · 当前已打开' : ''}</span>` +
+      const runBox = document.createElement('div');
+      runBox.className = 'sub-box';
+      runBox.innerHTML =
+        `<div class="row" style="justify-content:space-between;align-items:center;gap:12px">` +
+          `<div><b>${escHtml(p.label)}</b> <span class="hint">${escHtml(p.id)} · ${p.is_app ? '软件型' : '工具型'} · ${running ? '运行中' : '已停止'}</span>` +
+          `<div class="hint">${escHtml(p.description || '')}${caps ? ' · 能力：' + escHtml(caps) : ''}</div></div>` +
+          `<button class="act ${running ? 'sec' : ''}" ${p.implemented ? '' : 'disabled'} onclick="pluginAction('${escHtml(p.id)}','${running ? 'stop' : 'start'}')">${running ? '停止' : '启动'}</button>` +
         `</div>`;
-      list.appendChild(box);
+      runList.appendChild(runBox);
+
+      const cfgBtn = document.createElement('button');
+      cfgBtn.className = 'act sec';
+      cfgBtn.style.cssText = 'width:100%;text-align:left;margin-bottom:8px';
+      cfgBtn.innerHTML = `${escHtml(p.label)} <span class="hint">· 点击进入配置${p.implemented ? '' : '（未实现）'}</span>`;
+      cfgBtn.onclick = () => openPluginDetail(p.id);
+      cfgList.appendChild(cfgBtn);
     }
-    if(!pluginCache.length) list.innerHTML = '<div class="hint">未发现插件</div>';
+    if(!pluginCache.length){
+      runList.innerHTML = '<div class="hint">未发现插件</div>';
+      cfgList.innerHTML = '<div class="hint">未发现插件</div>';
+    }
   }catch(e){ toast('插件配置读取失败：' + e.message); }
 }
 async function pluginAction(id, action){
+  if(action === 'start' && id === 'qq_napcat'){
+    const required = [
+      ['q-group', '主动发言群号'],
+      ['q-token', 'NapCat 鉴权 Token'],
+      ['q-http', 'NapCat HTTP 接口地址'],
+    ];
+    if(!ensureRequired(required, true)){
+      openPluginDetail('qq_napcat');
+      ensureRequired(required);
+      return;
+    }
+  }
   try{
     await post('/api/plugins/' + action, {id});
-    toast((action === 'start' ? '启动' : '停止') + '成功');
+    toast((action === 'start' ? '插件已启动' : '插件已停止'));
     await loadPlugins();
+    if(currentPluginDetailId) openPluginDetail(currentPluginDetailId);
   }catch(e){ toast('操作失败：' + e.message); }
 }
-function toggleFollowBehavior(id){
-  const follow = $(`pl-${id}-follow`);
-  const disabled = !!(follow && follow.checked);
-  for(const suffix of ['abase', 'amodel', 'akey']){
-    const el = $(`pl-${id}-${suffix}`);
-    if(el) el.disabled = disabled;
+function toggleDetailFollow(){
+  const disabled = !!$('pd-follow').checked;
+  for(const id of ['pd-abase', 'pd-amodel', 'pd-akey']){
+    $(id).disabled = disabled;
+    if(disabled) $(id).classList.remove('missing');
   }
 }
-async function savePlugins(){
-  const body = {plugins: {}};
-  for(const p of pluginCache){
-    const enabled = $(`pl-${p.id}-enabled`);
-    if(!enabled) continue;
-    body.plugins[p.id] = {
-      enabled: enabled.checked,
-      follow_global_behavior: $(`pl-${p.id}-follow`).checked,
-      action_include_reasoning: $(`pl-${p.id}-reasoning`).checked,
-      action_llm: {
-        base_url: $(`pl-${p.id}-abase`).value.trim(),
-        model: $(`pl-${p.id}-amodel`).value.trim(),
-        api_key: $(`pl-${p.id}-akey`).value.trim(),
-      },
-    };
+function openPluginDetail(id){
+  const p = pluginCache.find(x => x.id === id);
+  if(!p) return;
+  currentPluginDetailId = id;
+  $('pluginRunPanel').style.display = 'none';
+  $('pluginConfigPanel').style.display = 'none';
+  $('pluginDetailPanel').style.display = '';
+  $('pluginDetailTitle').textContent = p.label;
+  $('pluginDetailDesc').textContent = (p.description || '') + (p.implemented ? '' : '（未实现）');
+  const al = p.action_llm || {};
+  currentPluginHasKey = !!al._has_api_key;
+  $('pd-follow').checked = p.follow_global_behavior !== false;
+  $('pd-abase').value = al.base_url || '';
+  $('pd-amodel').value = al.model || '';
+  $('pd-akey').value = '';
+  $('pd-akey').placeholder = currentPluginHasKey ? '已配置，留空不修改' : '必填（不跟随时）';
+  $('pd-reasoning').checked = !!p.action_include_reasoning;
+  toggleDetailFollow();
+  if(!$('pd-follow').checked){
+    const required = [
+      ['pd-abase', '行为模型 Base URL'],
+      ['pd-amodel', '行为模型名'],
+    ];
+    if(!currentPluginHasKey) required.push(['pd-akey', '行为 API Key']);
+    ensureRequired(required, true);
   }
-  await post('/api/plugins', body);
-  toast('插件配置已保存并热加载');
-  await loadPlugins();
+  const isQQ = p.id === 'qq_napcat';
+  $('pluginSpecificQQ').style.display = isQQ ? '' : 'none';
+  $('pluginSpecificHint').textContent = isQQ ? '' : (PLUGIN_EXTRA_HINTS[p.id] || '该插件暂无额外配置。');
+}
+function closePluginDetail(){
+  currentPluginDetailId = null;
+  $('pluginDetailPanel').style.display = 'none';
+  $('pluginRunPanel').style.display = '';
+  $('pluginConfigPanel').style.display = '';
+}
+async function savePluginDetail(){
+  const id = currentPluginDetailId;
+  if(!id) return;
+  if(!$('pd-follow').checked){
+    const required = [
+      ['pd-abase', '行为模型 Base URL'],
+      ['pd-amodel', '行为模型名'],
+    ];
+    if(!currentPluginHasKey && !$('pd-akey').value.trim()){
+      required.push(['pd-akey', '行为 API Key']);
+    }
+    if(!ensureRequired(required)) return;
+    clearMissing(['pd-akey']);
+  }else{
+    clearMissing(['pd-abase', 'pd-amodel', 'pd-akey']);
+  }
+  const body = {plugins: {}};
+  body.plugins[id] = {
+    follow_global_behavior: $('pd-follow').checked,
+    action_include_reasoning: $('pd-reasoning').checked,
+    action_llm: {
+      base_url: $('pd-abase').value.trim(),
+      model: $('pd-amodel').value.trim(),
+      api_key: $('pd-akey').value.trim(),
+    },
+  };
+  try{
+    await post('/api/plugins', body);
+    toast('插件配置已保存并热加载');
+    await loadPlugins();
+    openPluginDetail(id);
+  }catch(e){ toast('保存失败：' + e.message); }
 }
 
 // 日志：环形缓冲。
-// 每条日志进入环形缓冲后，按当前筛选重建视图；切换类型不会再丢之前的日志，
-// 也不会因为反复切换而无限增长（上限 MAX_LOG_LINES 条，只滚不丢）。
+// 每条日志进入环形缓冲后，按当前分类/等级筛选重建视图；上限 MAX_LOG_LINES。
 const logs = $('logs');
-const LOG_CATS = ['runtime', 'thinking', 'qqbot', 'ollama'];
-const logRing = [];               // 环形缓冲：{cat, line, cls}[]
-function pushLog(cat, line){
-  const cls = /ERROR|失败|异常/.test(line) ? 'e' : (/WARNING|警告/.test(line) ? 'w' : '');
-  logRing.push({cat, line, cls});
+const LOG_CATS = ['runtime', 'thinking', 'plugin', 'ollama', 'connection'];
+const LOG_LEVEL_LABELS = { error: '报错', warning: '警告', info: '日志' };
+const logRing = [];               // 环形缓冲：{cat, line, level, cls}[]
+function normalizeLogLevel(level, line){
+  if(level === 'error' || level === 'warning' || level === 'info') return level;
+  if(/ERROR|失败|异常|错误|Traceback/i.test(line)) return 'error';
+  if(/WARNING|警告|超时|未找到/i.test(line)) return 'warning';
+  return 'info';
+}
+function logMatches(entry){
+  const cat = $('logCat').value;
+  const level = $('logLevel').value;
+  if(cat !== 'all' && cat !== entry.cat) return false;
+  if(level !== 'all' && level !== entry.level) return false;
+  return true;
+}
+function pushLog(cat, line, level){
+  const lvl = normalizeLogLevel(level, line);
+  const cls = lvl === 'error' ? 'e' : (lvl === 'warning' ? 'w' : 't');
+  const entry = {cat, line, level: lvl, cls};
+  logRing.push(entry);
   if(logRing.length > MAX_LOG_LINES) logRing.shift();
-  // 仅在当前筛选可见时追加，避免无关类型触发重绘
-  const filter = $('logCat').value;
-  if(filter !== 'all' && filter !== cat) return;
-  appendLogNode(logRing[logRing.length - 1]);
+  if(!logMatches(entry)) return;
+  appendLogNode(entry);
   while(logs.childNodes.length > MAX_LOG_LINES) logs.removeChild(logs.firstChild);
   logs.scrollTop = logs.scrollHeight;
 }
 function appendLogNode(entry){
   const div = document.createElement('div');
-  div.className = entry.cls || '';
-  div.textContent = entry.line;
+  div.className = entry.cls || 't';
+  div.textContent = `[${LOG_LEVEL_LABELS[entry.level] || '日志'}] ${entry.line}`;
   logs.appendChild(div);
 }
 function rebuildLogView(){
-  const filter = $('logCat').value;
   logs.innerHTML = '';
   for(const entry of logRing){
-    if(filter !== 'all' && filter !== entry.cat) continue;
-    appendLogNode(entry);
+    if(logMatches(entry)) appendLogNode(entry);
   }
   logs.scrollTop = logs.scrollHeight;
 }
@@ -607,7 +805,7 @@ function connectWS(){
   ws.onopen = () => { logs.innerHTML = ''; logRing.length = 0; };
   ws.onmessage = (ev) => {
     let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
-    if(m.type === 'log') pushLog(m.cat, m.line);
+    if(m.type === 'log') pushLog(m.cat, m.line, m.level);
     else if(m.type === 'status') toast(m.text);
     else if(m.type === 'error') toast('错误：' + m.text);
     else if(m.type === 'message') addFeed(m.sender, m.content, m.source);
@@ -630,7 +828,7 @@ $('btnSave').onclick = async () => {
   catch(e){ toast('保存失败：'+e.message); }
 };
 $('shutdownBtn').onclick = async () => {
-  if(!confirm('确定要关闭面板吗？\n将停止 QQ 服务、保存全部数据并退出。')) return;
+  if(!confirm('确定要关闭面板吗？\n将停止认知循环与全部插件服务、保存全部数据并退出。')) return;
   const btn = $('shutdownBtn');
   btn.disabled = true; btn.textContent = '正在关闭…';
   shuttingDown = true;
@@ -644,29 +842,47 @@ $('shutdownBtn').onclick = async () => {
     toast('关闭请求失败：'+e.message);
   }
 };
-$('btnQQStart').onclick = async () => {
-  toast('QQ 服务启动中（首次需初始化，请稍候）');
-  try{ await post('/api/qq/start'); toast('QQ 服务已启动'); refreshStats(); }
+$('ovCognitiveStart').onclick = async () => {
+  toast('认知循环启动中…');
+  try{ await post('/api/cognitive/start'); toast('认知循环已启动'); refreshStats(); }
   catch(e){ toast('启动失败：'+e.message); }
 };
-$('btnQQStop').onclick = async () => {
-  toast('正在停止 QQ 服务…');
-  try{ await post('/api/qq/stop'); toast('QQ 服务已停止'); refreshStats(); }
+$('ovCognitiveStop').onclick = async () => {
+  toast('正在停止认知循环…');
+  try{ await post('/api/cognitive/stop'); toast('认知循环已停止'); refreshStats(); }
   catch(e){ toast('停止失败：'+e.message); }
 };
-$('ovQQStart').onclick = async () => {
-  toast('QQ 服务启动中（首次需初始化，请稍候）');
-  try{ await post('/api/qq/start'); toast('QQ 服务已启动'); refreshStats(); }
-  catch(e){ toast('启动失败：'+e.message); }
-};
-$('ovQQStop').onclick = async () => {
-  toast('正在停止 QQ 服务…');
-  try{ await post('/api/qq/stop'); toast('QQ 服务已停止'); refreshStats(); }
-  catch(e){ toast('停止失败：'+e.message); }
-};
+$('btnPluginBack').onclick = () => closePluginDetail();
+$('btnSavePluginDetail').onclick = () => savePluginDetail();
 $('btnClearLog').onclick = () => { logs.innerHTML = ''; logRing.length = 0; };
 $('logCat').onchange = () => { rebuildLogView(); };
+$('logLevel').onchange = () => { rebuildLogView(); };
 $('btnSaveCfg').onclick = async () => {
+  const required = [
+    ['f-pburl', '主模型 Base URL'],
+    ['f-pmodel', '主模型名称'],
+    ['f-oburl', 'Embedding 服务地址'],
+    ['f-omodel', 'Embedding 模型名称'],
+    ['f-odim', '向量维度'],
+  ];
+  if(!hasPrimaryKey && !$('f-pkey').value.trim()){
+    required.push(['f-pkey', '主模型 API Key']);
+  }
+  if($('f-oemode').value === 'openai' && !hasEmbeddingKey && !$('f-okey').value.trim()){
+    required.push(['f-okey', 'Embedding API Key']);
+  }
+  if(!ensureRequired(required)) return;
+  clearMissing(['f-pkey']);
+  if($('f-oemode').value !== 'openai' || hasEmbeddingKey) clearMissing(['f-okey']);
+  const behaviorBase = $('f-bburl').value.trim();
+  const behaviorModel = $('f-bmodel').value.trim();
+  if((behaviorBase && !behaviorModel) || (!behaviorBase && behaviorModel)){
+    toast('全局行为模型的 Base URL 与模型名需要同时填写');
+    $('f-bburl').classList.toggle('missing', !behaviorBase);
+    $('f-bmodel').classList.toggle('missing', !behaviorModel);
+    return;
+  }
+  clearMissing(['f-bburl', 'f-bmodel']);
   try{
     await post('/api/config', {
       primary_base_url:$('f-pburl').value.trim(),
@@ -680,8 +896,15 @@ $('btnSaveCfg').onclick = async () => {
       secondary_api_key:$('f-skey').value.trim(),
       ollama_base_url:$('f-oburl').value.trim(),
       ollama_embed_model:$('f-omodel').value.trim(),
+      embedding_api_mode:$('f-oemode').value,
+      embedding_api_key:$('f-okey').value.trim(),
+      embedding_dim:parseInt($('f-odim').value) || 768,
     });
-    $('f-pkey').value = ''; $('f-bkey').value = ''; $('f-skey').value = '';
+    if($('f-pkey').value.trim()) hasPrimaryKey = true;
+    if($('f-okey').value.trim()) hasEmbeddingKey = true;
+    $('f-pkey').value = ''; $('f-bkey').value = ''; $('f-skey').value = ''; $('f-okey').value = '';
+    $('f-pkey').placeholder = hasPrimaryKey ? '已配置，留空不修改' : '必填';
+    $('f-okey').placeholder = hasEmbeddingKey ? '已配置，留空不修改' : '网络接口通常必填';
     toast('模型与 API 配置已保存并热刷新');
   }catch(e){ toast('保存失败：'+e.message); }
 };
@@ -697,6 +920,11 @@ $('btnSavePanel').onclick = async () => {
   }catch(e){ toast('保存失败：'+e.message); }
 };
 $('btnSaveNapcat').onclick = async () => {
+  if(!ensureRequired([
+    ['q-group', '主动发言群号'],
+    ['q-token', 'NapCat 鉴权 Token'],
+    ['q-http', 'NapCat HTTP 接口地址'],
+  ])) return;
   try{
     await post('/api/config', {
       bot_qq:$('q-bot').value.trim(),
@@ -707,10 +935,6 @@ $('btnSaveNapcat').onclick = async () => {
     toast('NapCat 设置已保存并热刷新');
     refreshStats();
   }catch(e){ toast('保存失败：'+e.message); }
-};
-$('btnSavePlugins').onclick = async () => {
-  try{ await savePlugins(); }
-  catch(e){ toast('插件保存失败：'+e.message); }
 };
 $('btnSaveBio').onclick = async () => {
   const num = (id) => { const v = parseFloat($(id).value); return isFinite(v) ? v : undefined; };
@@ -728,9 +952,23 @@ $('btnSaveBio').onclick = async () => {
 };
 $('btnSaveRouter').onclick = async () => {
   const num = (id) => { const v = parseInt($(id).value); return isFinite(v) ? v : undefined; };
+  if($('f-ar-mode').value === 'local_llm' && !$('f-ar-follow').checked){
+    const required = [
+      ['f-ar-base', '门控模型 Base URL'],
+      ['f-ar-model', '门控模型名'],
+    ];
+    if(!hasRouterKey && !$('f-ar-key').value.trim()){
+      required.push(['f-ar-key', '门控模型 API Key']);
+    }
+    if(!ensureRequired(required)) return;
+    clearMissing(['f-ar-key']);
+  }else{
+    clearMissing(['f-ar-base', 'f-ar-model', 'f-ar-key']);
+  }
   try{
     await post('/api/config', {
       app_router_mode: $('f-ar-mode').value,
+      app_router_follow_global_behavior: $('f-ar-follow').checked,
       app_router_base_url: $('f-ar-base').value.trim(),
       app_router_model: $('f-ar-model').value.trim(),
       app_router_api_key: $('f-ar-key').value.trim(),
@@ -738,11 +976,23 @@ $('btnSaveRouter').onclick = async () => {
       app_close_conversation_idle_rounds: num('f-ar-closeconv'),
       app_close_idle_rounds: num('f-ar-closeapp'),
     });
+    if($('f-ar-key').value.trim()) hasRouterKey = true;
     $('f-ar-key').value = '';
+    $('f-ar-key').placeholder = hasRouterKey ? '已配置，留空不修改' : '必填';
     toast('软件门控配置已保存并热加载');
   }catch(e){ toast('保存失败：'+e.message); }
 };
 $('btnSaveBrowser').onclick = async () => {
+  if($('f-br-mode').value === 'dynamic'){
+    const required = [['f-br-durl', '动态解析接口']];
+    if(!hasPrimaryKey && !$('f-br-dkey').value.trim()){
+      required.push(['f-br-dkey', '动态解析 API Key']);
+    }
+    if(!ensureRequired(required)) return;
+    clearMissing(['f-br-dkey']);
+  }else{
+    clearMissing(['f-br-durl', 'f-br-dkey']);
+  }
   try{
     await post('/api/config', {
       browser_mode: $('f-br-mode').value,
@@ -755,11 +1005,6 @@ $('btnSaveBrowser').onclick = async () => {
     $('f-br-dkey').value = ''; $('f-br-skey').value = '';
     toast('浏览器配置已保存并热加载');
   }catch(e){ toast('保存失败：'+e.message); }
-};
-$('btnFakeSend').onclick = async () => {
-  try{ const r = await post('/api/maintenance', {kind:'fake_send', text:$('m-send').value});
-       $('m-send').value=''; toast('已发送（'+r.detail+'）'); }
-  catch(e){ toast('失败：'+e.message); }
 };
 $('btnFakeThink').onclick = async () => {
   try{ const r = await post('/api/maintenance', {kind:'fake_think', text:$('m-think').value});

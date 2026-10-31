@@ -175,10 +175,24 @@ class LocalAppRouter:
             return None
         if self._llm_broken:
             return None
-        model = _cfg_str("app_router_model", "")
+        follow_global = bool(config.get("app_router_follow_global_behavior", False))
+        if follow_global:
+            try:
+                from core.llm_profile import global_behavior_profile
+                profile = global_behavior_profile().resolved()
+                base_url = profile.base_url or ""
+                api_key = profile.api_key or ""
+                model = profile.model or ""
+            except Exception:
+                base_url, api_key, model = "", "", ""
+        else:
+            base_url = _cfg_str("app_router_base_url", "http://127.0.0.1:11434/v1")
+            api_key = _cfg_str("app_router_api_key", "ollama")
+            model = _cfg_str("app_router_model", "")
         if not model:
             if not self._llm_warned:
-                logging.warning("[AppRouter] local_llm 模式未配置 app_router_model，改用规则模式")
+                source = "全局行为模型" if follow_global else "app_router_model"
+                logging.warning("[AppRouter] local_llm 模式未配置%s，改用规则模式", source)
                 self._llm_warned = True
             self._llm_broken = True
             return None
@@ -186,8 +200,8 @@ class LocalAppRouter:
         try:
             from openai import OpenAI
             client = OpenAI(
-                api_key=_cfg_str("app_router_api_key", "ollama") or "ollama",
-                base_url=_cfg_str("app_router_base_url", "http://127.0.0.1:11434/v1"),
+                api_key=api_key or "ollama",
+                base_url=base_url or "http://127.0.0.1:11434/v1",
             )
             thoughts = "\n".join(f"- {t}" for t in (own_thoughts or [])[-6:]) or "（此刻没有新的想法）"
             system = (

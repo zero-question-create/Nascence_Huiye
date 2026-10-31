@@ -162,28 +162,46 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> bool:
-    """原子写入插件配置并让下次读取重新加载。"""
+    """原子写入插件配置并热更新实例设置（不销毁运行中的插件线程）。"""
     global _config_cache
     normalized = _normalize(cfg)
     ok = atomic_write_json(str(CONFIG_FILE), normalized)
     if ok:
         with _LOCK:
             _config_cache = normalized
-            _instances.clear()
+            for plugin_id, instance in _instances.items():
+                entry = normalized["plugins"].get(plugin_id)
+                if isinstance(entry, dict):
+                    try:
+                        instance.settings.clear()
+                        instance.settings.update(_deep_copy(entry))
+                    except Exception:
+                        pass
     return ok
 
 
 def reload():
-    """丢弃配置、实例与插件类缓存（面板保存后调用）。
+    """丢弃配置/类缓存并热更新实例设置。
 
-    重新扫描插件目录：运行中新放入的插件无需重启即可被发现；
-    已导入模块的代码改动仍需重启才能生效。
+    重新扫描插件目录：运行中新放入的插件无需重启即可被发现。
+    已有插件实例保留，避免正在运行的微信桥/插件线程因为保存配置而失去
+    stop() 句柄。已导入模块的代码改动仍需重启才能生效。
     """
     global _config_cache, _plugin_classes
     with _LOCK:
         _config_cache = None
         _plugin_classes = None
-        _instances.clear()
+        # 重新读盘并把新设置灌回现有实例；不销毁实例本身。
+        fresh = _normalize(_read_raw())
+        _config_cache = fresh
+        for plugin_id, instance in _instances.items():
+            entry = fresh["plugins"].get(plugin_id)
+            if isinstance(entry, dict):
+                try:
+                    instance.settings.clear()
+                    instance.settings.update(_deep_copy(entry))
+                except Exception:
+                    pass
 
 
 def _discover() -> Dict[str, Type[Plugin]]:
@@ -286,7 +304,7 @@ def _safe_llm_value(llm: dict) -> dict:
         "temperature": llm.get("temperature"),
         "max_tokens": llm.get("max_tokens"),
         "timeout": llm.get("timeout"),
-        "_has_api_key": bool(str(llm.get("api_key") or "").strip()),
+        "_has_api_key": str(llm.get("api_key") or "").strip() not in ("", "YOUR_API_KEY_HERE"),
     }
 
 

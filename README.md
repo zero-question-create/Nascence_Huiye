@@ -32,7 +32,7 @@ QQ 白名单 `config/qq_manifest.json` 在 QQ 服务首次启动时自动从 `co
 
 微信插件使用本地桥接协议，白名单在 `config/wechat_manifest.json`，协议见 [plugins/wechat/BRIDGE.md](plugins/wechat/BRIDGE.md)。Bilibili 插件 Cookie 在 `config/bilibili_credentials.json`（从 `config/bilibili.example.json` 复制，填入 `sessdata` / `bili_jct` / `buvid3`，可选 `mid` / `name`）。浏览器插件默认静态模式，不需要额外配置；动态模式使用 DeepSeek Fetch 形态接口，可在面板「配置 → 浏览器插件」填写。
 
-软件行为相关配置在 `config/api_config.json`：`short_term_thought_limit`（4~6，默认 5）、`app_context_max_lines`、`qq_app_default_open`（默认 `false`，QQ 先累积未读）、`qq_unread_buffer_max`，以及本地软件门控 `app_router_mode`（`rule` / `local_llm` / `off`）、`app_open_after_unread_rounds`、`app_close_conversation_idle_rounds`、`app_close_idle_rounds` 和 `app_router_base_url` / `app_router_model`。浏览器解析模式与摘要 LLM 使用 `browser_mode` / `browser_dynamic_url` / `browser_summary_*`。
+软件行为相关配置在 `config/api_config.json`：`short_term_thought_limit`（4~6，默认 5）、`app_context_max_lines`、`qq_app_default_open`（默认 `false`，QQ 先累积未读）、`qq_unread_buffer_max`，以及本地软件门控 `app_router_mode`（`rule` / `local_llm` / `off`）、`app_router_follow_global_behavior`、`app_open_after_unread_rounds`、`app_close_conversation_idle_rounds`、`app_close_idle_rounds` 和 `app_router_base_url` / `app_router_model` / `app_router_api_key`。门控 `local_llm` 可勾选跟随全局行为模型，也可使用独立的本地 Ollama 或网络 OpenAI 兼容模型。语义向量支持 `embedding_api_mode=ollama|openai`、`embedding_api_key` 与 `embedding_dim`，OpenAI 兼容模式可接网络 embedding 接口。浏览器解析模式与摘要 LLM 使用 `browser_mode` / `browser_dynamic_url` / `browser_summary_*`。
 
 QQ 富消息配置：`qq_mini_program_max_chars`（小程序卡片解析后的正文长度）、`qq_chat_record_max_messages` / `qq_chat_record_max_chars`（聊天记录展开条数与字符上限，只向内一层）、`qq_chat_record_summary_max_chars`（写入短期上下文的摘要长度）。
 
@@ -40,7 +40,7 @@ QQ 富消息配置：`qq_mini_program_max_chars`（小程序卡片解析后的�
 
 | 方式 | 命令 | 说明 |
 |---|---|---|
-| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 默认端口 `32123`（可在面板配置中修改），管理 QQ 服务、日志、配置与维护 |
+| **Web 控制面板（推荐）** | `run\启动控制面板.bat`（Windows）/ `bash run/启动控制面板.sh`（Linux） | 默认端口 `32123`（可在面板配置中修改），管理认知循环、插件服务、日志与配置 |
 | Docker 容器部署 | `docker compose up -d` | 容器化运行 Web 控制面板与 QQ 服务，端口映射 `32123` 与 `6700` |
 | 桌面控制面板（可选） | `python control_panel.py` | PyQt5 桌面窗口，功能与 Web 面板一致 |
 | CLI 对话 | `python main.py` | 本地调试入口 |
@@ -156,7 +156,7 @@ Nascence_Huiye/
 ```
 
 - **语言能力不变**：行为思考的 prompt 与模型能力保持原样；软件打开/关闭不改变语言层，所有插件共用同一个全局语言模型。
-- **本地软件门控**：`core/app_router.py` 只决定打开/退出软件，不参与语言回复；默认规则模式，可切换 `local_llm`（Ollama 本地聊天模型）或 `off`。
+- **本地软件门控**：`core/app_router.py` 只决定打开/退出软件，不参与语言回复；默认规则模式，可切换 `local_llm`（本地 Ollama 或网络 OpenAI 兼容模型）或 `off`。语义向量同样支持本地 Ollama 或网络 OpenAI 兼容 embedding 接口。
 - **动作只走插件**：只有软件已经打开时，当前软件的行为模型才处理点开对话、翻看更早、执行动作；它不决定语言层这句话发不发。打开软件不经过插件行为模型。
 - **插件行为模型**：每个插件可勾选“跟随全局行为模型”（`behavior_*`，未配置回落 `primary_*`），或使用自己的 `action_llm`；`action_include_reasoning=true` 时行为模型会收到语言层的思考过程。
 - **短期记忆窗口**：只保留她自己的最近 4~6 条想法（`config.short_term_thought_limit`，默认 5）；不再以“最近 4~6 条别人的消息”为锚点。
@@ -168,7 +168,8 @@ Nascence_Huiye/
 - **QQ 身份**：连接后由 NapCat `get_login_info` 自动获取 QQ 昵称/QQ 号；`BOT_NAME`（辉夜）只作为意识体名字用于记忆与思考。
 - **聊天记录持久化**：QQ/微信收到的每条消息（含未读、富消息卡片、自己发送）落盘到 `data/test/qq_chat_history` / `data/test/wechat_chat_history`；消息原始时间戳用于记忆 `creation_time`，时间前缀显示“当时/几天前”。`read_earlier` 会从内存 transcript 继续读到磁盘历史；动作提示词会标明“当前在消息底部 / 不在底部（可用 scroll_to_bottom 回到底部）”。
 - **微信**：内置桥接 WebSocket 服务端，微信桥连入后按协议收发消息；白名单 `config/wechat_manifest.json`。需要你选择的微信桥按 [BRIDGE.md](plugins/wechat/BRIDGE.md) 接入。
-- **Bilibili**：Cookie + WBI，只读推荐流/搜索/视频/字幕/弹幕/评论；默认关闭，可在插件页启用。推荐/搜索/字幕需要有效 Cookie；它依赖正在运行的认知循环（QQ/微信已连接）。
+- **Bilibili**：Cookie + WBI，只读推荐流/搜索/视频/字幕/弹幕/评论；默认关闭，可在插件页启用。推荐/搜索/字幕需要有效 Cookie；它依赖运行中的全局认知循环。
+- **日志页**：分为“全部 / 运行日志 / 思考过程 / 插件 / Ollama / 连接”，并可按“报错 / 警告 / 日志”筛选等级。网络连接与 LLM 请求归入“连接”，插件行为归入“插件”；外部 Ollama 只显示一条“ollama复用本地模型，无日志”提示。
 - **浏览器**：`read_page(url)` 支持 `static`（本地抓取 + HTMLParser）与 `dynamic`（DeepSeek Fetch 形态的网页解析接口）；两种模式都会先用 LLM 概括，再写入短期记忆。供其他插件调用，不引入新依赖。
 - **预留插件**：`plugins/web`（网页/小程序）仍为接口占位。
 - **后续电脑控制**：`is_app=True` 的插件共用打开/状态/动作接口，未来“智能体直接控制电脑”可以作为同一套软件模型接入。

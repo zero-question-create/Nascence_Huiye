@@ -2,7 +2,7 @@
 # ========================================================================
 # Nascence_Huiye 桌面控制面板（PyQt5）。
 #
-# 运行环境（Ollama 启停、QQ 服务线程、伪造发送/思考、落盘、关停）已抽到
+# 运行环境（Ollama 启停、插件服务、伪造思考/消息注入、落盘、关停）已抽到
 # panel_runtime.py，与 Web 面板（web_panel.py）共用；本文件只保留桌面 UI。
 # 两个面板互不依赖：Web 面板不需要 PyQt5，桌面面板也不需要 aiohttp 服务。
 # ========================================================================
@@ -61,8 +61,9 @@ from PyQt5.QtWidgets import (
 from config.api_config import config
 from config.constants import BOT_NAME
 from panel_runtime import (
+    LOG_CAT_CONNECTION,
     LOG_CAT_OLLAMA,
-    LOG_CAT_QQBOT,
+    LOG_CAT_PLUGIN,
     LOG_CAT_RUNTIME,
     LOG_CAT_THINKING,
     LOG_VIEW_MAX_BLOCKS,
@@ -319,7 +320,8 @@ class ControlPanel(QMainWindow):
         sub_tabs = QTabWidget()
         sub_tabs.setDocumentMode(True)
         labels = [("运行日志", LOG_CAT_RUNTIME), ("思考过程", LOG_CAT_THINKING),
-                  ("QQbot", LOG_CAT_QQBOT), ("Ollama", LOG_CAT_OLLAMA)]
+                  ("插件", LOG_CAT_PLUGIN), ("Ollama", LOG_CAT_OLLAMA),
+                  ("连接", LOG_CAT_CONNECTION)]
         for label, cat in labels:
             view = QPlainTextEdit()
             view.setReadOnly(True)
@@ -400,23 +402,10 @@ class ControlPanel(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        fake_panel = QFrame(objectName="panel")
-        fake_layout = QVBoxLayout(fake_panel)
-        fake_layout.addWidget(QLabel("伪造发送", objectName="sectionTitle"))
-        fake_layout.addWidget(QLabel("以 bot 身份向当前群发送消息，并写入历史对话与记忆库。", objectName="muted"))
-        self.fake_input = QPlainTextEdit()
-        self.fake_input.setPlaceholderText("输入要以 bot 身份发送的内容")
-        self.fake_input.setMaximumHeight(100)
-        fake_layout.addWidget(self.fake_input)
-        fake_btn = self.fake_btn = QPushButton("伪造发送")
-        fake_btn.clicked.connect(self.fake_send)
-        fake_layout.addWidget(fake_btn, alignment=Qt.AlignLeft)
-        layout.addWidget(fake_panel)
-
         think_panel = QFrame(objectName="panel")
         think_layout = QVBoxLayout(think_panel)
         think_layout.addWidget(QLabel("伪造思考", objectName="sectionTitle"))
-        think_layout.addWidget(QLabel("模拟 bot 的内心思考流程（LLM 拆解→检索→扩散→拼接），不向 QQ 发送消息，仅写入历史与记忆库。", objectName="muted"))
+        think_layout.addWidget(QLabel("模拟一次内部思考：使用全局语言模型与近期想法，不向任何插件发送消息，只写入“我想”和历史。", objectName="muted"))
         self.fake_think_input = QPlainTextEdit()
         self.fake_think_input.setPlaceholderText("输入要让 bot 思考的内容")
         self.fake_think_input.setMaximumHeight(100)
@@ -428,13 +417,13 @@ class ControlPanel(QMainWindow):
 
         panel = QFrame(objectName="panel")
         panel_layout = QVBoxLayout(panel)
-        panel_layout.addWidget(QLabel("管理员记忆注入", objectName="sectionTitle"))
-        panel_layout.addWidget(QLabel("直接写入记忆图并立即持久化。", objectName="muted"))
+        panel_layout.addWidget(QLabel("管理员消息注入", objectName="sectionTitle"))
+        panel_layout.addWidget(QLabel("写入记忆图，并加入下一轮认知检索的关键词信箱。", objectName="muted"))
         self.memory_input = QPlainTextEdit()
-        self.memory_input.setPlaceholderText("输入要植入的记忆")
+        self.memory_input.setPlaceholderText("输入要注入的消息/记忆")
         self.memory_input.setMaximumHeight(120)
         panel_layout.addWidget(self.memory_input)
-        inject_btn = QPushButton("注入并保存记忆")
+        inject_btn = QPushButton("注入并保存")
         inject_btn.clicked.connect(self.inject_memory)
         panel_layout.addWidget(inject_btn, alignment=Qt.AlignLeft)
         layout.addWidget(panel)
@@ -746,19 +735,6 @@ class ControlPanel(QMainWindow):
             )
             return False
         return True
-
-    def fake_send(self):
-        text = self.fake_input.toPlainText().strip()
-        if not text:
-            return
-        self.fake_input.clear()
-        self.fake_btn.setEnabled(False)
-        self.run_worker(
-            RUNTIME.fake_send,
-            text,
-            on_result=lambda memory_id: self._append_bubble(BOT_NAME, text, source="伪造"),
-            on_finished=lambda: self.fake_btn.setEnabled(True),
-        )
 
     def fake_think(self):
         text = self.fake_think_input.toPlainText().strip()

@@ -52,7 +52,8 @@ class _Signal:
 
 
 class EventBus:
-    log = _Signal("log")                 # (分类, 文本)
+    log = _Signal("log")                 # (分类, 文本) 兼容桌面面板
+    log_event = _Signal("log_event")     # (分类, 文本, 等级) 供 Web 日志页
     status = _Signal("status")           # (状态文本)
     stage = _Signal("stage")             # (阶段文本, 是否完成) 初始化/关停进度
     chat_reply = _Signal("chat_reply")   # (发送者, 内容)
