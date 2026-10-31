@@ -4,8 +4,8 @@
 #
 # 设计原则：
 #   - 本地认知循环（core/cognition.py）只负责记忆检索、扩散与概念路；
-#   - 插件负责“从平台读入”“把行为发回平台”，并通过 behavior_llm()
-#     指定该插件的行为 LLM；
+#   - 插件负责“从平台读入”“把行为发回平台”；语言模型始终是全局 primary，
+#     插件可选择跟随全局行为模型或用插件自己的行为模型处理软件动作；
 #   - 行为思考的提示词由 core/behavior.py 统一提供，插件不得改写，
 #     也不得向提示词注入平台名、群号、用户 ID 等外部信息。
 #
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from config.constants import BOT_NAME
-from core.llm_profile import LLMProfile
+from core.llm_profile import LLMProfile, global_behavior_profile
 from utils.event_bus import BUS
 
 
@@ -100,15 +100,15 @@ class BehaviorChannel(ABC):
     source: str = "Core"
 
     def llm_profile(self) -> LLMProfile:
-        """语言/行为思考使用的 LLM。"""
+        """兼容接口：语言模型始终全局 primary，插件不可覆盖。"""
         return LLMProfile(plugin_id=self.plugin_id)
 
     def action_llm_profile(self) -> LLMProfile:
-        """软件内动作使用的 LLM；默认沿用语言 LLM。"""
-        return self.llm_profile()
+        """软件内行为模型；默认使用全局行为模型。"""
+        return global_behavior_profile(plugin_id=self.plugin_id)
 
     def action_include_reasoning(self) -> bool:
-        """动作模型是否接收语言层的思考过程。"""
+        """行为模型是否接收语言层的思考过程。"""
         return False
 
     def resolve_target(self, fallback: Optional[str] = None) -> Optional[str]:
@@ -154,17 +154,40 @@ class Plugin(ABC):
         return bool(self.settings.get("enabled", False))
 
     def behavior_llm(self) -> LLMProfile:
-        """语言/行为思考 LLM；空配置自动回落到 primary。"""
-        return resolve_llm_profile(self.settings, plugin_id=self.plugin_id)
+        """语言/行为思考 LLM：始终使用全局 primary。
+
+        语言是意识连续性的载体，不允许插件覆盖；插件只决定行为通道
+        与软件动作，不改变“她是谁”的语言模型。
+        """
+        return LLMProfile(plugin_id=self.plugin_id)
+
+    def follow_global_behavior(self) -> bool:
+        """是否跟随全局行为模型（只影响软件内动作，不影响语言）。"""
+        raw = self.settings.get("follow_global_behavior")
+        if raw is None:
+            action = self.settings.get("action_llm")
+            if isinstance(action, dict):
+                return not any(
+                    str(action.get(k) or "").strip()
+                    for k in ("api_key", "base_url", "model")
+                )
+            return True
+        return bool(raw)
 
     def action_llm(self) -> LLMProfile:
-        """软件内动作 LLM；插件配置了 action_llm 时使用它，否则沿用语言 LLM。"""
+        """软件内行为模型（动作/是否执行），不参与语言生成。
+
+        跟随全局时使用 behavior_*（未配置回落 primary）；否则使用插件
+        自己的 action_llm。动作模型不判断语言层这句话发不发。
+        """
+        if self.follow_global_behavior():
+            return global_behavior_profile(plugin_id=self.plugin_id)
         raw = self.settings.get("action_llm")
         if isinstance(raw, dict) and any(
             str(raw.get(k) or "").strip() for k in ("api_key", "base_url", "model")
         ):
             return LLMProfile.from_mapping(raw, plugin_id=self.plugin_id)
-        return self.behavior_llm()
+        return global_behavior_profile(plugin_id=self.plugin_id)
 
     def action_include_reasoning(self) -> bool:
         """是否把语言层的思考过程交给动作模型（插件设置）。"""
@@ -239,6 +262,7 @@ class Plugin(ABC):
             "implemented": bool(self.implemented),
             "enabled": self.enabled,
             "is_app": bool(self.is_app),
+            "follow_global_behavior": self.follow_global_behavior(),
             "action_include_reasoning": self.action_include_reasoning(),
             "description": self.description,
         }

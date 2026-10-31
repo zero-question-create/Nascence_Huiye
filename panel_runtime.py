@@ -208,6 +208,11 @@ class Runtime:
         self.qq_thread = None
         self.qq_loop = None
         self.qq_task = None
+        # 全局认知循环：与任何插件连接解耦，只跑一个。
+        self.cognitive_thread = None
+        self.cognitive_loop = None
+        self.cognitive_task = None
+        self._cognitive_lock = threading.Lock()
         self._lock = threading.Lock()
         self._fake_lock = threading.Lock()
         self._shutdown_done = False
@@ -480,6 +485,82 @@ class Runtime:
             stage("就绪", done=True)
             logging.info("运行环境初始化完成，记忆数=%d，总耗时 %.1fs",
                          len(memories), time.time() - t_start)
+            # 认知循环与插件连接彻底解耦：核心就绪即启动全局唯一循环。
+            # 插件服务可以在之后任意启动/停止，只影响“软件”能否收发。
+            try:
+                self._start_cognitive_thread()
+            except Exception:
+                logging.exception("全局认知循环启动失败（面板仍可用）")
+
+    def _start_cognitive_thread(self):
+        """启动全局唯一认知循环（幂等；不依赖 QQ/微信连接）。"""
+        with self._cognitive_lock:
+            if self.cognitive_thread and self.cognitive_thread.is_alive():
+                return
+            self.cognitive_thread = threading.Thread(
+                target=self._cognitive_main,
+                name="CognitiveLoop",
+                daemon=True,
+            )
+            self.cognitive_thread.start()
+
+    def _cognitive_main(self):
+        from core.cognition import cognitive_loop
+        try:
+            self.cognitive_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.cognitive_loop)
+            self.cognitive_task = self.cognitive_loop.create_task(cognitive_loop())
+            logging.info("全局认知循环已启动（语言模型 primary）")
+            self.cognitive_loop.run_until_complete(self.cognitive_task)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("全局认知循环异常退出")
+        finally:
+            loop = self.cognitive_loop
+            if loop is not None:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+            self.cognitive_loop = None
+            self.cognitive_task = None
+            logging.info("全局认知循环已停止")
+
+    def start_cognitive(self):
+        """供插件/面板调用：确保核心与全局认知循环已启动。"""
+        self.initialize()
+        self._start_cognitive_thread()
+
+    def stop_cognitive(self):
+        """停止全局认知循环；插件服务可以继续独立停止。"""
+        try:
+            from core.cognition import request_graceful_stop
+            request_graceful_stop()
+        except Exception:
+            pass
+        loop = self.cognitive_loop
+        task = self.cognitive_task
+        if loop is not None and task is not None and not task.done():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except Exception:
+                pass
+        thread = self.cognitive_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+            if not thread.is_alive():
+                self.cognitive_thread = None
 
     def start_qq(self):
         self.initialize()
@@ -622,6 +703,7 @@ class Runtime:
             return
         self._shutdown_done = True
         logging.info("控制面板正在停止全部服务")
+        self.stop_cognitive()
         self.stop_qq()
         try:
             # 关停是最后一次落盘机会，绕过节流确保写入

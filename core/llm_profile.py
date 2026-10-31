@@ -86,3 +86,23 @@ class LLMProfile:
     def uses_primary(self) -> bool:
         """是否为全局默认模型（用于复用已有客户端）。"""
         return not self.api_key and not self.base_url and not self.model
+
+
+def global_behavior_profile(plugin_id: str = "") -> LLMProfile:
+    """全局行为模型。
+
+    语言模型必须全局一致（始终 primary）；行为模型只负责软件内动作，
+    可以由插件选择跟随这里的全局配置，或使用插件自己的 action_llm。
+    未配置 behavior_* 时逐字段回落到 primary。
+    """
+    return LLMProfile.from_mapping(
+        {
+            "api_key": config.get("behavior_api_key", ""),
+            "base_url": config.get("behavior_base_url", ""),
+            "model": config.get("behavior_model", ""),
+            "temperature": config.get("behavior_temperature"),
+            "max_tokens": config.get("behavior_max_tokens"),
+            "timeout": config.get("behavior_timeout"),
+        },
+        plugin_id=plugin_id,
+    )

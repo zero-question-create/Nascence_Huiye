@@ -28,7 +28,7 @@ bash setup.sh
 
 QQ 白名单 `config/qq_manifest.json` 在 QQ 服务首次启动时自动从 `config/qq_manifest.example.json` 创建，需填入允许响应的群号与成员昵称映射。
 
-插件配置 `config/plugins.json` 在首次启动时从 `config/plugins.example.json` 生成（含敏感 Key，已加入 `.gitignore`），用于选择当前行为插件以及为每个插件配置独立的行为 LLM / 动作 LLM；留空字段回落到 `primary_*`。
+插件配置 `config/plugins.json` 在首次启动时从 `config/plugins.example.json` 生成（含敏感 Key，已加入 `.gitignore`）。所有插件可并行运行；语言模型统一使用 `primary_*`，插件只配置“是否跟随全局行为模型”和行为模型本身；行为模型留空时回落到全局行为模型，再回落到 `primary_*`。
 
 微信插件使用本地桥接协议，白名单在 `config/wechat_manifest.json`，协议见 [plugins/wechat/BRIDGE.md](plugins/wechat/BRIDGE.md)。Bilibili 插件 Cookie 在 `config/bilibili_credentials.json`（从 `config/bilibili.example.json` 复制，填入 `sessdata` / `bili_jct` / `buvid3`，可选 `mid` / `name`）。浏览器插件默认静态模式，不需要额外配置；动态模式使用 DeepSeek Fetch 形态接口，可在面板「配置 → 浏览器插件」填写。
 
@@ -90,13 +90,13 @@ Nascence_Huiye/
 │
 ├── config/
 │   ├── api_config.py       # API 配置读取类
-│   ├── plugins.example.json # 插件与行为 LLM 示例配置
+│   ├── plugins.example.json # 插件与行为模型示例配置
 │   └── qq_manifest.example.json  # QQ 白名单示例框架
 │
 ├── core/
 │   ├── llm_interface.py    # LLM 调用 + 消息历史（理解层/多模态）
 │   ├── behavior.py         # 行为思考层（插件 LLM；最小提示词）
-│   ├── llm_profile.py      # 插件行为 LLM 的连接配置
+│   ├── llm_profile.py      # 全局语言/行为模型的连接配置
 │   ├── short_term.py       # 短期记忆：她自己的最近 4~6 条想法
 │   ├── apps.py             # 软件上下文：未读提醒、对话内容、动作执行
 │   ├── app_router.py       # 本地软件门控：打开/退出软件（规则或本地 LLM）
@@ -134,8 +134,8 @@ Nascence_Huiye/
 
 - **记忆引擎**: FAISS 向量索引 + 受限 BFS 激活扩散 + 半衰期衰减 + SQLite 持久化
 - **本地认知循环**: 多通道感知 → 概念/语义检索 → 图扩散 → 行为思考；短期记忆只保留她自己的 4~6 条近期想法
-- **软件（App）模型**: 插件可打开/关闭；未打开时只提示未读，本地软件门控决定打开/退出；打开后动作 LLM 才处理点开对话、翻看更早、发送
-- **行为思考层**: 把名字、记忆与现有提示词中的内在状态交给“当前插件配置的语言 LLM”；提示词与既有行为 LLM 逐字一致，不注入平台/插件元数据
+- **软件（App）模型**: 插件可打开/关闭；未打开时只提示未读，本地软件门控决定打开/退出；打开后当前软件的行为模型才处理点开对话、翻看更早、执行动作，发送由语言层 say 决定
+- **行为思考层**: 把名字、记忆与现有提示词中的内在状态交给“全局语言 LLM（primary）”；提示词与既有行为 LLM 逐字一致，不注入平台/插件元数据。插件不能覆盖语言模型，保证意识连续性。
 - **概念层**: 概念 → 事件段 → 记忆成员三级结构，按时间意图定向取回
 - **生物钟**: 睡眠压力动力学 + 从自身经历学得的作息节律；不硬编码睡觉时刻
 - **动作层**: 每轮循环末尾的本能冲动抉择（收下图片/表情包、发送素材、写 txt 笔记）
@@ -151,18 +151,19 @@ Nascence_Huiye/
 未打开软件：消息只进未读缓冲 → 短期上下文出现“某软件有 N 条未读”
 本地门控：规则/local_llm 决定 open_app / close_app / close_conversation
 语言思考：名字 + 记忆（自己的近期想法 + 软件内容）→ 语言 LLM，提示词不变
-软件内动作：只有软件已打开时，插件动作 LLM 才参与（点开对话/翻读/发送）
+软件内动作：只有软件已打开时，当前软件的行为模型才参与（点开对话/翻读/执行动作）
+发送：语言层 say=true 且当前软件有对话/发送能力时，由该插件发送这句话
 ```
 
-- **语言能力不变**：行为思考的 prompt 与模型能力保持原样；软件打开/关闭不改变语言层。
+- **语言能力不变**：行为思考的 prompt 与模型能力保持原样；软件打开/关闭不改变语言层，所有插件共用同一个全局语言模型。
 - **本地软件门控**：`core/app_router.py` 只决定打开/退出软件，不参与语言回复；默认规则模式，可切换 `local_llm`（Ollama 本地聊天模型）或 `off`。
-- **动作只走插件**：只有软件已经打开时，插件动作 LLM 才处理点开对话、翻看更早、发送等动作；打开软件不经过插件动作 LLM。
-- **插件动作模型**：每个插件有独立的 `action_llm`（留空沿用语言 LLM）；`action_include_reasoning=true` 时动作模型会收到语言层的思考过程。
+- **动作只走插件**：只有软件已经打开时，当前软件的行为模型才处理点开对话、翻看更早、执行动作；它不决定语言层这句话发不发。打开软件不经过插件行为模型。
+- **插件行为模型**：每个插件可勾选“跟随全局行为模型”（`behavior_*`，未配置回落 `primary_*`），或使用自己的 `action_llm`；`action_include_reasoning=true` 时行为模型会收到语言层的思考过程。
 - **短期记忆窗口**：只保留她自己的最近 4~6 条想法（`config.short_term_thought_limit`，默认 5）；不再以“最近 4~6 条别人的消息”为锚点。
 - **软件上下文**：未读提醒、打开的对话内容由 `core/apps.py` 从插件传入主进程；未打开软件时只给未读数，不给正文。
-- **QQ 默认关闭**：`config.qq_app_default_open=false`。收到消息先累计未读；本地门控打开 QQ、动作层点开对话后才读取内容并产生记忆。
-- **退出软件**：动作层可 `close_conversation` 回首页、`close_app` 退出；本地门控也会在空闲轮数达到阈值后自动退出。NapCat 断开时 QQ 自动关闭，未读缓冲保留。
-- **当前插件**：`config/plugins.json` 的 `active`，可在 Web 面板「插件」页切换；桌面面板未提供插件页，可直接编辑该文件。
+- **QQ 默认关闭**：`config.qq_app_default_open=false`。收到消息先累计未读；本地门控打开 QQ、行为层点开对话后才读取内容并产生记忆。
+- **退出软件**：行为模型可 `close_conversation` 回首页、`close_app` 退出；本地门控也会在空闲轮数达到阈值后自动退出。NapCat 断开时 QQ 自动关闭，未读缓冲保留。
+- **行为通道**：不再由 `active` 选择；所有插件可并行运行，打开哪个软件，行为/发送就落到哪个插件。`active` 仅保留为旧配置兼容/兜底。
 - **最小提示词**：行为思考的 system prompt 在 `core/behavior.py`，与重构前逐字一致；插件不得注入平台名、群号、用户 ID 等信息。
 - **QQ 身份**：连接后由 NapCat `get_login_info` 自动获取 QQ 昵称/QQ 号；`BOT_NAME`（辉夜）只作为意识体名字用于记忆与思考。
 - **聊天记录持久化**：QQ/微信收到的每条消息（含未读、富消息卡片、自己发送）落盘到 `data/test/qq_chat_history` / `data/test/wechat_chat_history`；消息原始时间戳用于记忆 `creation_time`，时间前缀显示“当时/几天前”。`read_earlier` 会从内存 transcript 继续读到磁盘历史；动作提示词会标明“当前在消息底部 / 不在底部（可用 scroll_to_bottom 回到底部）”。

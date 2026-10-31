@@ -1,12 +1,12 @@
 # core/behavior.py
 # ========================================================================
-# 行为思考层（插件可配置 LLM）。
+# 行为思考层（全局语言模型）。
 #
 # 分工：
 #   1. 本地认知循环（core/cognition.py）只做本地计算：检索、扩散、概念路、
 #      反刍抑制、短期对话窗口。它不依赖任何平台，也不调用 LLM 做记忆选择。
-#   2. 每轮最后一跳“行为思考”交给本模块：把已经选好的记忆交给插件配置的
-#      LLM，产出“此刻的想法 + 是否说出口”。
+#   2. 每轮最后一跳“语言/行为思考”交给本模块：把已经选好的记忆交给全局
+#      primary LLM，产出“此刻的想法 + 是否说出口”。插件不能覆盖语言模型。
 #
 # 提示词约束（人格涌现的前提）：
 #   - 行为思考只接收名字（BOT_NAME）与记忆；不注入平台名、插件名、群号、
@@ -130,7 +130,7 @@ def _prepare_memories(memories: list, keywords: list = None, pinned: list = None
 
 
 class BehaviorEngine:
-    """把“本地认知循环选出的记忆”交给插件指定的 LLM 做行为思考。
+    """把“本地认知循环选出的记忆”交给全局 primary LLM 做语言/行为思考。
 
     profile 为 None 时使用全局 primary 模型（CLI、旧调用方的兼容路径）。
     """
@@ -181,7 +181,7 @@ class BehaviorEngine:
         fingerprint_prompt("verbalize", system_prompt, profile=self.profile)
 
         # 认知循环高频调用：默认只输出一句 JSON 短句，关闭推理以降低 token。
-        # 插件要求动作模型接收思维链时，才打开推理并捕获 reasoning。
+        # 当前软件要求行为模型接收思维链时，才打开推理并捕获 reasoning。
         PROBE.bump("llm.verbalize.calls")
         PROBE.bump(f"behavior.{self.plugin_id}.calls")
         with PROBE.timed("llm.verbalize_ms"):
@@ -230,7 +230,7 @@ class BehaviorEngine:
 
     def act(self, thought_text: str, should_speak: bool, said_text: str = "",
             keywords: list = None, context_hint: str = "") -> dict:
-        """动作抉择（本能冲动）同样走插件配置的 LLM；提示词由动作层负责。"""
+        """动作抉择（本能冲动）走当前软件的行为模型；提示词由动作层负责。"""
         from .action_layer import decide_action
         return decide_action(
             thought_text=thought_text,

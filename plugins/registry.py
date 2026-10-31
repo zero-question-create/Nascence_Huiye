@@ -46,6 +46,7 @@ _DEFAULT_LLM = {
 _DEFAULT_PLUGIN = {
     "enabled": False,
     "llm": dict(_DEFAULT_LLM),
+    "follow_global_behavior": True,
     "action_llm": dict(_DEFAULT_LLM),
     "action_include_reasoning": False,
 }
@@ -75,6 +76,31 @@ def _deep_copy(value):
     return copy.deepcopy(value)
 
 
+def _normalize_entry(current, entry: dict) -> dict:
+    """规范化单个插件配置；兼容旧配置并补齐行为模型字段。"""
+    current = current if isinstance(current, dict) else {}
+    current.setdefault("enabled", bool(entry.get("enabled", False)))
+    current.setdefault("action_include_reasoning", False)
+    # 迁移：旧配置里已经填了插件级 action_llm 的，默认继续使用自己的
+    # 行为模型；没填过的默认跟随全局行为模型。
+    if "follow_global_behavior" not in current:
+        action = current.get("action_llm")
+        action = action if isinstance(action, dict) else {}
+        current["follow_global_behavior"] = not any(
+            str(action.get(k) or "").strip()
+            for k in ("api_key", "base_url", "model")
+        )
+    current.setdefault("follow_global_behavior", True)
+    for field in ("llm", "action_llm"):
+        value = current.get(field)
+        if not isinstance(value, dict):
+            value = {}
+        for key, default_value in entry.get(field, {}).items():
+            value.setdefault(key, default_value)
+        current[field] = value
+    return current
+
+
 def _normalize(raw: dict) -> dict:
     """补齐缺省字段，保证面板与运行期看到的配置结构一致。"""
     raw = raw if isinstance(raw, dict) else {}
@@ -84,24 +110,16 @@ def _normalize(raw: dict) -> dict:
 
     defaults = _deep_copy(DEFAULT_CONFIG["plugins"])
     for plugin_id, entry in defaults.items():
-        current = plugins.get(plugin_id)
-        if not isinstance(current, dict):
-            current = {}
-        current.setdefault("enabled", bool(entry.get("enabled", False)))
-        current.setdefault("action_include_reasoning", False)
-        for field in ("llm", "action_llm"):
-            value = current.get(field)
-            if not isinstance(value, dict):
-                value = {}
-            for key, default_value in entry.get(field, {}).items():
-                value.setdefault(key, default_value)
-            current[field] = value
-        plugins[plugin_id] = current
+        plugins[plugin_id] = _normalize_entry(plugins.get(plugin_id), entry)
 
-    # 自动发现的新插件：默认关闭，LLM 走 primary
+    # 自动发现的新插件：默认关闭，行为模型默认跟随全局。
     for plugin_id in _classes():
         if plugin_id not in plugins:
             plugins[plugin_id] = _deep_copy(_DEFAULT_PLUGIN)
+
+    # 第三方/旧自定义插件也补齐字段，避免面板显示与运行期判断不一致。
+    for plugin_id, current in list(plugins.items()):
+        plugins[plugin_id] = _normalize_entry(current, _DEFAULT_PLUGIN)
 
     active = raw.get("active")
     if active not in plugins:
@@ -292,6 +310,7 @@ def list_plugins() -> List[dict]:
             "implemented": bool(instance.implemented),
             "enabled": bool(entry.get("enabled", False)),
             "is_app": bool(getattr(instance, "is_app", False)),
+            "follow_global_behavior": bool(entry.get("follow_global_behavior", True)),
             "action_include_reasoning": bool(entry.get("action_include_reasoning", False)),
             "active": plugin_id == cfg.get("active"),
             "llm": _safe_llm(entry),
@@ -347,6 +366,8 @@ def update_from_panel(payload: dict) -> dict:
         entry = cfg["plugins"][plugin_id]
         if "enabled" in update:
             entry["enabled"] = bool(update["enabled"])
+        if "follow_global_behavior" in update:
+            entry["follow_global_behavior"] = bool(update["follow_global_behavior"])
         if "action_include_reasoning" in update:
             entry["action_include_reasoning"] = bool(update["action_include_reasoning"])
         if "llm" in update:

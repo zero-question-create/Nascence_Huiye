@@ -2423,19 +2423,18 @@ async def fetch_quoted_message(msg_id: str, fallback_group_id: str = "") -> Opti
 
 # ---------- WebSocket 服务器 ----------
 def _start_cognitive_loop():
-    """启动本地认知循环，并把 QQ 插件作为唯一行为通道交进去。
+    """确保全局认知循环已启动。
 
-    认知循环本身与平台无关；行为思考使用 plugins.qq_napcat 配置的 LLM。
+    认知循环不再由 QQ 连接持有：QQ 只是众多并行软件之一，连接/断开
+    不改变唯一认知循环；语言模型始终是全局 primary。
     """
-    global _cognitive_task
-    if _cognitive_task is not None and not _cognitive_task.done():
+    try:
+        import panel_runtime
+        panel_runtime.RUNTIME.start_cognitive()
+    except Exception as e:
+        logger.warning("[认知循环] 启动全局认知循环失败: %s", e)
         return
-    from core.cognition import request_graceful_stop, cognitive_loop
-    from plugins.qq_napcat.plugin import get_channel
-
-    request_graceful_stop()  # 确保旧实例已清理
-    _cognitive_task = asyncio.create_task(cognitive_loop(channel=get_channel()))
-    logger.info("[认知循环] 已随 NapCat 连接启动（本地认知循环 + 插件行为 LLM）")
+    logger.info("[认知循环] 已确保全局认知循环运行（QQ 仅作为软件接入）")
 
 
 async def _bootstrap_connection(websocket):

@@ -177,6 +177,20 @@ class AppContext:
         except Exception:
             return None
 
+    def current_channel(self):
+        """当前打开软件的行为通道；没有打开软件/插件无通道时返回 None。
+
+        认知循环每轮都通过它取通道，因此“打开哪个软件，行为就落到哪个
+        插件”；语言模型不受影响。
+        """
+        plugin = self.current_plugin()
+        if plugin is None:
+            return None
+        try:
+            return plugin.channel()
+        except Exception:
+            return None
+
     def action_llm_profile(self, fallback=None):
         """当前软件的动作 LLM；没有打开软件时用调用方给的 fallback。"""
         plugin = self.current_plugin()
@@ -210,9 +224,14 @@ class AppContext:
                 for candidate in registry.app_plugins():
                     if app_id in (candidate.plugin_id, candidate.label):
                         return candidate
-            active = registry.get_plugin(registry.get_active_id())
-            if active is not None:
-                return active
+            # 没有有效 id 时优先留在当前软件，其次选第一个已启用软件；
+            # 不再使用旧 active 字段，避免 active 与并行软件语义冲突。
+            if self.current_app:
+                plugin = registry.get_plugin(self.current_app)
+                if plugin is not None:
+                    return plugin
+            for candidate in registry.app_plugins():
+                return candidate
         except Exception:
             pass
         return None
@@ -238,6 +257,11 @@ class AppContext:
         pieces.extend(str(x) for x in content[:3] if str(x or "").strip())
         return "；".join(p for p in pieces if p) or "没有新内容"
 
+    def _fail(self, message: str) -> str:
+        """动作失败也作为“她看到的结果”进入上下文，下一轮可感知。"""
+        self.remember(message)
+        return message
+
     async def execute(self, action: str, data: dict) -> str:
         """执行动作层选出的软件动作，并把结果写入软件上下文。"""
         data = data if isinstance(data, dict) else {}
@@ -247,7 +271,7 @@ class AppContext:
                 app_id = str(data.get("app_id") or data.get("id") or "").strip()
                 plugin = self._plugin_for(app_id)
                 if plugin is None:
-                    return "找不到这个软件"
+                    return self._fail("找不到这个软件")
                 res = await plugin.open_app()
                 if isinstance(res, dict) and res.get("ok", True):
                     with self._lock:
@@ -262,7 +286,7 @@ class AppContext:
                 app_id = str(data.get("app_id") or data.get("id") or self.current_app).strip()
                 plugin = self._plugin_for(app_id)
                 if plugin is None:
-                    return "没有打开着的软件"
+                    return self._fail("没有打开着的软件")
                 res = await plugin.close_app()
                 # 退出软件后不再把刚才的对话内容当作“眼前正在发生的事”；
                 # 只保留一条“我关掉了软件”的状态。长期记忆不受影响。
@@ -281,7 +305,7 @@ class AppContext:
             if action == "open_conversation":
                 plugin = self._plugin_for(self.current_app)
                 if plugin is None:
-                    return "还没有打开软件"
+                    return self._fail("还没有打开软件")
                 conversation_id = str(
                     data.get("conversation") or data.get("conversation_id")
                     or data.get("id") or ""
@@ -297,7 +321,7 @@ class AppContext:
             if action == "close_conversation":
                 plugin = self._plugin_for(self.current_app)
                 if plugin is None:
-                    return "还没有打开软件"
+                    return self._fail("还没有打开软件")
                 res = await plugin.close_conversation()
                 with self._lock:
                     self._current_conversation = ""
@@ -306,22 +330,22 @@ class AppContext:
             if action == "read_earlier":
                 plugin = self._plugin_for(self.current_app)
                 if plugin is None:
-                    return "还没有打开软件"
+                    return self._fail("还没有打开软件")
                 res = await plugin.read_earlier(self.current_conversation)
                 return self._remember_result(res)
 
             if action == "scroll_to_bottom":
                 plugin = self._plugin_for(self.current_app)
                 if plugin is None:
-                    return "还没有打开软件"
+                    return self._fail("还没有打开软件")
                 res = await plugin.scroll_to_bottom()
                 return self._remember_result(res)
 
             return ""
         except NotImplementedError:
-            return "这个软件还不支持这个动作"
+            return self._fail("这个软件还不支持这个动作")
         except Exception as e:
-            return f"软件操作失败：{e}"
+            return self._fail(f"软件操作失败：{e}")
 
 
 APP_CONTEXT = AppContext()

@@ -20,7 +20,7 @@ class QQNapCatChannel(BehaviorChannel):
     source = "QQ"
 
     def llm_profile(self):
-        # 每轮重新取插件实例：面板热保存后无需重启即可换模型
+        # 语言模型始终全局 primary；保留此方法兼容通道契约。
         from plugins.registry import get_plugin
         plugin = get_plugin(self.plugin_id)
         if plugin is None:
@@ -28,7 +28,7 @@ class QQNapCatChannel(BehaviorChannel):
         return plugin.behavior_llm()
 
     def action_llm_profile(self):
-        """软件内动作模型：优先使用插件的 action_llm，未配置时沿用语言 LLM。"""
+        """软件内行为模型：跟随全局行为模型或使用插件自己的配置。"""
         from plugins.registry import get_plugin
         plugin = get_plugin(self.plugin_id)
         if plugin is None:

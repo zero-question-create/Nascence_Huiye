@@ -3,14 +3,7 @@
   "plugins": {
     "qq_napcat": {
       "enabled": true,
-      "llm": {
-        "base_url": "",
-        "api_key": "",
-        "model": "",
-        "temperature": null,
-        "max_tokens": null,
-        "timeout": null
-      },
+      "follow_global_behavior": true,
       "action_llm": {
         "base_url": "",
         "api_key": "",
@@ -23,14 +16,7 @@
     },
     "wechat": {
       "enabled": false,
-      "llm": {
-        "base_url": "",
-        "api_key": "",
-        "model": "",
-        "temperature": null,
-        "max_tokens": null,
-        "timeout": null
-      },
+      "follow_global_behavior": true,
       "action_llm": {
         "base_url": "",
         "api_key": "",
@@ -43,14 +29,7 @@
     },
     "web": {
       "enabled": false,
-      "llm": {
-        "base_url": "",
-        "api_key": "",
-        "model": "",
-        "temperature": null,
-        "max_tokens": null,
-        "timeout": null
-      },
+      "follow_global_behavior": true,
       "action_llm": {
         "base_url": "",
         "api_key": "",
@@ -63,14 +42,7 @@
     },
     "bilibili": {
       "enabled": false,
-      "llm": {
-        "base_url": "",
-        "api_key": "",
-        "model": "",
-        "temperature": null,
-        "max_tokens": null,
-        "timeout": null
-      },
+      "follow_global_behavior": true,
       "action_llm": {
         "base_url": "",
         "api_key": "",
@@ -83,14 +55,7 @@
     },
     "browser": {
       "enabled": true,
-      "llm": {
-        "base_url": "",
-        "api_key": "",
-        "model": "",
-        "temperature": null,
-        "max_tokens": null,
-        "timeout": null
-      },
+      "follow_global_behavior": true,
       "action_llm": {
         "base_url": "",
         "api_key": "",

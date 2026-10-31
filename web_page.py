@@ -150,14 +150,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <section class="page" id="page-plugins">
     <div class="panel">
       <h3>行为插件</h3>
-      <div class="hint">本地认知循环负责记忆检索与扩散；“行为思考”使用当前插件配置的 LLM。提示词只包含名字与记忆，插件不得注入平台/群号/用户 ID 等信息。</div>
-      <div class="grid2" style="margin-top:10px">
-        <div><label>当前行为插件</label><select id="p-active"></select></div>
-      </div>
+      <div class="hint">所有插件可并行运行：启动后各自收消息、缓存未读；辉夜打开哪个软件，行为就落到哪个插件。语言模型始终是全局主模型，插件只提供软件动作与发送通道。提示词只包含名字与记忆，插件不得注入平台/群号/用户 ID 等信息。</div>
       <div id="pluginList" style="margin-top:12px"></div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSavePlugins">保存插件配置</button></div>
-      <div class="hint">行为 LLM 留空表示沿用“配置”页的主模型；动作 LLM 留空表示沿用语言 LLM。API Key 留空表示不修改。</div>
-      <div class="hint">动作模型只在软件已打开时参与；勾选“接收语言层思考过程”后，动作提示词会额外带上语言层的 reasoning。</div>
+      <div class="hint">语言模型统一使用“配置”页的主模型，插件不可覆盖。行为模型只在软件打开后参与，决定软件动作；是否发送这句话仍由语言层的 say 决定。全局行为模型默认使用主模型，可在“配置”页单独配置。</div>
+      <div class="hint">行为模型 API Key 留空表示不修改。勾选“跟随全局行为模型”时，插件自己的行为模型字段会被忽略。</div>
     </div>
   </section>
 
@@ -194,12 +191,23 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
       <!-- 主大模型区块 -->
       <div class="sub-box">
-        <h4>主模型（Primary LLM）— 文本理解；插件未单独配置行为 LLM 时的默认模型</h4>
+        <h4>主模型（Primary LLM）— 全局语言模型；所有插件共用的唯一意识声音</h4>
         <div class="grid3">
           <div><label>服务地址 (Base URL)</label><input id="f-pburl" placeholder="https://api.deepseek.com"></div>
           <div><label>模型名称 (Model)</label><input id="f-pmodel" placeholder="deepseek-v4-flash"></div>
           <div><label>API Key（留空表示不修改）</label><input id="f-pkey" type="password" placeholder="已配置则留空"></div>
         </div>
+      </div>
+
+      <!-- 全局行为模型区块 -->
+      <div class="sub-box">
+        <h4>全局行为模型（Global Behavior LLM）— 只决定软件内动作，不参与语言生成</h4>
+        <div class="grid3">
+          <div><label>服务地址 (Base URL)（留空用主模型）</label><input id="f-bburl" placeholder="https://api.deepseek.com"></div>
+          <div><label>模型名称 (Model)（留空用主模型）</label><input id="f-bmodel" placeholder="deepseek-v4-flash"></div>
+          <div><label>API Key（留空表示不修改）</label><input id="f-bkey" type="password" placeholder="已配置则留空"></div>
+        </div>
+        <div class="hint">插件勾选“跟随全局行为模型”时使用这里的配置；未勾选时使用插件自己的行为模型。语言模型永远是上面的主模型。</div>
       </div>
 
       <!-- 次大模型区块（独立换行展示） -->
@@ -434,6 +442,8 @@ async function loadConfig(){
     const c = await getJSON('/api/config');
     $('f-pburl').value = c.primary_base_url || '';
     $('f-pmodel').value = c.primary_model || '';
+    $('f-bburl').value = c.behavior_base_url || '';
+    $('f-bmodel').value = c.behavior_model || '';
     $('f-sburl').value = c.secondary_base_url || '';
     $('f-smode').value = c.secondary_model || '';
     $('f-oburl').value = c.ollama_base_url || '';
@@ -478,19 +488,11 @@ async function loadPlugins(){
   try{
     const d = await getJSON('/api/plugins');
     pluginCache = d.plugins || [];
-    const sel = $('p-active');
     const list = $('pluginList');
-    sel.innerHTML = '';
     list.innerHTML = '';
     for(const p of pluginCache){
-      const opt = document.createElement('option');
-      opt.value = p.id;
-      opt.textContent = p.label + (p.implemented ? '' : '（未实现）');
-      opt.selected = !!p.active;
-      sel.appendChild(opt);
-
-      const llm = p.llm || {};
       const al = p.action_llm || {};
+      const follow = p.follow_global_behavior !== false;
       const caps = (p.capabilities || []).map(c => CAP_LABELS[c] || c).join(' · ');
       const box = document.createElement('div');
       box.className = 'sub-box';
@@ -498,17 +500,14 @@ async function loadPlugins(){
         `<h4>${escHtml(p.label)} <span class="hint" style="font-weight:400">${escHtml(p.id)}${p.implemented ? '' : ' · 未实现'}</span></h4>` +
         `<div class="hint">${escHtml(p.description || '')}${caps ? ' · 能力：' + escHtml(caps) : ''}</div>` +
         `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-enabled" ${p.enabled ? 'checked' : ''} style="width:auto"> 启用</label>` +
+        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-follow" ${follow ? 'checked' : ''} style="width:auto" onchange="toggleFollowBehavior('${escHtml(p.id)}')"> 跟随全局行为模型</label>` +
         `<div class="grid3" style="margin-top:8px">` +
-          `<div><label>语言/行为 LLM Base URL（留空用主模型）</label><input id="pl-${escHtml(p.id)}-base" value="${escHtml(llm.base_url || '')}"></div>` +
-          `<div><label>语言/行为模型名（留空用主模型）</label><input id="pl-${escHtml(p.id)}-model" value="${escHtml(llm.model || '')}"></div>` +
-          `<div><label>语言 API Key（${llm._has_api_key ? '已配置，留空不修改' : '未配置'}）</label><input id="pl-${escHtml(p.id)}-key" type="password" placeholder="留空不修改"></div>` +
+          `<div><label>行为模型 Base URL（不跟随时使用）</label><input id="pl-${escHtml(p.id)}-abase" value="${escHtml(al.base_url || '')}" ${follow ? 'disabled' : ''}></div>` +
+          `<div><label>行为模型名（不跟随时使用）</label><input id="pl-${escHtml(p.id)}-amodel" value="${escHtml(al.model || '')}" ${follow ? 'disabled' : ''}></div>` +
+          `<div><label>行为 API Key（${al._has_api_key ? '已配置，留空不修改' : '未配置'}）</label><input id="pl-${escHtml(p.id)}-akey" type="password" placeholder="留空不修改" ${follow ? 'disabled' : ''}></div>` +
         `</div>` +
-        `<div class="grid3" style="margin-top:8px">` +
-          `<div><label>动作 LLM Base URL（留空沿用语言 LLM）</label><input id="pl-${escHtml(p.id)}-abase" value="${escHtml(al.base_url || '')}"></div>` +
-          `<div><label>动作模型名（留空沿用语言 LLM）</label><input id="pl-${escHtml(p.id)}-amodel" value="${escHtml(al.model || '')}"></div>` +
-          `<div><label>动作 API Key（${al._has_api_key ? '已配置，留空不修改' : '未配置'}）</label><input id="pl-${escHtml(p.id)}-akey" type="password" placeholder="留空不修改"></div>` +
-        `</div>` +
-        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-reasoning" ${p.action_include_reasoning ? 'checked' : ''} style="width:auto"> 动作模型接收语言层思考过程（思维链）</label>` +
+        `<div class="hint" style="margin-top:6px">留空字段回落到全局行为模型；全局行为模型未配置时使用主模型。行为模型只做软件动作，不决定是否发送。</div>` +
+        `<label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="pl-${escHtml(p.id)}-reasoning" ${p.action_include_reasoning ? 'checked' : ''} style="width:auto"> 行为模型接收语言层思考过程（思维链）</label>` +
         `<div class="row" style="margin-top:8px">` +
           `<button class="act sec" onclick="pluginAction('${escHtml(p.id)}','start')">启动软件</button>` +
           `<button class="act sec" onclick="pluginAction('${escHtml(p.id)}','stop')">停止软件</button>` +
@@ -526,19 +525,23 @@ async function pluginAction(id, action){
     await loadPlugins();
   }catch(e){ toast('操作失败：' + e.message); }
 }
+function toggleFollowBehavior(id){
+  const follow = $(`pl-${id}-follow`);
+  const disabled = !!(follow && follow.checked);
+  for(const suffix of ['abase', 'amodel', 'akey']){
+    const el = $(`pl-${id}-${suffix}`);
+    if(el) el.disabled = disabled;
+  }
+}
 async function savePlugins(){
-  const body = {active: $('p-active').value, plugins: {}};
+  const body = {plugins: {}};
   for(const p of pluginCache){
     const enabled = $(`pl-${p.id}-enabled`);
     if(!enabled) continue;
     body.plugins[p.id] = {
       enabled: enabled.checked,
+      follow_global_behavior: $(`pl-${p.id}-follow`).checked,
       action_include_reasoning: $(`pl-${p.id}-reasoning`).checked,
-      llm: {
-        base_url: $(`pl-${p.id}-base`).value.trim(),
-        model: $(`pl-${p.id}-model`).value.trim(),
-        api_key: $(`pl-${p.id}-key`).value.trim(),
-      },
       action_llm: {
         base_url: $(`pl-${p.id}-abase`).value.trim(),
         model: $(`pl-${p.id}-amodel`).value.trim(),
@@ -669,13 +672,16 @@ $('btnSaveCfg').onclick = async () => {
       primary_base_url:$('f-pburl').value.trim(),
       primary_model:$('f-pmodel').value.trim(),
       primary_api_key:$('f-pkey').value.trim(),
+      behavior_base_url:$('f-bburl').value.trim(),
+      behavior_model:$('f-bmodel').value.trim(),
+      behavior_api_key:$('f-bkey').value.trim(),
       secondary_base_url:$('f-sburl').value.trim(),
       secondary_model:$('f-smode').value.trim(),
       secondary_api_key:$('f-skey').value.trim(),
       ollama_base_url:$('f-oburl').value.trim(),
       ollama_embed_model:$('f-omodel').value.trim(),
     });
-    $('f-pkey').value = ''; $('f-skey').value = '';
+    $('f-pkey').value = ''; $('f-bkey').value = ''; $('f-skey').value = '';
     toast('模型与 API 配置已保存并热刷新');
   }catch(e){ toast('保存失败：'+e.message); }
 };

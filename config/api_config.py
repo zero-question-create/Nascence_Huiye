@@ -33,6 +33,14 @@ DEFAULT_CONFIG = {
     "secondary_api_key": "YOUR_API_KEY_HERE",
     "secondary_base_url": "https://api.lucisapi.ai/v1",
     "secondary_model": "gpt-5.6-sol",
+    # 全局行为模型：只负责软件内动作；留空逐字段回落 primary。
+    # 语言模型始终使用 primary，插件不可覆盖（保证意识连续性）。
+    "behavior_api_key": "",
+    "behavior_base_url": "",
+    "behavior_model": "",
+    "behavior_temperature": None,
+    "behavior_max_tokens": None,
+    "behavior_timeout": None,
     "ollama_base_url": "http://localhost:11434",
     "ollama_embed_model": "shaw/dmeta-embedding-zh",
     "bot_qq": "123456",                     # 兜底 QQ 号；连接后以 NapCat get_login_info 自动获取的为准
@@ -154,6 +162,9 @@ def load_config():
             "SECONDARY_API_KEY": "secondary_api_key",
             "SECONDARY_BASE_URL": "secondary_base_url",
             "SECONDARY_MODEL": "secondary_model",
+            "BEHAVIOR_API_KEY": "behavior_api_key",
+            "BEHAVIOR_BASE_URL": "behavior_base_url",
+            "BEHAVIOR_MODEL": "behavior_model",
             "OLLAMA_BASE_URL": "ollama_base_url",
             "OLLAMA_EMBED_MODEL": "ollama_embed_model",
             "BOT_QQ": "bot_qq",

@@ -5,9 +5,9 @@
 # 这里只做本地计算：关键词信箱、概念/向量检索、图扩散、反刍抑制、
 # 短期想法窗口、软件上下文合并、记忆写入。它不知道 QQ/微信/网页的存在。
 #
-# 每一轮的“行为思考”通过 BehaviorEngine 交给当前插件配置的 LLM；
-# 插件负责软件读写（打开/关闭、对话内容）、行为通道与 LLM 连接信息，
-# 不得向行为提示词注入平台元数据（人格涌现约束，见 core/behavior.py）。
+# 每一轮的“语言思考”通过 BehaviorEngine 交给全局 primary LLM；
+# 插件只负责软件读写（打开/关闭、对话内容）与行为通道；打开软件后，
+# 当前软件的行为模型决定软件动作。插件不得向行为提示词注入平台元数据。
 # ========================================================================
 
 import inspect
@@ -772,15 +772,48 @@ class _LegacyChannel:
 
 
 def _emit_outbound(channel, text, kind: str = "text"):
-    """把行为结果广播给面板；无插件时沿用 QQ 来源。"""
+    """把行为结果广播给面板；来源跟随当前软件，无插件时用 Core。"""
     if channel is not None:
         try:
             channel.emit_outbound(text, kind)
             return
         except Exception as e:
             append_log(f"[认知循环] 行为通道广播失败: {e}")
+    source = "Core"
+    try:
+        plugin = APP_CONTEXT.current_plugin()
+        if plugin is not None:
+            source = plugin.label or plugin.plugin_id or source
+    except Exception:
+        pass
     from utils.event_bus import BUS
-    BUS.message.emit(BOT_NAME, text, "QQ")
+    BUS.message.emit(BOT_NAME, text, source)
+
+
+def _round_channel(default_channel=None):
+    """本轮行为通道：打开软件时跟随当前软件，否则用调用方给的兼容通道。
+
+    语言模型永远是全局 primary；这里只决定行为/发送落在哪个插件。
+    没有打开软件时，全局循环不给默认通道，因此不会主动发言。
+    """
+    try:
+        if APP_CONTEXT.any_app_open():
+            return APP_CONTEXT.current_channel()
+    except Exception:
+        pass
+    return default_channel
+
+
+def _resolve_send_target(round_channel, fallback=None):
+    """解析本轮可发送目标；没有通道/对话/发送能力时返回空目标。"""
+    if round_channel is None:
+        return "", False
+    try:
+        target = round_channel.resolve_target(fallback)
+    except Exception:
+        target = ""
+    can_send = getattr(round_channel, "send_func", True) is not None
+    return (str(target or ""), can_send)
 
 
 def _consume_note_memory():
@@ -824,7 +857,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
 
     抉择本身是同步 LLM 调用，放进线程池执行；语义上仍属于本轮的最后一步。
     channel 为插件行为通道；为 None 时退化为旧的 send_func/media_send_func。
-    软件未打开时，插件动作层不参与；打开软件由本地 AppRouter 负责。
+    软件未打开时，行为模型不参与；打开软件由本地 AppRouter 负责。
     """
     from .action_layer import decide_action, action_enabled, APP_ACTIONS
     from .llm_interface import add_to_history
@@ -843,12 +876,13 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     # 记事本允许从零开始写，故开启时即便收藏为空也值得询问一次
     from . import asset_library as ASSETS
     from .action_layer import note_enabled
-    apps = APP_CONTEXT.prompt_state() if channel is not None else []
+    apps = APP_CONTEXT.prompt_state()
     open_apps = [app for app in apps if app.get("open")]
-    # 只有软件已经打开，插件动作层才参与；打开/退出软件由本地 AppRouter 负责。
-    if apps and not open_apps:
+    # 行为模型只在软件已打开时参与；打开/退出软件由本地 AppRouter 负责。
+    # 没有打开的软件时，认知循环只思考，不执行任何插件行为。
+    if not open_apps:
         return None
-    has_app_action = bool(open_apps)
+    has_app_action = True
     if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled() or has_app_action):
         return None
     action_apps = open_apps
@@ -876,7 +910,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         fallback_profile = channel.action_llm_profile() if channel is not None else None
         profile = APP_CONTEXT.action_llm_profile(fallback=fallback_profile)
     except Exception as e:
-        append_log(f"[动作抉择] 读取插件动作 LLM 失败，回落 primary: {e}")
+        append_log(f"[动作抉择] 读取当前软件行为模型失败，回落 primary: {e}")
         profile = None
     try:
         fallback_reasoning = bool(channel and channel.action_include_reasoning())
@@ -943,6 +977,8 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         create_memory(f"我发了{measure}{tag}，内容是：{detail}")
         add_to_history(None, None, f"（我发了{measure}{tag}，内容是：{detail}）")
         _emit_outbound(channel, f"[{tag}] {detail}", "media")
+        # 行为执行结果进入软件上下文：下一轮作为 pinned 记忆被语言层看到。
+        APP_CONTEXT.remember(f"我刚发了{measure}{tag}，内容是：{detail}")
         return f"发送{tag}: {detail}"
 
     # -------- 收藏类 --------
@@ -964,6 +1000,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
                 append_log(f"[认知循环] 收藏记忆建链失败: {e}")
         add_to_history(None, None, f"（我收藏了{measure}{tag}，内容是：{detail}）")
         _emit_outbound(channel, result.get("reply") or f"（收下了这个{tag}）", "media")
+        APP_CONTEXT.remember(f"我收藏了{measure}{tag}，内容是：{detail}")
         return f"收藏{tag}: {detail}"
 
     # -------- 记事本：写入/修改/删除/翻开，内容留给下一轮特供记忆（不入库）--------
@@ -983,6 +1020,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             create_memory(f"我在记事本「{name}」里写下：{written}{suffix}")
             add_to_history(None, None, f"（我在记事本「{name}」里写下：{written}{suffix}）")
             _emit_outbound(channel, f"[笔记] {written}", "note")
+            APP_CONTEXT.remember(f"我在记事本「{name}」里写下：{written}{suffix}")
             return f"写笔记: {name}"
 
         if action == "edit_txt":
@@ -992,6 +1030,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             create_memory(f"我把记事本「{name}」里的「{old_text}」改成了「{new_text}」")
             add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」改成了「{new_text}」）")
             _emit_outbound(channel, f"[笔记] {new_text}", "note")
+            APP_CONTEXT.remember(f"我把记事本「{name}」里的「{old_text}」改成了「{new_text}」")
             return f"改笔记: {name}"
 
         if action == "delete_txt":
@@ -999,6 +1038,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             create_memory(f"我把记事本「{name}」里的「{old_text}」划掉了")
             add_to_history(None, None, f"（我把记事本「{name}」里的「{old_text}」划掉了）")
             _emit_outbound(channel, f"[笔记] 划掉了：{old_text}", "note")
+            APP_CONTEXT.remember(f"我把记事本「{name}」里的「{old_text}」划掉了")
             return f"删笔记行: {name}"
 
         append_log(f"[认知循环] 记事本「{name}」内容已载入下一轮特供记忆")
@@ -1010,19 +1050,17 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
 async def cognitive_loop(send_func=None, target_group_id: str = None, media_send_func=None,
                          channel=None):
     """
-    永续认知循环 —— 本地“默认模式网络”永远在线。
+    永续认知循环 —— 全局唯一的“默认模式网络”，与插件服务解耦。
     无论是否有用户输入，循环始终运行：
-      消费队列关键词 → 本地检索/扩散 → 行为思考(生成内心独白+发言决策)
+      消费队列关键词 → 本地检索/扩散 → 全局语言模型(生成想法 + say 意图)
       → 存入记忆 → 回复jieba分词入队 → 检查新消息 → 循环
 
     关键词来源：上一轮的回复（心理活动或发送消息）与接收到的消息，
     均以 jieba 搜索引擎模式分词后进入消费队列，每轮取空队列处理全部关键词。
 
-    channel: 插件行为通道（plugins.base.BehaviorChannel）。本地认知与平台无关，
-             行为思考使用 channel.llm_profile() 指定的 LLM。为 None 时用
-             send_func/media_send_func 包成兼容通道（CLI/旧测试）。
-    在 NapCat 连接后启动，断开时 request_graceful_stop 触发：
-      当前轮继续执行到回复输出，跳过复搜后退出。
+    语言模型始终是全局 primary（意识连续性）；插件不再提供语言模型。
+    channel 只是兼容旧调用（CLI/测试）的默认通道；正式运行时由本轮
+    “当前打开的软件”动态决定行为通道。没有打开软件时不发送任何消息。
     """
     global _keyword_queue, _shallow_pool, _cognitive_running, _graceful_stop
     global _keyword_continuity, _inhibited_seeds, _inhibited_edges, _inhibited_keywords
@@ -1047,13 +1085,17 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
     APP_ROUTER.reset()
     current_keywords = []
 
-    # 没有插件时退化为旧的发送回调；有插件时由插件提供行为通道与 LLM。
-    if channel is None:
-        channel = _LegacyChannel(send_func=send_func, media_send_func=media_send_func)
+    # 兼容旧调用：只有显式给了发送回调/通道时才保留默认通道。
+    # 正式全局循环不传这些参数，因此没有打开软件时不会主动发言。
+    default_channel = channel
+    if default_channel is None and (send_func is not None or media_send_func is not None):
+        default_channel = _LegacyChannel(
+            send_func=send_func, media_send_func=media_send_func,
+        )
 
     append_log("="*40)
-    append_log("[认知循环] 本地永续认知循环启动"
-               f"（行为插件：{getattr(channel, 'plugin_id', 'legacy')}）")
+    append_log("[认知循环] 全局认知循环启动（语言模型：primary；"
+               "行为模型随当前打开的软件）")
     append_log("="*40)
 
     while not _graceful_stop:
@@ -1108,6 +1150,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                     append_log(f"[认知循环] 软件门控: {decision} → {outcome}")
             except Exception as e:
                 append_log(f"[认知循环] 软件门控异常: {e}")
+
+            # 本轮行为通道：打开软件后跟随该软件插件；没打开软件时为空。
+            # 语言模型不随通道改变，仍由下面的全局 primary 完成。
+            round_channel = _round_channel(default_channel)
 
             # ============================
             # Step 1: 合并关键词信箱（追加，而不是整批替换）
@@ -1310,15 +1356,14 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 + concept_ts
             )
 
-            # 本地检索/扩散已完成；最后一步“行为思考”交给插件配置的 LLM。
-            # 提示词只包含名字与记忆（见 core/behavior.py），不注入平台信息。
+            # 本地检索/扩散已完成；最后一步“行为思考”始终使用全局语言模型。
+            # 提示词只包含名字与记忆（见 core/behavior.py），不注入平台信息；
+            # 插件不能覆盖语言模型，否则会破坏意识连续性。
+            app_plugin = APP_CONTEXT.current_plugin()
             try:
-                profile = channel.llm_profile()
-            except Exception as e:
-                append_log(f"[认知循环] 读取插件行为 LLM 失败，回落 primary: {e}")
-                profile = None
-            try:
-                fallback_reasoning = bool(channel and channel.action_include_reasoning())
+                fallback_reasoning = bool(
+                    app_plugin and app_plugin.action_include_reasoning()
+                )
                 include_reasoning = bool(
                     APP_CONTEXT.any_app_open()
                     and APP_CONTEXT.action_include_reasoning(fallback=fallback_reasoning)
@@ -1328,8 +1373,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
 
             result = await loop.run_in_executor(
                 None, lambda: BehaviorEngine(
-                    profile=profile,
-                    plugin_id=getattr(channel, "plugin_id", "core"),
+                    profile=None,
+                    plugin_id=APP_CONTEXT.current_app or "global",
                 ).think(
                     related_memories, current_keywords, state,
                     pinned=pinned_memories,
@@ -1361,8 +1406,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # 不再用“最近 4~6 条别人的消息”当短期窗口锚点。
             # 发送结果要等 Step 6 才知道，所以“我说/我想”先按是否有发送目标判断；
             # 真正的短期标签在发送后按 talk_sent 写入。
-            target_group = channel.resolve_target(target_group_id)
-            can_send = getattr(channel, "send_func", True) is not None
+            # 只有当前打开软件的插件通道才允许发送；没有软件时只思考。
+            target_group, can_send = _resolve_send_target(
+                round_channel, target_group_id,
+            )
             attempted_speech = bool(should_speak and target_group and can_send)
 
             # ============================
@@ -1400,15 +1447,16 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # ============================
             talk_sent = False
             # target_group / can_send 在 Step 5 前已解析，本轮复用同一结果。
+            # say 只表示语言层“想不想说”；真正发送由当前软件插件执行。
             if should_speak and thought_text and target_group and can_send:
                 # @/引用等平台语义由插件决定（QQ 插件只回应冲她来的消息）
                 try:
-                    options = channel.outbound_options(target_group) or {}
+                    options = round_channel.outbound_options(target_group) or {}
                 except Exception as e:
                     append_log(f"[认知循环] 解析发送选项失败: {e}")
                     options = {}
 
-                delivered = await channel.send_text(target_group, thought_text, **options)
+                delivered = await round_channel.send_text(target_group, thought_text, **options)
                 talk_sent = delivered is not False     # 兼容未返回值的旧签名
                 if delivered is False:
                     append_log(f"[认知循环] 消息发送失败，历史标记为未送达: {thought_text[:30]}")
@@ -1419,8 +1467,10 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                         mark_delivery_failed(seq)
                     except Exception as e:
                         append_log(f"[认知循环] 标记发送失败时出错: {e}")
-                _emit_outbound(channel, thought_text, "text")
+                _emit_outbound(round_channel, thought_text, "text")
                 APP_ROUTER.note_activity()
+            elif should_speak and round_channel is None:
+                append_log("[认知循环] 没有打开软件，say=true 只作为想说的话保留")
 
             # 短期里的“我说/我想”以实际送达为准；没发出去就是只在心里想。
             SHORT_TERM.add_thought(thought_text, bool(talk_sent))
@@ -1433,7 +1483,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             try:
                 acted = await _run_action_decision(
                     loop, thought_text, should_speak, talk_sent, current_keywords,
-                    media_send_func, target_group_id, action_context, channel=channel,
+                    media_send_func, target_group_id, action_context, channel=round_channel,
                     reasoning=reasoning,
                 )
                 if acted:

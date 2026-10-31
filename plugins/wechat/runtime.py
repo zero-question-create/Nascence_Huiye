@@ -717,21 +717,14 @@ async def handle_message(data: dict, from_flush: bool = False):
 
 # ---------- WebSocket 服务 ----------
 def _start_cognitive_loop():
-    global _cognitive_task
-    if _cognitive_task is not None and not _cognitive_task.done():
-        return
+    """确保全局认知循环已启动；微信只是并行软件之一。"""
     try:
-        import core.cognition as C
-        if getattr(C, "_cognitive_running", False):
-            logger.warning("[认知循环] 已有认知循环在运行，微信暂不启动第二个循环")
-            return
-    except Exception:
-        pass
-    from core.cognition import request_graceful_stop, cognitive_loop
-    from plugins.wechat.plugin import get_channel
-    request_graceful_stop()
-    _cognitive_task = asyncio.create_task(cognitive_loop(channel=get_channel()))
-    logger.info("[认知循环] 已随微信桥连接启动")
+        import panel_runtime
+        panel_runtime.RUNTIME.start_cognitive()
+    except Exception as e:
+        logger.warning("[认知循环] 启动全局认知循环失败: %s", e)
+        return
+    logger.info("[认知循环] 已确保全局认知循环运行（微信仅作为软件接入）")
 
 
 async def ws_handler(websocket):

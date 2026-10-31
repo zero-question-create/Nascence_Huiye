@@ -288,14 +288,16 @@ async def handle_config_get(request):
 
 # API Key / 文本字段 / 数值字段分别处理：空值不覆盖，数字容错转换。
 _CONFIG_STR_KEYS = (
-    "primary_base_url", "primary_model", "secondary_base_url", "secondary_model",
+    "primary_base_url", "primary_model",
+    "behavior_base_url", "behavior_model",
+    "secondary_base_url", "secondary_model",
     "ollama_base_url", "ollama_embed_model",
     "bot_qq", "active_group_id", "napcat_token", "napcat_http_url",
     "app_router_mode", "app_router_base_url", "app_router_model",
     "browser_mode", "browser_dynamic_url", "browser_summary_base_url", "browser_summary_model",
 )
 _CONFIG_KEY_KEYS = (
-    "primary_api_key", "secondary_api_key", "app_router_api_key",
+    "primary_api_key", "behavior_api_key", "secondary_api_key", "app_router_api_key",
     "browser_dynamic_api_key", "browser_summary_api_key",
 )
 _CONFIG_FLOAT_KEYS = (
