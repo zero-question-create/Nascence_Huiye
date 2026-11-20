@@ -313,6 +313,7 @@ _CONFIG_KEY_KEYS = (
 )
 _CONFIG_BOOL_KEYS = (
     "app_router_follow_global_behavior",
+    "biorhythm_never_sleep",
 )
 _CONFIG_FLOAT_KEYS = (
     "biorhythm_wake_seconds", "biorhythm_sleep_seconds",
@@ -381,18 +382,6 @@ async def handle_plugins_get(request):
     def _collect():
         from plugins import registry
         plugins = registry.list_plugins()
-        for item in plugins:
-            plugin_id = str(item.get("id") or "")
-            if plugin_id == "qq_napcat":
-                item["running"] = bool(
-                    panel.RUNTIME.qq_thread and panel.RUNTIME.qq_thread.is_alive()
-                )
-            elif plugin_id == "wechat":
-                status = item.get("status") or {}
-                item["running"] = bool(status.get("running"))
-            else:
-                # 工具型/只读插件没有常驻服务：启用即视为可用。
-                item["running"] = bool(item.get("enabled"))
         return {
             "ok": True,
             "active": registry.get_active_id(),
@@ -437,6 +426,11 @@ async def handle_plugin_start(request):
             plugin = get_plugin(plugin_id)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: asyncio.run(plugin.start()))
+        # 启动成功才记为“自动启动”：下次面板启动时按这个标记恢复运行。
+        await loop.run_in_executor(
+            None, update_from_panel,
+            {"plugin_id": plugin_id, "enabled": True, "autostart": True},
+        )
         return web.json_response({"ok": True})
     except NotImplementedError as e:
         return web.json_response({"ok": False, "error": str(e)}, status=501)
@@ -454,11 +448,54 @@ async def handle_plugin_stop(request):
             return web.json_response({"ok": False, "error": "插件不存在"}, status=404)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: asyncio.run(plugin.stop()))
-        # 插件页只有“启动/停止”一个开关：停止即退出运行与软件门控。
+        # 插件页只有“启动/停止”一个开关：停止即退出运行与软件门控，
+        # 同时清掉自动启动标记，下次面板启动不会再拉起。
         await loop.run_in_executor(
-            None, update_from_panel, {"plugin_id": plugin_id, "enabled": False}
+            None, update_from_panel,
+            {"plugin_id": plugin_id, "enabled": False, "autostart": False},
         )
         return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugin_panel_save(request):
+    """保存插件自述面板的字段；写哪个配置文件由插件自己决定。"""
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        values = body.get("values")
+        from plugins import registry
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, registry.save_panel, plugin_id, values if isinstance(values, dict) else {}
+        )
+        if not result.get("ok", True):
+            return web.json_response(
+                {"ok": False, "error": result.get("error") or "保存失败"}, status=400
+            )
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+async def handle_plugin_panel_action(request):
+    """执行插件面板上声明的动作（自测、收起工作桌面等）。"""
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        key = str(body.get("key") or "").strip()
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        from plugins import registry
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, registry.panel_action, plugin_id, key, payload
+        )
+        if not result.get("ok", True):
+            return web.json_response(
+                {"ok": False, "error": result.get("error") or "执行失败"}, status=400
+            )
+        return web.json_response({"ok": True, "detail": result.get("detail") or ""})
     except Exception as e:
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
 
@@ -582,6 +619,8 @@ def _build_app():
     app.router.add_post("/api/plugins", handle_plugins_post)
     app.router.add_post("/api/plugins/start", handle_plugin_start)
     app.router.add_post("/api/plugins/stop", handle_plugin_stop)
+    app.router.add_post("/api/plugins/panel", handle_plugin_panel_save)
+    app.router.add_post("/api/plugins/panel/action", handle_plugin_panel_action)
     app.router.add_post("/api/cognitive/start", handle_cognitive_start)
     app.router.add_post("/api/cognitive/stop", handle_cognitive_stop)
     app.router.add_post("/api/save", handle_save)

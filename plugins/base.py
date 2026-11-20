@@ -43,6 +43,7 @@ class Capability:
     FEED = "feed"                  # 信息流浏览
     SEARCH = "search"              # 站内搜索
     PROACTIVE = "proactive"        # 支持主动发言
+    COMPUTER = "computer"          # 能操作电脑/虚拟桌面
 
 
 @dataclass
@@ -192,6 +193,99 @@ class Plugin(ABC):
     def action_include_reasoning(self) -> bool:
         """是否把语言层的思考过程交给动作模型（插件设置）。"""
         return bool(self.settings.get("action_include_reasoning", False))
+
+    # ---------- 动作层扩展接口（只增不改） ----------
+    def extra_actions(self) -> dict:
+        """插件自述的额外动作：{动作名: 一行提示词示例}。
+
+        动作层会把它们渲染进提示词，执行时交给 perform_action()。
+        默认空字典；新插件不需要改 core/action_layer.py。
+        """
+        return {}
+
+    def available_for_actions(self) -> bool:
+        """软件未打开时，是否仍允许动作层对它下指令。
+
+        默认 False：沿用“打开软件归本地门控”的边界。
+        工具型软件（例如电脑/虚拟桌面）可以返回 True，表示不必先打开
+        也能接任务；是否真正启动工作区由插件自己决定。
+        """
+        return False
+
+    async def perform_task(self, task: str, context: str = "") -> dict:
+        """接收一个自然语言任务（动作层 app_do 的落点）。
+
+        返回 {"ok": bool, "detail": str, "content_lines": [...]}；
+        耗时任务应当立即返回“已开始”，进度用 APP_CONTEXT.remember 回传。
+        """
+        return {"ok": False, "detail": f"{self.label or self.plugin_id}还不能执行任务"}
+
+    async def perform_action(self, kind: str, data: dict) -> dict:
+        """插件自述动作（extra_actions）的统一执行入口。"""
+        return {"ok": False, "detail": f"{self.label or self.plugin_id}不支持这个动作"}
+
+    # ---------- 软件阅读接口（电脑插件用） ----------
+    def provides_reading(self) -> bool:
+        """是否愿意在别的软件打开后，替它读窗口内容。"""
+        return False
+
+    def delegates_reading(self) -> bool:
+        """本软件是否把“读内容”委托给会看窗口的插件（默认自己解析）。"""
+        return False
+
+    async def observe_app(self, app_id: str) -> dict:
+        """软件被打开后，由会看窗口的插件读取当前窗口内容。
+
+        返回 {"ok": bool, "detail": str, "content_lines": [...]}。
+        内容怎么写进上下文由插件自己决定。
+        """
+        return {}
+
+    # ---------- 后台面板自述接口（只增不改） ----------
+    def panel_schema(self) -> dict:
+        """插件自述配置面板。
+
+        结构：
+          {
+            "status": [{"key": "service", "label": "服务状态"}],
+            "fields": [{"key","label","type","placeholder","hint","required"}],
+            "hint": "补充说明",
+            "save_label": "保存按钮文字",
+          }
+        字段 type：text / password / number / bool / select / textarea。
+        插件目录里放 panel.py（导出 PANEL）可覆盖这些方法。
+        """
+        return {"status": [], "fields": [], "hint": "", "save_label": "保存插件配置"}
+
+    def panel_values(self) -> dict:
+        """面板当前值；密码类字段返回空串并带 _has_<key>=True 表示已配置。"""
+        return {}
+
+    def panel_save(self, values: dict) -> dict:
+        """保存面板字段。返回 {"ok": bool, "error": str}。"""
+        return {"ok": False, "error": "这个插件没有可保存的配置"}
+
+    def is_running(self) -> bool:
+        """插件服务是否在运行；面板“启动/停止”用它显示状态。
+
+        优先读取插件自己的 status()["running"]（微信/QQ 等有常驻服务的插件
+        会填），没有该字段时退回“已启用”。
+        """
+        try:
+            status = self.status()
+            if isinstance(status, dict) and "running" in status:
+                return bool(status.get("running"))
+        except Exception:
+            pass
+        return bool(self.enabled)
+
+    def conflict_note(self, others: list) -> str:
+        """与其他正在运行的插件同时使用时的提示。
+
+        others 是同一时刻处于运行状态的其他插件实例。返回空字符串表示
+        没有冲突；返回文字时面板会在启动前提示，但不阻止同时运行。
+        """
+        return ""
 
     def channel(self) -> Optional[BehaviorChannel]:
         """返回行为通道；未实现的插件返回 None。"""

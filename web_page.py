@@ -65,6 +65,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .msg{border-left:3px solid var(--accent);padding:6px 10px;margin:6px 0;background:#101722;border-radius:0 6px 6px 0}
   .msg .who{color:var(--muted);font-size:11px}
   .hint{color:var(--muted);font-size:12px;margin-top:6px}
+  .field-head{display:flex;align-items:center;gap:6px}
+  .field-head label{margin:8px 0 4px}
+  .help-dot{width:17px;height:17px;border-radius:50%;border:1px solid #35445a;background:#0f1621;
+            color:var(--muted);font-size:11px;line-height:15px;text-align:center;cursor:pointer;
+            padding:0;flex:none;margin-top:4px}
+  .help-dot:hover,.help-dot:focus{color:#fff;border-color:var(--accent2);outline:none}
+  .help-dot.open{color:#fff;background:#1b2b45;border-color:var(--accent2)}
+  .help-pop{display:none;background:#0b1220;border:1px solid #35445a;border-radius:8px;
+            padding:8px 10px;margin:2px 0 4px;color:var(--text);font-size:12px;line-height:1.55}
+  .help-pop.open{display:block}
   .kv{display:grid;grid-template-columns:120px 1fr;gap:6px 12px;font-size:13px}
   .kv .k{color:var(--muted)}
   #toast{position:fixed;right:20px;bottom:20px;background:#1b2b45;border:1px solid var(--border);
@@ -144,25 +154,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div class="row" style="margin-top:12px"><button class="act" id="btnSavePluginDetail">保存插件配置</button></div>
         <div class="hint">不跟随全局行为模型时，Base URL、模型名和 API Key 为必填；未填写保存会提示。</div>
       </div>
-      <div id="pluginSpecificQQ" style="display:none;margin-top:16px">
-        <h4>QQ / NapCat</h4>
-        <div class="kv" style="margin-top:10px">
-          <div class="k">服务状态</div><div id="q-status">未运行</div>
-          <div class="k">NapCat 连接</div><div id="q-napcat">未连接</div>
-          <div class="k">QQ 身份（自动获取）</div><div id="q-iden">未连接</div>
-          <div class="k">软件状态</div><div id="q-app">未打开</div>
-          <div class="k">当前对话</div><div id="q-conv">无</div>
-        </div>
-        <div class="grid2" style="margin-top:12px">
-          <div><label>机器人 QQ（连接后自动获取；此处仅作未连接时兜底）</label><input id="q-bot"></div>
-          <div><label>主动发言群号</label><input id="q-group"></div>
-          <div><label>NapCat 鉴权 Token</label><input id="q-token"></div>
-          <div><label>NapCat HTTP 接口地址（正向 HTTP，用于语音下载）</label><input id="q-http" placeholder="http://127.0.0.1:5700"></div>
-        </div>
-        <div class="row" style="margin-top:12px"><button class="act" id="btnSaveNapcat">保存 QQ 配置</button></div>
-        <div class="hint">保存后立即生效。主动发言群号、NapCat Token、HTTP 地址为必填；机器人 QQ 可留空，连接后由 NapCat 自动获取。QQ 昵称与 QQ 号在连接后由 get_login_info 自动获取；意识体名字（{{BOT_NAME}}）只用于记忆与思考。</div>
+      <div id="pluginPanelSection" style="margin-top:16px">
+        <div class="kv" id="pluginPanelStatus"></div>
+        <div id="pluginPanelFields" class="grid2" style="margin-top:12px"></div>
+        <div class="row" style="margin-top:12px"><button class="act" id="btnSavePluginPanel" style="display:none">保存插件配置</button></div>
+        <div class="row" id="pluginPanelActions" style="margin-top:10px"></div>
+        <div class="hint" id="pluginPanelHint" style="margin-top:12px"></div>
       </div>
-      <div class="hint" id="pluginSpecificHint" style="margin-top:12px"></div>
     </div>
   </section>
 
@@ -310,6 +308,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div><label>入睡所需安静秒数（默认 300）</label><input id="f-idle" type="number" step="30"></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="act" id="btnSaveBio">保存生物钟参数</button></div>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="f-never-sleep" style="width:auto"> 永不会困（不推进睡眠、不会入睡；取消勾选时恢复启动时的精力值）</label>
       <div class="hint">参数保存后立即作用于睡眠动力学；"常睡时段"始终由她自己的经历学得，不受此设置影响。</div>
     </div>
   </section>
@@ -481,23 +480,6 @@ async function refreshStats(){
     const cogRunning = !!d.cognitive_running;
     cb.textContent = '认知循环：' + (cogRunning ? '运行中' : '已停止');
     cb.className = 'badge' + (cogRunning ? '' : ' off');
-    if($('q-status')){
-      $('q-status').textContent = d.qq_running ? '运行中' : '未运行';
-      $('q-napcat').textContent = d.napcat_connected ? '已连接' : (d.qq_running ? '等待 NapCat 连入…' : '未连接');
-      const ident = d.qq_identity || {};
-      if(ident.nickname){
-        $('q-iden').textContent = `${ident.nickname}（${ident.user_id || '?'}，${ident.source === 'napcat' ? 'NapCat 自动获取' : '兜底'}）`;
-      }else if(ident.user_id){
-        $('q-iden').textContent = `${ident.user_id}（未连接，使用配置兜底）`;
-      }else{
-        $('q-iden').textContent = '未获取';
-      }
-      const qapp = d.qq_app || {};
-      $('q-app').textContent = qapp.open
-        ? `已打开${qapp.unread ? `，另有 ${qapp.unread} 条未读` : ''}`
-        : `未打开${qapp.unread ? `，${qapp.unread} 条未读` : ''}`;
-      $('q-conv').textContent = qapp.current_conversation || '无';
-    }
   }catch(e){ /* 面板不因统计失败而中断 */ }
   finally{ statsInFlight = false; }
 }
@@ -520,16 +502,13 @@ async function loadConfig(){
     $('f-odim').value = c.embedding_dim ?? 768;
     $('f-oburl').value = c.ollama_base_url || '';
     $('f-omodel').value = c.ollama_embed_model || '';
-    $('q-bot').value = c.bot_qq || '';
-    $('q-group').value = c.active_group_id || '';
-    $('q-token').value = c.napcat_token || '';
-    $('q-http').value = c.napcat_http_url || '';
     $('f-twake').value = c.biorhythm_wake_seconds ?? '';
     $('f-tsleep').value = c.biorhythm_sleep_seconds ?? '';
     $('f-onset').value = c.biorhythm_onset_threshold ?? '';
     $('f-wake').value = c.biorhythm_wake_threshold ?? '';
     $('f-rw').value = c.biorhythm_rhythm_weight ?? 0.25;
     $('f-idle').value = c.biorhythm_idle_to_sleep ?? 300;
+    $('f-never-sleep').checked = !!c.biorhythm_never_sleep;
     $('f-panel-port').value = c.panel_port ?? 32123;
     $('f-ar-mode').value = c.app_router_mode || 'rule';
     $('f-ar-follow').checked = !!c.app_router_follow_global_behavior;
@@ -591,17 +570,12 @@ function markLoadedRequired(){
 const CAP_LABELS = {
   chat:'文本', group_chat:'群聊', direct_chat:'私聊', media:'媒体',
   page_read:'网页', mini_program:'小程序', account:'账号',
-  feed:'信息流', search:'搜索', proactive:'主动发言'
+  feed:'信息流', search:'搜索', proactive:'主动发言', computer:'电脑'
 };
 let pluginCache = [];
 let currentPluginDetailId = null;
 let currentPluginHasKey = false;
-const PLUGIN_EXTRA_HINTS = {
-  wechat: '微信桥接地址、Token 与会话白名单在“配置”页和 config/wechat_manifest.json；桥接协议见 plugins/wechat/BRIDGE.md。',
-  bilibili: 'Bilibili Cookie 在 config/bilibili_credentials.json；推荐、搜索、评论等参数在“配置”页。',
-  browser: '网页解析模式（static/dynamic）、DeepSeek Fetch 地址与摘要模型在“配置”页的浏览器插件区域。',
-  web: '网页/小程序读取接口尚未实现。',
-};
+const PLUGIN_FIELD_TYPES = ['text', 'password', 'number', 'bool', 'select', 'textarea'];
 function escHtml(value){
   return String(value ?? '').replace(/[&<>"']/g, c => (
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
@@ -625,9 +599,9 @@ async function loadPlugins(){
       runBox.className = 'sub-box';
       runBox.innerHTML =
         `<div class="row" style="justify-content:space-between;align-items:center;gap:12px">` +
-          `<div><b>${escHtml(p.label)}</b> <span class="hint">${escHtml(p.id)} · ${p.is_app ? '软件型' : '工具型'} · ${running ? '运行中' : '已停止'}</span>` +
+          `<div><b>${escHtml(p.label)}</b>${p.conflict_note && !running ? ' <span class="hint">⚠ 与其他插件可能冲突</span>' : ''} <span class="hint" id="prun-state-${escHtml(p.id)}">${escHtml(p.id)} · ${p.is_app ? '软件型' : '工具型'} · ${running ? '运行中' : '已停止'}</span>` +
           `<div class="hint">${escHtml(p.description || '')}${caps ? ' · 能力：' + escHtml(caps) : ''}</div></div>` +
-          `<button class="act ${running ? 'sec' : ''}" ${p.implemented ? '' : 'disabled'} onclick="pluginAction('${escHtml(p.id)}','${running ? 'stop' : 'start'}')">${running ? '停止' : '启动'}</button>` +
+          `<button id="prun-btn-${escHtml(p.id)}" class="act ${running ? 'sec' : ''}" ${p.implemented ? '' : 'disabled'} onclick="pluginAction('${escHtml(p.id)}','${running ? 'stop' : 'start'}')">${running ? '停止' : '启动'}</button>` +
         `</div>`;
       runList.appendChild(runBox);
 
@@ -644,16 +618,44 @@ async function loadPlugins(){
     }
   }catch(e){ toast('插件配置读取失败：' + e.message); }
 }
+async function refreshPluginRunning(){
+  // 只更新运行状态与按钮，不重建列表，避免打断点击。
+  try{
+    const d = await getJSON('/api/plugins');
+    pluginCache = d.plugins || [];
+    for(const p of pluginCache){
+      const running = pluginRunning(p);
+      const state = $('prun-state-' + p.id);
+      if(state){
+        state.textContent = `${p.id} · ${p.is_app ? '软件型' : '工具型'} · ${running ? '运行中' : '已停止'}`;
+      }
+      const btn = $('prun-btn-' + p.id);
+      if(btn && p.implemented){
+        btn.textContent = running ? '停止' : '启动';
+        btn.className = 'act ' + (running ? 'sec' : '');
+        btn.onclick = () => pluginAction(p.id, running ? 'stop' : 'start');
+      }
+    }
+  }catch(e){ /* 轮询失败忽略 */ }
+}
 async function pluginAction(id, action){
-  if(action === 'start' && id === 'qq_napcat'){
-    const required = [
-      ['q-group', '主动发言群号'],
-      ['q-token', 'NapCat 鉴权 Token'],
-      ['q-http', 'NapCat HTTP 接口地址'],
-    ];
-    if(!ensureRequired(required, true)){
-      openPluginDetail('qq_napcat');
-      ensureRequired(required);
+  if(action === 'start'){
+    // 通用必填检查：插件自述面板里的 required 字段为空时先引导去填写。
+    const p = pluginCache.find(x => x.id === id);
+    const schema = (p && p.panel && p.panel.schema) || {};
+    const values = (p && p.panel && p.panel.values) || {};
+    const missing = (schema.fields || []).filter(f => {
+      if(!f.required) return false;
+      const filled = String(values[f.key] ?? '').trim();
+      if(filled) return false;
+      return !(f.type === 'password' && values['_has_' + f.key]);
+    });
+    if(missing.length){
+      openPluginDetail(id);
+      toast('还需要填写：' + missing.map(f => f.label || f.key).join('、'));
+      return;
+    }
+    if(p && p.conflict_note && !confirm(p.conflict_note + '\n\n仍然启动吗？')){
       return;
     }
   }
@@ -697,9 +699,167 @@ function openPluginDetail(id){
     if(!currentPluginHasKey) required.push(['pd-akey', '行为 API Key']);
     ensureRequired(required, true);
   }
-  const isQQ = p.id === 'qq_napcat';
-  $('pluginSpecificQQ').style.display = isQQ ? '' : 'none';
-  $('pluginSpecificHint').textContent = isQQ ? '' : (PLUGIN_EXTRA_HINTS[p.id] || '该插件暂无额外配置。');
+  renderPluginPanel(p);
+}
+// 插件自述面板：状态行 + 字段全部由 /api/plugins 返回的 panel 决定。
+// 新插件只要在插件目录放 panel.py（或实现 panel_schema/panel_values/panel_save），
+// 这里不需要任何改动。
+function renderPluginPanel(p){
+  const panel = p.panel || {};
+  const schema = panel.schema || {};
+  const values = panel.values || {};
+  const statusEl = $('pluginPanelStatus');
+  const fieldsEl = $('pluginPanelFields');
+  const saveBtn = $('btnSavePluginPanel');
+  statusEl.innerHTML = '';
+  fieldsEl.innerHTML = '';
+
+  const live = values._status || {};
+  const statusRows = schema.status || [];
+  for(const row of statusRows){
+    const k = document.createElement('div');
+    k.className = 'k';
+    k.textContent = row.label || row.key;
+    const v = document.createElement('div');
+    v.id = 'pst-' + row.key;
+    v.textContent = live[row.key] ?? '—';
+    statusEl.appendChild(k);
+    statusEl.appendChild(v);
+  }
+  statusEl.style.display = statusRows.length ? '' : 'none';
+
+  const fields = schema.fields || [];
+  for(const f of fields){
+    const box = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'field-head';
+    const label = document.createElement('label');
+    label.textContent = f.label || f.key;
+    head.appendChild(label);
+    const helpText = String(f.help || f.hint || '').trim();
+    let pop = null;
+    if(helpText){
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = 'help-dot';
+      dot.textContent = '?';
+      dot.title = helpText;
+      dot.setAttribute('aria-label', '说明：' + helpText);
+      pop = document.createElement('div');
+      pop.className = 'help-pop';
+      pop.textContent = helpText;
+      dot.onclick = () => {
+        const open = !pop.classList.contains('open');
+        document.querySelectorAll('.help-pop.open').forEach(el => el.classList.remove('open'));
+        document.querySelectorAll('.help-dot.open').forEach(el => el.classList.remove('open'));
+        if(open){
+          pop.classList.add('open');
+          dot.classList.add('open');
+        }
+      };
+      head.appendChild(dot);
+    }
+    box.appendChild(head);
+
+    const type = PLUGIN_FIELD_TYPES.includes(f.type) ? f.type : 'text';
+    let input;
+    if(type === 'bool'){
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.style.width = 'auto';
+      input.checked = !!values[f.key];
+    }else if(type === 'select'){
+      input = document.createElement('select');
+      for(const opt of (f.options || [])){
+        const item = document.createElement('option');
+        const value = (opt && typeof opt === 'object') ? opt.value : opt;
+        const text = (opt && typeof opt === 'object') ? (opt.label ?? opt.value) : opt;
+        item.value = String(value ?? '');
+        item.textContent = String(text ?? value ?? '');
+        input.appendChild(item);
+      }
+      input.value = String(values[f.key] ?? '');
+    }else if(type === 'textarea'){
+      input = document.createElement('textarea');
+      input.value = String(values[f.key] ?? '');
+    }else{
+      input = document.createElement('input');
+      input.type = type === 'password' ? 'password' : (type === 'number' ? 'number' : 'text');
+      input.value = type === 'password' ? '' : String(values[f.key] ?? '');
+      if(type === 'password' && values['_has_' + f.key]){
+        input.placeholder = '已配置，留空不修改';
+      }else if(f.placeholder){
+        input.placeholder = f.placeholder;
+      }
+    }
+    input.id = 'pp-' + f.key;
+    input.dataset.key = f.key;
+    input.dataset.type = type;
+    input.dataset.label = f.label || f.key;
+    if(f.required) input.dataset.required = '1';
+    if(values['_has_' + f.key]) input.dataset.has = '1';
+    box.appendChild(input);
+    if(pop) box.appendChild(pop);
+    fieldsEl.appendChild(box);
+  }
+  fieldsEl.style.display = fields.length ? '' : 'none';
+  saveBtn.textContent = schema.save_label || '保存插件配置';
+  saveBtn.style.display = fields.length ? '' : 'none';
+  saveBtn.onclick = () => savePluginPanel(p.id);
+  const actionsEl = $('pluginPanelActions');
+  actionsEl.innerHTML = '';
+  for(const a of (schema.actions || [])){
+    const btn = document.createElement('button');
+    btn.className = 'act sec';
+    btn.style.marginRight = '8px';
+    btn.textContent = a.label || a.key;
+    btn.onclick = () => runPluginAction(p.id, a.key);
+    actionsEl.appendChild(btn);
+  }
+  const conflict = p.conflict_note ? '⚠ ' + p.conflict_note + ' ' : '';
+  $('pluginPanelHint').textContent = conflict + (schema.hint || (fields.length ? '' : '该插件暂无额外配置。'));
+}
+async function runPluginAction(id, key){
+  try{
+    const d = await post('/api/plugins/panel/action', {id, key});
+    toast(d.detail || '已执行');
+    await loadPlugins();
+    if(currentPluginDetailId) openPluginDetail(currentPluginDetailId);
+  }catch(e){ toast('执行失败：' + e.message); }
+}
+function pluginPanelStatusValues(p){
+  const schema = (p.panel && p.panel.schema) || {};
+  const values = (p.panel && p.panel.values) || {};
+  const live = values._status || {};
+  for(const row of (schema.status || [])){
+    const el = $('pst-' + row.key);
+    if(el) el.textContent = live[row.key] ?? '—';
+  }
+}
+async function savePluginPanel(id){  const values = {};
+  const missing = [];
+  for(const input of document.querySelectorAll('#pluginPanelFields [data-key]')){
+    const key = input.dataset.key;
+    const type = input.dataset.type || 'text';
+    let value = type === 'bool' ? !!input.checked : String(input.value ?? '').trim();
+    if(type === 'password' && !value){
+      if(input.dataset.required && input.dataset.has !== '1') missing.push(input.dataset.label || key);
+      continue;
+    }
+    if(input.dataset.required && !value) missing.push(input.dataset.label || key);
+    if(type === 'number' && value !== '') value = Number(value);
+    values[key] = value;
+  }
+  if(missing.length){
+    toast('还需要填写：' + missing.join('、'));
+    return;
+  }
+  try{
+    await post('/api/plugins/panel', {id, values});
+    toast('插件配置已保存');
+    await loadPlugins();
+    openPluginDetail(id);
+  }catch(e){ toast('保存失败：' + e.message); }
 }
 function closePluginDetail(){
   currentPluginDetailId = null;
@@ -919,23 +1079,6 @@ $('btnSavePanel').onclick = async () => {
     toast('面板端口已保存为 ' + p + '，下次启动生效');
   }catch(e){ toast('保存失败：'+e.message); }
 };
-$('btnSaveNapcat').onclick = async () => {
-  if(!ensureRequired([
-    ['q-group', '主动发言群号'],
-    ['q-token', 'NapCat 鉴权 Token'],
-    ['q-http', 'NapCat HTTP 接口地址'],
-  ])) return;
-  try{
-    await post('/api/config', {
-      bot_qq:$('q-bot').value.trim(),
-      active_group_id:$('q-group').value.trim(),
-      napcat_token:$('q-token').value.trim(),
-      napcat_http_url:$('q-http').value.trim(),
-    });
-    toast('NapCat 设置已保存并热刷新');
-    refreshStats();
-  }catch(e){ toast('保存失败：'+e.message); }
-};
 $('btnSaveBio').onclick = async () => {
   const num = (id) => { const v = parseFloat($(id).value); return isFinite(v) ? v : undefined; };
   try{
@@ -946,6 +1089,7 @@ $('btnSaveBio').onclick = async () => {
       biorhythm_wake_threshold: num('f-wake'),
       biorhythm_rhythm_weight: num('f-rw'),
       biorhythm_idle_to_sleep: num('f-idle'),
+      biorhythm_never_sleep: $('f-never-sleep').checked,
     });
     toast('生物钟参数已保存并热加载');
   }catch(e){ toast('保存失败：'+e.message); }
@@ -1022,6 +1166,24 @@ refreshStats();
 loadConfig();
 loadPlugins();
 setInterval(refreshStats, 500);
+// 插件页显示时轮询运行状态：自动启动/初始化完成后按钮会自动变成“停止”。
+setInterval(() => {
+  const page = $('page-plugins');
+  if(!page || !page.classList.contains('active')) return;
+  if($('pluginDetailPanel').style.display !== 'none') return;
+  refreshPluginRunning();
+}, 2000);
+// 插件详情页打开时，每 3 秒刷新一次状态行（不改动用户正在编辑的字段）。
+setInterval(async () => {
+  if(!currentPluginDetailId) return;
+  if($('pluginDetailPanel').style.display === 'none') return;
+  try{
+    const d = await getJSON('/api/plugins');
+    pluginCache = d.plugins || [];
+    const p = pluginCache.find(x => x.id === currentPluginDetailId);
+    if(p) pluginPanelStatusValues(p);
+  }catch(e){ /* 状态刷新失败不影响操作 */ }
+}, 3000);
 </script>
 </body>
 </html>

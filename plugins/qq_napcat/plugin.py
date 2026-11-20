@@ -80,6 +80,10 @@ class QQNapCatPlugin(Plugin):
     def channel(self):
         return QQNapCatChannel()
 
+    def delegates_reading(self) -> bool:
+        """qq_reader_mode=desktop 且真实窗口已打开时，把内容读取交给电脑插件。"""
+        return runtime._external_reader_active()
+
     async def start(self) -> None:
         # 复用面板已有的线程管理（初始化 Ollama/记忆、启动后台事件循环）
         import panel_runtime

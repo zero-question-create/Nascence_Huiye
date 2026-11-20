@@ -606,6 +606,50 @@ class Runtime:
                 self._start_cognitive_thread()
             except Exception:
                 logging.exception("全局认知循环启动失败（面板仍可用）")
+            # 按上次面板关闭前的启停状态恢复插件服务（用户点过“启动”的才恢复）。
+            try:
+                self._start_autostart_plugins()
+            except Exception:
+                logging.exception("插件自动启动调度失败（面板仍可用）")
+
+    def _start_autostart_plugins(self):
+        """面板启动后，自动拉起上次处于“运行中”的插件。"""
+        try:
+            from plugins import registry
+
+            cfg = registry.load_config()
+            entries = cfg.get("plugins") or {}
+            targets = [
+                pid for pid in registry.plugin_ids()
+                if (entries.get(pid) or {}).get("enabled")
+                and (entries.get(pid) or {}).get("autostart")
+            ]
+        except Exception:
+            logging.exception("读取插件自动启动配置失败")
+            return
+        if not targets:
+            return
+
+        def _run():
+            import asyncio
+
+            for plugin_id in targets:
+                if getattr(self, "shutdown_requested", False):
+                    break
+                try:
+                    from plugins import registry as reg
+
+                    plugin = reg.get_plugin(plugin_id)
+                    if plugin is None or not getattr(plugin, "implemented", True):
+                        continue
+                    if plugin.is_running():
+                        continue
+                    asyncio.run(plugin.start())
+                    logging.info("[插件] 已按上次状态自动启动：%s", plugin_id)
+                except Exception:
+                    logging.exception("[插件] 自动启动失败：%s", plugin_id)
+
+        threading.Thread(target=_run, name="PluginAutostart", daemon=True).start()
 
     def _start_cognitive_thread(self):
         """启动全局唯一认知循环（幂等；不依赖 QQ/微信连接）。"""
@@ -809,11 +853,35 @@ class Runtime:
         save_state()
         logging.info("记忆和对话状态已完整保存")
 
+    def _stop_all_plugins(self):
+        """面板关停时，把所有处于运行中的插件一起停掉（避免留下工作桌面孤儿进程）。"""
+        try:
+            import asyncio
+
+            from plugins import registry
+
+            entries = (registry.load_config().get("plugins") or {})
+            for plugin_id in registry.plugin_ids():
+                plugin = registry.get_plugin(plugin_id)
+                if plugin is None or not getattr(plugin, "implemented", True):
+                    continue
+                entry = entries.get(plugin_id) or {}
+                try:
+                    if not entry.get("autostart") and not plugin.is_running():
+                        continue
+                    asyncio.run(plugin.stop())
+                    logging.info("[插件] 已随面板停止：%s", plugin_id)
+                except Exception:
+                    logging.exception("[插件] 停止失败：%s", plugin_id)
+        except Exception:
+            logging.exception("停止插件时出错")
+
     def shutdown(self):
         if self._shutdown_done:
             return
         self._shutdown_done = True
         logging.info("控制面板正在停止全部服务")
+        self._stop_all_plugins()
         self.stop_cognitive()
         self.stop_qq()
         try:
@@ -870,6 +938,8 @@ def reload_biorhythm_params():
     try:
         from core import biorhythm as _bio
         _bio._load_params()
+        # “永不会困”开关的生效/恢复也在这里处理。
+        _bio.BIORHYTHM.apply_config()
     except Exception:
         logging.exception("生物钟参数热加载失败")
 

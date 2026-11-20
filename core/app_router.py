@@ -143,13 +143,16 @@ class LocalAppRouter:
             return {"action": "open_app", "app_id": str(target.get("id") or "")}
 
         app = open_apps[0]
+        # 还有未读时不要自动退出对话；否则刚打开就关，消息会“消失”。
+        if int(app.get("unread") or 0) > 0:
+            return None
         if not app.get("current_conversation"):
-            if self._idle_rounds >= max(1, _cfg_int("app_close_idle_rounds", 30)):
+            if self._idle_rounds >= max(1, _cfg_int("app_close_idle_rounds", 240)):
                 return {"action": "close_app", "app_id": str(app.get("id") or "")}
             return None
 
-        close_conv_at = max(1, _cfg_int("app_close_conversation_idle_rounds", 15))
-        close_app_at = max(close_conv_at + 1, _cfg_int("app_close_idle_rounds", 30))
+        close_conv_at = max(1, _cfg_int("app_close_conversation_idle_rounds", 120))
+        close_app_at = max(close_conv_at + 1, _cfg_int("app_close_idle_rounds", 240))
         if self._idle_rounds >= close_app_at:
             return {"action": "close_app", "app_id": str(app.get("id") or "")}
         if self._idle_rounds >= close_conv_at:

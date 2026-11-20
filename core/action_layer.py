@@ -27,7 +27,10 @@ from utils.monitor import append_log
 
 DEFAULT_MAX_PAGES = 4    # 单个动作类型的翻页上限，超过强制结束抉择
 DEFAULT_PAGE_SIZE = 8    # 每页候选数量
-APP_ACTIONS = {"open_conversation", "read_earlier", "scroll_to_bottom", "close_conversation", "close_app"}
+APP_ACTIONS = {
+    "open_conversation", "read_earlier", "scroll_to_bottom",
+    "close_conversation", "close_app", "app_do",
+}
 VALID_ACTIONS = {
     "none", "image", "sticker",
     "image_next_page", "sticker_next_page",
@@ -117,7 +120,8 @@ def _pending_text() -> str:
     return "\n".join(lines)
 
 
-def _system_prompt(has_apps: bool = False) -> str:
+def _system_prompt(has_apps: bool = False, extra_actions: dict = None) -> str:
+    extra_actions = extra_actions if isinstance(extra_actions, dict) else {}
     parts = [
         f"你是{BOT_NAME}的冲动决策层，只决定此刻要不要做一个小动作。\n\n",
         "可用动作（每次只输出一个 JSON）：\n"
@@ -138,7 +142,18 @@ def _system_prompt(has_apps: bool = False) -> str:
             "- {\"action\":\"scroll_to_bottom\"}\n"
             "- {\"action\":\"close_conversation\"}\n"
             "- {\"action\":\"close_app\"}\n"
+            "- {\"action\":\"app_do\",\"task\":\"要它替我做的一件事\"}\n"
         )
+    if extra_actions:
+        lines = ["\n插件自述动作（软件支持时）：\n"]
+        for name, example in extra_actions.items():
+            name = str(name or "").strip()
+            if not name:
+                continue
+            default_example = '{"action":"%s"}' % name
+            lines.append(f"- {example or default_example}\n")
+        if len(lines) > 1:
+            parts.append("".join(lines))
     parts.append(
         "\n规则：\n"
         "1. 只输出 JSON，不加解释、不加多余字段。\n"
@@ -152,7 +167,10 @@ def _system_prompt(has_apps: bool = False) -> str:
             "6. 只有软件已经打开时才会询问软件内动作；打开软件由本地层负责，不要输出 open_app。\n"
             "7. 翻看更早用 read_earlier；不确定是否到底部时看【我的软件】里的状态，"
             "不在底部可以用 scroll_to_bottom 回到最新消息。\n"
-            "8. 看完/不想看时先 close_conversation 回软件首页；长时间不用再 close_app 退出软件。\n"
+            "8. 对话保持打开：不要读完/发完就 close_conversation；等待对方回复期间保持当前对话。"
+            "只有对方明确让你退出/换对话，或确实长时间不用时才 close_conversation / close_app。\n"
+            "9. app_do 只用来让标着“可动手”的软件替你完成一件事：task 写清楚要做什么，"
+            "不要写平台细节，也不要一次交代多件事。\n"
         )
     return "".join(parts)
 
@@ -200,8 +218,19 @@ def _apps_text(apps: list) -> str:
         app_id = str(app.get("id") or "")
         label = str(app.get("label") or app_id)
         opened = bool(app.get("open"))
+        actionable = bool(app.get("actionable"))
         unread = int(app.get("unread") or 0)
-        head = f"- {label}（{app_id}）：{'已打开' if opened else '未打开'}"
+        workspace = app.get("workspace") or {}
+        state_text = "已打开" if opened else ("工具软件" if actionable else "未打开")
+        head = f"- {label}（{app_id}）：{state_text}"
+        if actionable:
+            head += "，可动手（可用 app_do 交任务）"
+            if workspace.get("running"):
+                head += "，工作桌面已打开"
+                if int(workspace.get("windows") or 0):
+                    head += f"（{int(workspace['windows'])} 个窗口）"
+        if app.get("busy"):
+            head += f"，正在操作：{app.get('task') or '一件事'}"
         if not opened and unread:
             head += f"，{unread} 条未读"
         lines.append(head)
@@ -298,7 +327,8 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
 
 def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
                   keywords: list = None, context_hint: str = "", profile=None,
-                  apps: list = None, language_trace: str = "") -> dict:
+                  apps: list = None, language_trace: str = "",
+                  extra_actions: dict = None) -> dict:
     """执行一次动作抉择（含翻页子对话）。阻塞式，请在线程池中调用。
 
     profile: 插件配置的动作 LLM（core.llm_profile.LLMProfile）；None 走全局 primary。
@@ -322,7 +352,7 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
         return {"action": "none", "detail": ""}
 
     messages = [
-        {"role": "system", "content": _system_prompt(bool(apps))},
+        {"role": "system", "content": _system_prompt(bool(apps), extra_actions)},
         {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords,
                                                  context_hint, images=images, stickers=stickers,
                                                  apps=apps, language_trace=language_trace)},
@@ -379,12 +409,18 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
         raw_id = str(data.get("id") or "")
         if action == "open_conversation":
             conversation = conversation or raw_id
-        return {
+        result = {
             "action": action,
             "detail": "",
             "app_id": app_id,
             "conversation": conversation,
         }
+        if action == "app_do":
+            task = str(data.get("task") or data.get("text") or "").strip()
+            if not task:
+                return {"action": "none", "detail": ""}
+            result["task"] = task
+        return result
 
     if action in ("image", "sticker"):
         kind = ASSETS.IMAGE if action == "image" else ASSETS.STICKER

@@ -153,8 +153,21 @@ class Biorhythm:
         self._late_sleep_guard = False  # 作息入睡但节律已弱时，交回自然醒判定
         self.last_guard_wake = False    # 上一次醒来是否由安全阀触发（供观测）
         self.last_activity = time.time() # 最近一次外部活动（群消息）时刻，用于安静检测
+        # “永不会困”：勾选时不推进睡眠压力、不会入睡；取消时恢复到启动时的精力。
+        self._never_sleep = False
+        self._startup_energy = 1.0
         _load_params()
+        # 先读开关再 load()：否则离线补算会在“永不会困”期间继续累积睡眠压力。
+        want_never = bool(config.get("biorhythm_never_sleep", False))
+        self._never_sleep = want_never
         self.load()
+        # 启动精力按压力本身算（never_sleep 时 energy 属性会返回 1.0）。
+        self._startup_energy = max(0.0, min(1.0, 1.0 - self.s))
+        if want_never:
+            self.state = "awake"
+            self.sleep_hold_until = 0.0
+            self.awake_until = 0.0
+            self.last_tick = time.time()
 
 
     # ---------- 核心推进 ----------
@@ -179,6 +192,9 @@ class Biorhythm:
 
     def _advance(self, dt: float, now: float):
         """推进 dt 秒（dt <= MAX_STEP），期间可能发生入睡/醒来转换。"""
+        if self._never_sleep:
+            # 永不会困：压力保持不动，也不做入睡判定。
+            return
         if self.state in ("awake", "wind_down"):
             self.s = 1.0 - (1.0 - self.s) * math.exp(-dt / T_WAKE)
             self._maybe_sleep(now)
@@ -186,6 +202,36 @@ class Biorhythm:
             self.s = self.s * math.exp(-dt / T_SLEEP)
             self._sample_rhythm(now)
             self._maybe_wake(now)
+
+    def apply_config(self):
+        """应用“永不会困”开关（配置热加载/启动时调用）。
+
+        - 勾选：立刻醒来、状态回到 awake；压力不再推进，精力显示为满。
+        - 取消：把睡眠压力恢复到**启动时**的精力对应的值。
+        """
+        with self._lock:
+            enabled = bool(config.get("biorhythm_never_sleep", False))
+            was = self._never_sleep
+            if enabled == was:
+                return
+            self._never_sleep = enabled
+            if enabled:
+                if self.state == "asleep":
+                    self._wake_internal(time.time())
+                self.state = "awake"
+                self.sleep_hold_until = 0.0
+                self.awake_until = 0.0
+                self.last_tick = time.time()
+            elif was:
+                self.s = max(0.0, min(1.0, 1.0 - self._startup_energy))
+                self.state = "awake"
+                self.sleep_hold_until = 0.0
+                self.awake_until = 0.0
+                self.last_tick = time.time()
+            try:
+                self.save()
+            except Exception as e:
+                append_log(f"[生物钟] 保存“永不会困”状态失败: {e}")
 
     # ---------- 作息惯性 ----------
     def circadian(self, ts: float = None) -> float:
@@ -212,6 +258,8 @@ class Biorhythm:
 
     def sleep_drive(self, ts: float = None) -> float:
         """睡前总驱力 = 睡眠压力 + 作息助力。纯诊断用，判定走 _maybe_sleep。"""
+        if self._never_sleep:
+            return 0.0
         return self.s + RHYTHM_WEIGHT * self.circadian(ts) * self.rhythm_confidence()
 
     def rhythm_hours(self, threshold: float = 0.5) -> list:
@@ -451,10 +499,12 @@ class Biorhythm:
     @property
     def energy(self) -> float:
         """精力 ∈ [0,1]，睡眠压力越低越有精神。"""
+        if self._never_sleep:
+            return 1.0
         return max(0.0, min(1.0, 1.0 - self.s))
 
     def is_asleep(self) -> bool:
-        return self.state == "asleep"
+        return self.state == "asleep" and not self._never_sleep
 
     def is_winding_down(self) -> bool:
         return self.state == "wind_down"
@@ -479,6 +529,8 @@ class Biorhythm:
         """
         now = time.time()
         with self._lock:
+            if self._never_sleep:
+                return None
             if self.state == "wind_down":
                 last_onset = self.last_onset or 0
                 if self.last_pre_sleep_time > last_onset:
@@ -519,6 +571,8 @@ class Biorhythm:
         避免认知循环每几秒反复自我催眠。
         """
         now = time.time()
+        if self._never_sleep:
+            return None
         if not self._in_wake_window(now):
             return None
         # 本次醒来是否已提过一次。
@@ -565,6 +619,8 @@ class Biorhythm:
             "by_rhythm": self._by_rhythm,
             "wake_generation": self.wake_generation,
             "woke_by_user": self.woke_by_user,
+            "never_sleep": self._never_sleep,
+            "startup_energy": round(self._startup_energy, 3),
         }
 
     # ---------- 持久化 ----------

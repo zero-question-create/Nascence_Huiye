@@ -660,23 +660,15 @@ def generate_response(user_input: str, current_speaker: str = None,
         # 去掉句末句号（入库之前，只去末尾这一个）
         reply = _strip_trailing_period(reply)
 
-        # 尊重 say 决策：此前只读 text、忽略 say，把"内心话"也当成公开回复
-        # 返回并记成"我说"，导致 CLI 会把纯内心独白显示出来（F10）。
-        if should_speak:
-            if current_speaker:
-                reply_memory = f"我告诉{current_speaker}，{reply}"
-            else:
-                reply_memory = f"我说，{reply}"
-        else:
-            # 未发言：记为"我想"，调用方据此决定不公开显示
-            reply_memory = f"我想：{reply}"
+        # 理解层的回复统一记为“我想”；say 只作为插件是否发送的参考。
+        reply_memory = f"我想：{reply}"
 
         bot_mem_id = create_memory(reply_memory)
         user_mem_ids.append(bot_mem_id)
         if len(user_mem_ids) > 1:
             add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
         # 与全局认知循环一致：自己的近期想法进入 4~6 条短期窗口。
-        SHORT_TERM.add_thought(reply, bool(should_speak))
+        SHORT_TERM.add_thought(reply, False)
     return reply, user_input, user_mem_ids, should_speak
 
 def reset_dialogue():
@@ -896,14 +888,26 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     from .action_layer import note_enabled
     apps = APP_CONTEXT.prompt_state()
     open_apps = [app for app in apps if app.get("open")]
-    # 行为模型只在软件已打开时参与；打开/退出软件由本地 AppRouter 负责。
-    # 没有打开的软件时，认知循环只思考，不执行任何插件行为。
-    if not open_apps:
+    # 行为模型只在有软件可用时参与；打开/退出软件由本地 AppRouter 负责。
+    # “可动手”的工具型软件（电脑/虚拟桌面）不要求先打开：
+    # 它由 app_do 任务自己启动工作区，不算绕过本地门控。
+    action_apps = open_apps + [
+        app for app in apps if app.get("actionable") and not app.get("open")
+    ]
+    if not action_apps:
         return None
     has_app_action = True
     if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled() or has_app_action):
         return None
-    action_apps = open_apps
+    extra_actions = {}
+    try:
+        from plugins import registry as _plugin_registry
+        for app in action_apps:
+            plugin = _plugin_registry.get_plugin(str(app.get("id") or ""))
+            if plugin is not None:
+                extra_actions.update(plugin.extra_actions() or {})
+    except Exception:
+        extra_actions = {}
 
     # 调用门槛：不再因为“有 keywords”就每轮都问一次动作层。
     # 旧条件是 `talk_sent or keywords`，而关键词几乎每轮都有，等价于每轮必调。
@@ -946,6 +950,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
             profile=profile,
             apps=action_apps,
             language_trace=language_trace,
+            extra_actions=extra_actions,
         )
     )
     if not result:
@@ -1420,23 +1425,19 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 #await asyncio.sleep(3)
                 continue
 
-            # 她自己的近期想法进入短期记忆窗口（4~6 条），
-            # 不再用“最近 4~6 条别人的消息”当短期窗口锚点。
-            # 发送结果要等 Step 6 才知道，所以“我说/我想”先按是否有发送目标判断；
-            # 真正的短期标签在发送后按 talk_sent 写入。
-            # 只有当前打开软件的插件通道才允许发送；没有软件时只思考。
+            # 她自己的近期想法进入短期记忆窗口（4~6 条）；
+            # 理解层回复统一按“想”记录，是否真的发送由插件结果单独记录。
             target_group, can_send = _resolve_send_target(
                 round_channel, target_group_id,
             )
-            attempted_speech = bool(should_speak and target_group and can_send)
 
             # ============================
             # Step 5: 存入记忆库
             # ============================
-            if attempted_speech:
-                memory_text = f"我说：{thought_text}"
-            else:
-                memory_text = f"我想：{thought_text}"
+            # 理解层的所有回复都先记为“我想”。
+            # say 只是给插件/发送层的参考，不改变记忆语义；真正送没送到
+            # 由 Step 6 的历史和发送日志记录。
+            memory_text = f"我想：{thought_text}"
 
             # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环；
             # 同一次写入里把她的回复追加到刚刚归入的概念，让"你上次说什么"也能召回。
@@ -1454,7 +1455,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             mem_id = await loop.run_in_executor(None, _write_reply_memory)
             _shallow_pool.append(mem_id)
 
-            append_log(f"[认知循环] {'【发言】' if should_speak else '【内心】'}: {thought_text}")
+            append_log(f"[认知循环] 【回复】: {thought_text}")
 
             # ============================
             # Step 6: 发送消息（若应发言）
@@ -1488,10 +1489,57 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 _emit_outbound(round_channel, thought_text, "text")
                 APP_ROUTER.note_activity()
             elif should_speak and round_channel is None:
-                append_log("[认知循环] 没有打开软件，say=true 只作为想说的话保留")
+                # 没有“当前软件通道”时，按实际前台决定落点：
+                # QQ 窗口在前台就发 QQ；否则才写进虚拟桌面记事本。
+                delivered = False
+                try:
+                    from plugins import registry
 
-            # 短期里的“我说/我想”以实际送达为准；没发出去就是只在心里想。
-            SHORT_TERM.add_thought(thought_text, bool(talk_sent))
+                    qq_plugin = registry.get_plugin("qq_desktop")
+                    if (
+                        qq_plugin is not None
+                        and qq_plugin.is_running()
+                        and qq_plugin.window_hwnd()
+                        and qq_plugin.window_foreground()
+                    ):
+                        qq_channel = qq_plugin.channel()
+                        qq_target = (
+                            qq_channel.resolve_target()
+                            if qq_channel is not None
+                            else qq_plugin.current_conversation()
+                        )
+                        delivered = bool(
+                            await qq_plugin.send_text_to_current(
+                                qq_target, thought_text
+                            )
+                        )
+                        if delivered:
+                            talk_sent = True
+                            add_to_history(None, None, thought_text)
+                            append_log("[认知循环] 没有软件通道，已把回复发到当前前台 QQ 会话")
+                except Exception as e:
+                    append_log(f"[认知循环] 发送到前台 QQ 失败: {e}")
+
+                if not delivered:
+                    try:
+                        plugin = registry.get_plugin("desktop")
+                        if plugin is not None and plugin.is_running():
+                            delivered = bool(
+                                await loop.run_in_executor(
+                                    None, plugin.deliver_text, thought_text
+                                )
+                            )
+                    except Exception as e:
+                        append_log(f"[认知循环] 写入虚拟桌面记事本失败: {e}")
+                    if delivered:
+                        talk_sent = True
+                        add_to_history(None, None, thought_text)
+                        append_log("[认知循环] 没有聊天通道，已把回复写进虚拟桌面记事本")
+                    else:
+                        append_log("[认知循环] 没有聊天通道，say=true 只作为想说的话保留")
+
+            # 短期里也统一记为“想”：say 只控制插件要不要发送。
+            SHORT_TERM.add_thought(thought_text, False)
 
             # ============================
             # Step 6b: 动作抉择（本能冲动，本轮最后一步）

@@ -421,6 +421,70 @@ def _app_record_message(group_id: str, message_id: str, line: str, push: bool = 
     return True
 
 
+def _external_reader_active() -> bool:
+    """是否由电脑插件代读窗口；true 时 QQ 只维护未读，不再自己解析正文。"""
+    try:
+        mode = str(config.get("qq_reader_mode", "auto")).lower()
+    except Exception:
+        mode = "auto"
+    if mode == "self":
+        return False
+    try:
+        from plugins import registry
+
+        plugin = registry.get_plugin("desktop")
+        if plugin is None:
+            return False
+        provides = getattr(plugin, "provides_reading", None)
+        if not callable(provides) or not provides():
+            return False
+        # auto/self 都走平台自己的事件与记忆；只有显式 desktop 才读窗口，
+        # 避免把用户自己登录的另一个账号当成机器人账号。
+        if mode != "desktop":
+            return False
+        # 只有真实窗口已经开着才代读；绝不自动登录（会把 NapCat 顶号）。
+        try:
+            if not plugin.has_app_window("qq_napcat"):
+                return False
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _fetch_history_into_buffer(group_id: str, count: int = 10) -> int:
+    """直接向 NapCat 拉最近历史，补上离线/断线期间漏掉的消息。
+
+    这是 NapCat 的 Action 接口，不涉及登录客户端，不会被顶号。
+    """
+    websocket = _napcat_websocket
+    if websocket is None or not group_id:
+        return 0
+    try:
+        data = await _call_action(
+            websocket, "get_group_msg_history",
+            {"group_id": group_id, "count": int(count)}, timeout=10.0,
+        )
+    except Exception:
+        return 0
+    payload = (data or {}).get("data") or {}
+    messages = payload.get("messages") or []
+    added = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        msg.setdefault("group_id", group_id)
+        msg.setdefault("message_type", "group")
+        msg.setdefault("post_type", "message")
+        try:
+            if app_buffer_message(msg):
+                added += 1
+        except Exception:
+            continue
+    return added
+
+
 async def app_open() -> dict:
     """打开 QQ：只告知未读，不自动把正文塞给主进程。"""
     global _app_open
@@ -478,6 +542,17 @@ async def app_open_conversation(group_id: str) -> dict:
     if not known:
         return {"ok": False, "detail": f"找不到对话 {group_id}"}
 
+    # 缓冲里没有、也没有读过的记录时，直接向 NapCat 拉最近历史补齐。
+    # 这是 Action 接口，不需要启动/登录 QQ 客户端，不会被顶号。
+    with _app_lock:
+        has_pending = bool(_app_buffer.get(group_id))
+        has_transcript = bool(_app_transcript.get(group_id))
+    if not has_pending and not has_transcript:
+        try:
+            await _fetch_history_into_buffer(group_id, 10)
+        except Exception:
+            pass
+
     with _app_lock:
         _app_current_group = group_id
         pending = list(_app_buffer.pop(group_id, []))
@@ -512,27 +587,35 @@ async def app_open_conversation(group_id: str) -> dict:
         recent = list(transcript)[-6:]
 
     # 正文解析（理解层、媒体、记忆写入）在后台进行，不阻塞打开动作。
-    for _mid, data, _preview in pending:
-        task = asyncio.create_task(handle_group_message(data, from_flush=True))
-        _app_flush_tasks.add(task)
-        task.add_done_callback(_app_flush_tasks.discard)
+    # 如果电脑插件负责读窗口，这里只维护 transcript，不再调用平台理解层。
+    delegate = _external_reader_active()
+    if not delegate:
+        for _mid, data, _preview in pending:
+            task = asyncio.create_task(handle_group_message(data, from_flush=True))
+            _app_flush_tasks.add(task)
+            task.add_done_callback(_app_flush_tasks.discard)
 
     label = _conversation_label(group_id)
-    if previews:
-        detail = f"我点开了{label}的对话，看到 {len(previews)} 条未读"
+    if delegate:
+        detail = f"我点开了{label}的对话，让电脑看看窗口"
+        content_lines = []
     else:
-        detail = f"我点开了{label}的对话"
+        if previews:
+            detail = f"我点开了{label}的对话，看到 {len(previews)} 条未读"
+        else:
+            detail = f"我点开了{label}的对话"
+        content_lines = list(recent[-6:])
+        transcript_set = set(transcript)
+        for line in previews[-8:]:
+            if line not in transcript_set and line not in content_lines:
+                content_lines.append(line)
+        content_lines = content_lines[-12:]
     logger.info(f"[QQ软件] {detail}")
-    content_lines = list(recent[-6:])
-    transcript_set = set(transcript)
-    for line in previews[-8:]:
-        if line not in transcript_set and line not in content_lines:
-            content_lines.append(line)
     return {
         "ok": True,
         "detail": detail,
         "conversation": group_id,
-        "content_lines": content_lines[-12:],
+        "content_lines": content_lines,
     }
 
 
@@ -2492,12 +2575,12 @@ async def ws_handler(websocket):
                     if group_id not in manifest.whitelist:
                         logger.debug(f"群 {group_id} 不在白名单，忽略")
                         continue
-                    if app_can_read(group_id):
+                    if app_can_read(group_id) and not _external_reader_active():
                         task = asyncio.create_task(handle_group_message(data))
                         message_tasks.add(task)
                         task.add_done_callback(message_tasks.discard)
                     else:
-                        # 软件未打开或不在这个对话：只累计未读，不解析正文
+                        # 未打开 / 不在这个对话 / 由电脑插件代读：只累计未读，不解析正文
                         app_buffer_message(data)
             except json.JSONDecodeError:
                 logger.warning("收到非JSON消息")

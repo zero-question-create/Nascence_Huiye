@@ -33,6 +33,7 @@ class AppContext:
         self._max_lines = max(5, int(max_lines)) if max_lines else _max_lines_from_config()
         self._entries: deque = deque(maxlen=self._max_lines)
         self._notifications: dict = {}
+        self._states: dict = {}
         self._current_app = ""
         self._current_conversation = ""
 
@@ -43,14 +44,56 @@ class AppContext:
         if not text:
             return
         real_ts = clock.to_real_time(clock.now())
+        line = f"[现在] {text}"
         with self._lock:
-            self._entries.append((real_ts, f"[现在] {text}"))
+            # 同一段内容被连续轮询重复送来时只保留一条；这不是消息去重，
+            # 只挡住紧挨着的同一行，不会吞掉隔开的重复消息。
+            if self._entries and self._entries[-1][1] == line:
+                return
+            self._entries.append((real_ts, line))
+
+    def remember_state(self, key: str, text: str):
+        """按 key 保存“当前状态”，同 key 覆盖而不是追加。
+
+        桌面概览、任务进度这类每轮都成立的状态用这个接口，
+        避免像 remember 那样越积越多、每轮重复并入提示词。
+        传空字符串表示清除该状态。
+        """
+        key = str(key or "").strip()
+        if not key:
+            return
+        text = str(text or "").strip()
+        with self._lock:
+            if not text:
+                self._states.pop(key, None)
+                return
+            real_ts = clock.to_real_time(clock.now())
+            self._states[key] = (real_ts, f"[现在] {text}")
+
+    def state_text(self, key: str) -> str:
+        with self._lock:
+            item = self._states.get(str(key or "").strip())
+            return item[1] if item else ""
+
+    def forget_prefix(self, prefixes) -> int:
+        """删除以指定前缀开头的追加条目（不动 states / 其他插件上下文）。"""
+        prefixes = tuple(str(p or "") for p in (prefixes or ()) if str(p or ""))
+        if not prefixes:
+            return 0
+        with self._lock:
+            before = len(self._entries)
+            self._entries = [
+                (ts, text) for ts, text in self._entries
+                if not text.startswith(prefixes)
+            ]
+            return before - len(self._entries)
 
     def snapshot(self) -> List[Tuple[float, str]]:
         """返回 (时间戳, 文本)，供行为思考作为 pinned 记忆。"""
         with self._lock:
             real_ts = clock.to_real_time(clock.now())
-            lines = [(real_ts, text) for text in self._notifications.values()]
+            lines = list(self._states.values())
+            lines.extend((real_ts, text) for text in self._notifications.values())
             lines.extend(self._entries)
             return lines
 
@@ -66,6 +109,8 @@ class AppContext:
                 return next(iter(self._notifications.values()))
             if self._entries:
                 return self._entries[-1][1]
+            if self._states:
+                return max(self._states.values(), key=lambda item: item[0])[1]
         return ""
 
     def last_content_ts(self) -> float:
@@ -75,12 +120,13 @@ class AppContext:
 
     def has_context(self) -> bool:
         with self._lock:
-            return bool(self._notifications or self._entries)
+            return bool(self._states or self._notifications or self._entries)
 
     def clear(self):
         with self._lock:
             self._entries.clear()
             self._notifications.clear()
+            self._states.clear()
             self._current_app = ""
             self._current_conversation = ""
 
@@ -120,6 +166,10 @@ class AppContext:
                 "unread": int(state.get("unread") or 0),
                 "current_conversation": str(state.get("current_conversation") or ""),
                 "at_bottom": state.get("at_bottom"),
+                "actionable": bool(plugin.available_for_actions()),
+                "busy": bool(state.get("busy")),
+                "task": str(state.get("task") or ""),
+                "workspace": state.get("workspace") or {},
                 "conversations": list(state.get("conversations") or [])[:10],
             }
             result.append(item)
@@ -262,6 +312,31 @@ class AppContext:
         self.remember(message)
         return message
 
+    async def _observe_with_reader(self) -> None:
+        """软件打开后，让“会看窗口”的插件（电脑）读一眼当前窗口。
+
+        只有当前软件显式声明 delegates_reading() 时才读；平台插件默认自己解析。
+        """
+        app_id = self.current_app
+        if not app_id:
+            return
+        app_plugin = self._plugin_for(app_id)
+        if app_plugin is None:
+            return
+        try:
+            if not app_plugin.delegates_reading():
+                return
+        except Exception:
+            return
+        for plugin in self._plugins():
+            try:
+                if not plugin.provides_reading():
+                    continue
+                await plugin.observe_app(app_id)
+                return
+            except Exception:
+                continue
+
     async def execute(self, action: str, data: dict) -> str:
         """执行动作层选出的软件动作，并把结果写入软件上下文。"""
         data = data if isinstance(data, dict) else {}
@@ -280,6 +355,7 @@ class AppContext:
                     if current:
                         with self._lock:
                             self._current_conversation = current
+                    await self._observe_with_reader()
                 return self._remember_result(res)
 
             if action == "close_app":
@@ -293,6 +369,7 @@ class AppContext:
                 with self._lock:
                     self._entries.clear()
                     self._notifications.clear()
+                    self._states.clear()
                     self._current_app = ""
                     self._current_conversation = ""
                 try:
@@ -316,6 +393,7 @@ class AppContext:
                         self._current_conversation = (
                             str(res.get("conversation") or "").strip() or conversation_id
                         )
+                    await self._observe_with_reader()
                 return self._remember_result(res)
 
             if action == "close_conversation":
@@ -333,6 +411,42 @@ class AppContext:
                     return self._fail("还没有打开软件")
                 res = await plugin.read_earlier(self.current_conversation)
                 return self._remember_result(res)
+
+            if action == "app_do":
+                # 通用任务接口：把一件事交给“可动手”的插件（电脑/虚拟桌面等）。
+                app_id = str(data.get("app_id") or "").strip()
+                plugin = self._plugin_for(app_id) if app_id else None
+                if plugin is None:
+                    # 模型没写 app_id 时，优先选声明了“可动手”的软件，
+                    # 而不是当前正开着的聊天软件。
+                    for candidate in self._plugins():
+                        try:
+                            if candidate.available_for_actions():
+                                plugin = candidate
+                                break
+                        except Exception:
+                            continue
+                if plugin is None:
+                    plugin = self._plugin_for(self.current_app)
+                if plugin is None:
+                    return self._fail("找不到这个软件")
+                task = str(data.get("task") or "").strip()
+                if not task:
+                    return self._fail("没有要交办的事")
+                res = await plugin.perform_task(task, context=self.latest_line())
+                return self._remember_result(res)
+
+            # 插件自述动作：动作名由 extra_actions() 声明，执行走 perform_action()。
+            app_id = str(data.get("app_id") or self.current_app or "").strip()
+            plugin = self._plugin_for(app_id)
+            if plugin is not None:
+                try:
+                    declared = plugin.extra_actions() or {}
+                except Exception:
+                    declared = {}
+                if action in declared:
+                    res = await plugin.perform_action(action, data)
+                    return self._remember_result(res)
 
             if action == "scroll_to_bottom":
                 plugin = self._plugin_for(self.current_app)

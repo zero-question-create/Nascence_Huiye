@@ -16,6 +16,7 @@ config/plugins.json
 config/qq_manifest.json
 config/bilibili_credentials.json
 config/wechat_manifest.json
+config/desktop_apps.json
 config/__pycache__/
 
 # 运行数据（记忆、向量索引、日志等）
@@ -33,6 +34,7 @@ ollama/
 # 运行时产物
 run/logs/
 run/control_panel.lock
+run/desktop_worker.json
 run/bat_temp.bat
 run/qt-plugins/
 run/lib/

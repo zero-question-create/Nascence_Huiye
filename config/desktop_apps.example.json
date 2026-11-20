@@ -1,0 +1,14 @@
+{
+  "notepad": {
+    "path": "C:\\Windows\\System32\\notepad.exe"
+  },
+  "记事本": {
+    "path": "C:\\Windows\\System32\\notepad.exe"
+  },
+  "edge": {
+    "path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+  },
+  "Edge": {
+    "path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+  }
+}

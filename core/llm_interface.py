@@ -551,10 +551,12 @@ def _sniff_image_mime(raw: bytes) -> str:
     return ""
 
 
-async def describe_image_from_path(image_path: str, prompt: str = None, max_chars: int = None) -> str:
+async def describe_image_from_path(image_path: str, prompt: str = None, max_chars: int = None,
+                                   max_tokens: int = 160, timeout: float = 30.0) -> str:
     """从本地路径读取图片，返回简短客观描述。
 
     - 默认使用短描述提示词，max_tokens=160，temperature=0；
+    - 视觉模型若是推理模型，调用方可以传更大的 max_tokens（如 3000）；
     - 相同文件 + 相同提示词命中内容哈希缓存，不再调用视觉模型；
     - max_chars 控制最终长度（图片 60、表情包 30），在标点处截断。
     """
@@ -615,9 +617,9 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
                         }
                     ],
                     stream=False,
-                    max_tokens=160,
+                    max_tokens=int(max_tokens),
                     temperature=0,
-                    timeout=30.0,
+                    timeout=float(timeout),
                 )
             )
         _record_usage("vision", response)

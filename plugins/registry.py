@@ -45,6 +45,7 @@ _DEFAULT_LLM = {
 
 _DEFAULT_PLUGIN = {
     "enabled": False,
+    "autostart": False,
     "llm": dict(_DEFAULT_LLM),
     "follow_global_behavior": True,
     "action_llm": dict(_DEFAULT_LLM),
@@ -66,6 +67,7 @@ _LOCK = threading.RLock()
 _config_cache: Optional[dict] = None
 _plugin_classes: Optional[Dict[str, Type[Plugin]]] = None
 _instances: Dict[str, Plugin] = {}
+_panel_cache: Dict[str, object] = {}
 
 
 def _logger():
@@ -80,6 +82,7 @@ def _normalize_entry(current, entry: dict) -> dict:
     """规范化单个插件配置；兼容旧配置并补齐行为模型字段。"""
     current = current if isinstance(current, dict) else {}
     current.setdefault("enabled", bool(entry.get("enabled", False)))
+    current.setdefault("autostart", bool(entry.get("autostart", False)))
     current.setdefault("action_include_reasoning", False)
     # 迁移：旧配置里已经填了插件级 action_llm 的，默认继续使用自己的
     # 行为模型；没填过的默认跟随全局行为模型。
@@ -191,6 +194,7 @@ def reload():
     with _LOCK:
         _config_cache = None
         _plugin_classes = None
+        _panel_cache.clear()
         # 重新读盘并把新设置灌回现有实例；不销毁实例本身。
         fresh = _normalize(_read_raw())
         _config_cache = fresh
@@ -305,11 +309,85 @@ def _safe_llm_value(llm: dict) -> dict:
         "max_tokens": llm.get("max_tokens"),
         "timeout": llm.get("timeout"),
         "_has_api_key": str(llm.get("api_key") or "").strip() not in ("", "YOUR_API_KEY_HERE"),
+        "has_api_key": str(llm.get("api_key") or "").strip() not in ("", "YOUR_API_KEY_HERE"),
     }
 
 
 def _safe_llm(entry: dict) -> dict:
     return _safe_llm_value(entry.get("llm"))
+
+
+def _panel_provider(plugin_id: str):
+    """读取 plugins/<id>/panel.py 的 PANEL（带缓存）。"""
+    with _LOCK:
+        if plugin_id not in _panel_cache:
+            from . import panel as panel_module
+            try:
+                _panel_cache[plugin_id] = panel_module.resolve(plugin_id)
+            except Exception:
+                _logger().exception("插件 %s 的 panel.py 加载失败，使用默认面板", plugin_id)
+                _panel_cache[plugin_id] = None
+        return _panel_cache[plugin_id]
+
+
+def panel_info(instance: Plugin) -> dict:
+    """返回插件面板所需的 schema / values / running。"""
+    provider = _panel_provider(instance.plugin_id)
+    if provider is None:
+        schema = instance.panel_schema()
+        values = instance.panel_values()
+        running = instance.is_running()
+    else:
+        schema = provider.schema(instance)
+        values = provider.values(instance)
+        running = provider.running(instance)
+        if running is None:
+            running = instance.is_running()
+    return {
+        "schema": schema if isinstance(schema, dict) else {},
+        "values": values if isinstance(values, dict) else {},
+        "running": bool(running),
+    }
+
+
+def save_panel(plugin_id: str, values: dict) -> dict:
+    """保存插件自述面板的字段；插件可自行决定写到哪个配置文件。"""
+    instance = get_plugin(plugin_id)
+    if instance is None:
+        return {"ok": False, "error": "插件不存在"}
+    values = values if isinstance(values, dict) else {}
+    provider = _panel_provider(plugin_id)
+    try:
+        if provider is None:
+            result = instance.panel_save(values)
+        else:
+            result = provider.save(instance, values)
+    except Exception as exc:
+        _logger().exception("插件 %s 面板保存失败", plugin_id)
+        return {"ok": False, "error": str(exc)}
+    result = result if isinstance(result, dict) else {"ok": True}
+    if result.get("ok", True) and provider is not None:
+        try:
+            provider.refresh(instance)
+        except Exception:
+            _logger().exception("插件 %s 面板保存后的热刷新失败", plugin_id)
+    return result
+
+
+def panel_action(plugin_id: str, key: str, payload: dict = None) -> dict:
+    """执行插件面板上声明的动作（例如“自测”）。"""
+    instance = get_plugin(plugin_id)
+    if instance is None:
+        return {"ok": False, "error": "插件不存在"}
+    provider = _panel_provider(plugin_id)
+    if provider is None:
+        return {"ok": False, "error": "这个插件没有面板动作"}
+    try:
+        result = provider.run_action(instance, str(key or ""), payload or {})
+    except Exception as exc:
+        _logger().exception("插件 %s 面板动作失败", plugin_id)
+        return {"ok": False, "error": str(exc)}
+    return result if isinstance(result, dict) else {"ok": True}
 
 
 def list_plugins() -> List[dict]:
@@ -327,6 +405,7 @@ def list_plugins() -> List[dict]:
             "capabilities": list(instance.capabilities),
             "implemented": bool(instance.implemented),
             "enabled": bool(entry.get("enabled", False)),
+            "autostart": bool(entry.get("autostart", False)),
             "is_app": bool(getattr(instance, "is_app", False)),
             "follow_global_behavior": bool(entry.get("follow_global_behavior", True)),
             "action_include_reasoning": bool(entry.get("action_include_reasoning", False)),
@@ -339,7 +418,32 @@ def list_plugins() -> List[dict]:
             item["status"] = instance.status()
         except Exception as exc:
             item["status"] = {"error": str(exc)}
+        try:
+            item["panel"] = panel_info(instance)
+        except Exception as exc:
+            item["panel"] = {"schema": {}, "values": {}, "running": False, "error": str(exc)}
+        item["running"] = bool(item["panel"].get("running"))
+        item["extra_actions"] = list(instance.extra_actions().keys())
+        item["available_for_actions"] = bool(instance.available_for_actions())
         result.append(item)
+
+    # 冲突提示：只提示、不阻止。others 取“当前正在运行”的其他插件。
+    running_instances = [
+        get_plugin(str(item.get("id") or ""))
+        for item in result
+        if item.get("running")
+    ]
+    running_instances = [p for p in running_instances if p is not None]
+    for item in result:
+        instance = get_plugin(str(item.get("id") or ""))
+        if instance is None:
+            continue
+        others = [p for p in running_instances if p.plugin_id != instance.plugin_id]
+        try:
+            item["conflict_note"] = str(instance.conflict_note(others) or "")
+        except Exception:
+            item["conflict_note"] = ""
+    return result
     return result
 
 
@@ -384,6 +488,8 @@ def update_from_panel(payload: dict) -> dict:
         entry = cfg["plugins"][plugin_id]
         if "enabled" in update:
             entry["enabled"] = bool(update["enabled"])
+        if "autostart" in update:
+            entry["autostart"] = bool(update["autostart"])
         if "follow_global_behavior" in update:
             entry["follow_global_behavior"] = bool(update["follow_global_behavior"])
         if "action_include_reasoning" in update:
@@ -414,9 +520,12 @@ __all__ = [
     "get_plugin",
     "list_plugins",
     "load_config",
+    "panel_action",
+    "panel_info",
     "plugin_config_path",
     "plugin_ids",
     "reload",
     "save_config",
+    "save_panel",
     "update_from_panel",
 ]

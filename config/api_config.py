@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     # ===== 作息惯性（学得的昼夜节律，非硬编码钟点）=====
     "biorhythm_rhythm_weight": 0.25,        # 作息窗口内最大睡意抬升量（峰值时 S≥0.37 即可入睡）
     "biorhythm_idle_to_sleep": 300,         # 靠作息入睡所需的安静时长（秒），即"没人发消息"多久
+    "biorhythm_never_sleep": False,         # 永不会困；取消勾选时恢复启动时的精力值
     "biorhythm_rhythm_min_nights": 5,       # 积累多少晚后作息开始生效
     "biorhythm_rhythm_full_nights": 10,     # 积累多少晚后作息强度完全生效
     # ===== 动作抉择（本能冲动）=====
@@ -76,9 +77,33 @@ DEFAULT_CONFIG = {
     "note_brief_max_chars": 400,            # 动作层摘要总长
     "note_brief_recent_lines": 5,           # 动作层摘要每本最近条目数
     # ===== 短期记忆与“软件”行为 =====
-    "short_term_thought_limit": 5,          # 本地短期记忆窗口：她自己最近 4~6 条想法
+    "short_term_thought_limit": 5,          # 本地短期记忆窗口：她自己最近 4~12 条想法
     "app_context_max_lines": 40,            # 插件传入主进程的软件上下文上限（未读、对话内容等）
     "qq_app_default_open": False,           # QQ 默认关闭：先累积未读，等动作层打开
+    # ===== 电脑 / 虚拟桌面插件 =====
+    "desktop_use_real_desktop": False,      # True=不启动虚拟工作桌面，直接操作真实 Windows 桌面
+    "desktop_max_steps": 12,                # 单个电脑任务最多几步
+    "desktop_task_timeout": 180,            # 单个电脑任务超时（秒）
+    "desktop_thought_window": 10,           # 插件运行时把思考窗口设为 9~11 条
+    "desktop_allow_screenshot": False,      # 是否允许操作手显式截图（默认不截图）
+    "desktop_allow_coordinate_input": True, # 允许坐标鼠标/键盘（UIA 语义动作失败时兜底）
+    "desktop_allow_synthetic_keys": True,   # 允许合成按键/键入（Enter、快捷键、剪贴板输入）
+    "desktop_allow_shell_windows": True,    # 允许操作 Progman/WorkerW/任务栏等 shell 窗口（放行所有窗口）
+    "desktop_coordinate_fence": True,       # 坐标必须落在目标窗口/工作桌面内
+    "desktop_snapshot_bounds": True,        # 快照里附带元素屏幕矩形 @l,t,r,b
+    "desktop_observe_software": True,       # 软件打开后由电脑插件读窗口内容
+    "desktop_launch_mode": "auto",          # auto=已打开就复用镜像，否则新开；new=总是新开；reuse=只复用镜像
+    "desktop_window_mode": "float",         # float=窗口浮在工作区内（宿主键鼠可输入）；embed=真子窗口（可能无法接收宿主键盘）
+    "desktop_reuse_mode": "mirror",         # 复用已有窗口时：mirror=只复制画面；float=把真实窗口移进工作区（可交互）
+    "desktop_wallpaper": "",                # 壁纸图片路径；留空用系统壁纸
+    "desktop_notes_dirs": "",               # 桌面笔记目录（逗号/分号分隔）；留空=项目所在桌面、用户桌面/文档/下载
+    "desktop_worker_width": 1280,           # 虚拟桌面窗口尺寸
+    "desktop_worker_height": 800,
+    # 以下仅作“以后外联 dsh”的预留，运行路径当前不读取：
+    "desktop_backend": "local",
+    "desktop_dsh_command": "",
+    "desktop_dsh_launcher": "",
+    "desktop_dsh_home": "",
     # ===== 本地软件门控（打开/退出软件，不参与语言回复）=====
     "app_router_mode": "rule",              # rule | local_llm | off
     "app_router_follow_global_behavior": False,  # 跟随全局 behavior_* 行为模型
@@ -88,9 +113,13 @@ DEFAULT_CONFIG = {
     "app_router_timeout": 20,
     "app_router_max_tokens": 160,
     "app_open_after_unread_rounds": 2,      # 未读持续几轮后打开软件
-    "app_close_conversation_idle_rounds": 15,  # 对话空闲几轮后退出对话
-    "app_close_idle_rounds": 30,            # 软件空闲几轮后退出软件
+    "app_close_conversation_idle_rounds": 120,  # 对话空闲几轮后退出对话（默认放宽，避免聊天中途丢上下文）
+    "app_close_idle_rounds": 240,            # 软件空闲几轮后退出软件
     "qq_unread_buffer_max": 200,            # 每个对话缓冲的未读消息上限（原始事件）
+    "qq_reader_mode": "auto",               # auto | desktop | self：打开对话时谁来读窗口
+    "qq_desktop_poll_seconds": 5,           # QQ 桌面读取：扫描窗口未读的间隔
+    "qq_desktop_history_pages": 12,         # 打开对话时向上翻多少页加载历史
+    "qq_desktop_use_vision": True,          # QQ 桌面读取：UIA 读不到时用视觉模型兜底
     # ===== QQ 富消息（小程序 / 合并转发聊天记录）=====
     "qq_mini_program_max_chars": 200,       # 小程序卡片解析后写入正文的最大字符数（不打开小程序）
     "qq_chat_record_max_messages": 80,      # 单条聊天记录最多展开的消息条数（只向内一层）
