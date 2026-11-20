@@ -39,7 +39,10 @@ CONFIG_FILE = CONFIG_DIR / "plugins.json"
 EXAMPLE_FILE = CONFIG_DIR / "plugins.example.json"
 
 # 面板展示顺序；未列出的插件排在其后
-BUILTIN_ORDER = ("qq_napcat", "wechat", "web", "bilibili", "browser")
+BUILTIN_ORDER = (
+    "qq_napcat", "wechat", "web", "bilibili", "browser",
+    "desktop", "qq_desktop", "skills",
+)
 
 _DEFAULT_LLM = {
     "base_url": "",
@@ -68,6 +71,17 @@ DEFAULT_CONFIG = {
         "bilibili": copy.deepcopy(_DEFAULT_PLUGIN),
         "browser": {**copy.deepcopy(_DEFAULT_PLUGIN), "enabled": True},
         "skills": {**copy.deepcopy(_DEFAULT_PLUGIN), "enabled": True},
+        "desktop": {
+            **copy.deepcopy(_DEFAULT_PLUGIN),
+            "enabled": True,
+            "autostart": True,
+            "action_include_reasoning": True,
+        },
+        "qq_desktop": {
+            **copy.deepcopy(_DEFAULT_PLUGIN),
+            "enabled": True,
+            "autostart": True,
+        },
     },
 }
 
