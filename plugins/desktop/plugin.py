@@ -51,8 +51,8 @@ def _window_score(title: str, prefer: str) -> int:
     return score
 
 
-def _task_similar(left: str, right: str) -> bool:
-    """粗粒度判断两条电脑任务是不是在追同一件失败的事。"""
+def _task_similar(left: str, right: str, threshold: float = 0.30) -> bool:
+    """粗粒度判断两条电脑任务是不是在追同一件事。"""
     def grams(text):
         text = "".join(str(text or "").split()).lower()
         return {text[i:i + 2] for i in range(max(0, len(text) - 1))}
@@ -60,7 +60,30 @@ def _task_similar(left: str, right: str) -> bool:
     a, b = grams(left), grams(right)
     if not a or not b:
         return str(left).strip() == str(right).strip()
-    return len(a & b) / max(1, len(a | b)) >= 0.30
+    return len(a & b) / max(1, len(a | b)) >= threshold
+
+
+def _task_duplicate(left: str, right: str) -> bool:
+    """判断两条任务是不是同一个“搜索/打开同一个目标”。
+
+    先看引号里的关键词和 URL；同一个关键词才算重复。没有引号时才
+    退回高阈值文本相似，避免“打开B站搜A”挡住紧接着的“打开B站搜B”。
+    """
+    def quoted(text):
+        items = re.findall(r"[“\"「『]([^”\"」』]{2,})[”\"」』]", str(text or ""))
+        return {"".join(item.split()).lower() for item in items}
+
+    def urls(text):
+        return {
+            item.rstrip("，。,.").lower()
+            for item in re.findall(r"https?://\S+", str(text or ""))
+        }
+
+    if quoted(left) & quoted(right):
+        return True
+    if urls(left) & urls(right):
+        return True
+    return _task_similar(left, right, 0.75)
 
 
 class DesktopPlugin(Plugin):
@@ -86,6 +109,7 @@ class DesktopPlugin(Plugin):
         self._result_token = 0
         self._task_cooldown_until = 0.0
         self._failed_tasks = []
+        self._recent_success = None
         try:
             width = int(config.get("desktop_worker_width", 1280))
             height = int(config.get("desktop_worker_height", 800))
@@ -846,12 +870,22 @@ class DesktopPlugin(Plugin):
         task = str(task or "").strip()
         if not task:
             return {"ok": False, "detail": "没有要交办的事"}
+        # 聊天窗口的发送/粘贴是平台插件的事；电脑插件去点输入框只会
+        # 反复 snapshot 到 12 步失败，再把失败提醒灌回认知循环。
+        if (re.search(r"QQ|微信|聊天|对话|会话", task)
+                and re.search(r"粘贴|输入框|发送|发出去|发消息", task)):
+            return {
+                "ok": False,
+                "silent": True,
+                "detail": "聊天发送由聊天插件负责；电脑插件不代点聊天输入框，也不把剪贴板粘进聊天。",
+            }
         with self._lock:
             if self._task and self._task.get("status") == "running":
                 return {"ok": False, "detail": f"电脑还在忙：{self._task.get('text')}"}
             if time.time() < self._task_cooldown_until:
                 return {
                     "ok": False,
+                    "silent": True,
                     "detail": "电脑刚失败过，先停一会儿，不要马上再交新的电脑任务。",
                 }
             now = time.time()
@@ -862,6 +896,7 @@ class DesktopPlugin(Plugin):
                 if _task_similar(task, text):
                     return {
                         "ok": False,
+                        "silent": True,
                         "detail": "这件电脑任务刚才失败过，先别换个说法继续追；"
                         "等用户明确要求再重试。",
                     }
@@ -870,7 +905,19 @@ class DesktopPlugin(Plugin):
                 if last_text == task and time.time() - last_at < 90:
                     return {
                         "ok": False,
+                        "silent": True,
                         "detail": "刚才同样的电脑任务失败过，先别重复；换个做法或先确认目标窗口还在。",
+                    }
+            # 同一件事刚成功过就别再跑一遍：语言层看到“电脑那边结束了”
+            # 之前可能会把同一个搜索/打开动作连交三次，既浪费步数也刷屏。
+            if self._recent_success:
+                ok_task, ok_at, ok_summary = self._recent_success
+                if now - ok_at < 120 and _task_duplicate(task, ok_task):
+                    return {
+                        "ok": True,
+                        "silent": True,
+                        "detail": f"刚才已经做过：{ok_summary[:200]}",
+                        "content_lines": [],
                     }
             self._task = {
                 "text": task,
@@ -936,6 +983,9 @@ class DesktopPlugin(Plugin):
             if result.get("ok"):
                 self._last_task_failure = None
                 self._task_cooldown_until = 0.0
+                self._recent_success = (
+                    task, time.time(), str(result.get("summary") or "")
+                )
             else:
                 self._last_task_failure = (task, time.time())
                 self._task_cooldown_until = time.time() + 60.0

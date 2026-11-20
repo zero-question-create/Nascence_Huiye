@@ -839,21 +839,83 @@ def _consume_note_memory():
     return mem, clock.to_real_time(clock.now())
 
 
+def _thought_ngrams(text: str, size: int = 2) -> set:
+    content = re.sub(r"^\[[^\]]+\]\s*", "", str(text or ""))
+    content = content.replace("我想：", "").replace("我说：", "")
+    content = re.sub(r"[\W_]+", "", content, flags=re.UNICODE)
+    if len(content) <= size:
+        return {content} if content else set()
+    return {content[i:i + size] for i in range(len(content) - size + 1)}
+
+
+def _seed_repeats_recent(text: str) -> bool:
+    """种子是否只是最近几轮想法的换皮重复。
+
+    反刍抑制能拦住关键词，但如果随机种子又抽到刚写下的同一条想法，
+    下一轮仍会原样复述。这里按 2-gram 相似度挡掉近重复种子。
+    """
+    current = _thought_ngrams(text)
+    if not current:
+        return False
+    try:
+        recent = SHORT_TERM.texts()
+    except Exception:
+        return False
+    for item in recent:
+        other = _thought_ngrams(item)
+        if not other:
+            continue
+        union = current | other
+        if union and len(current & other) / len(union) >= 0.85:
+            return True
+    return False
+
+
+def _seed_conflicts_with_reality(text: str) -> bool:
+    """记忆里的未读状态和当前软件状态相反时，不要拿它当种子。
+
+    记忆只是当时看到的状态，重启/读完后会过时：没有未读时还念叨
+    “99条未读”，或明明有未读却记着“没有未读”，都会让辉夜对现实判断
+    失真。这里只挡与当前未读状态直接矛盾的念头，不碰普通话题。
+    """
+    content = str(text or "")
+    if "未读" not in content:
+        return False
+    try:
+        statuses = APP_CONTEXT.prompt_state()
+    except Exception:
+        return False
+    if not statuses:
+        return False
+    unread = sum(max(0, int(item.get("unread") or 0)) for item in statuses)
+    if unread <= 0:
+        return True
+    return bool(re.search(r"(?:没有|没|无)\s*未读|(?<!\d)(?:0|零)\s*条未读", content))
+
+
 def _pick_seed_text() -> str | None:
     """取一条记忆当检索种子：优先浅层意识池，池空或内容缺失时退回随机记忆。
 
-    返回截断到 50 字的内容；记忆库为空时返回 None。
+    返回截断到 50 字的内容；记忆库为空或只剩与当前软件状态矛盾的
+    未读旧念头时返回 None。
     """
     from .memory_engine import get_random_memory_id, get_memory_content, access_memory
-    if _shallow_pool:
-        mem_id = random.choice(list(_shallow_pool))
+    candidates = list(_shallow_pool)
+    random.shuffle(candidates)
+    for mem_id in candidates[:20]:
         content = get_memory_content(mem_id)
-        if content:
+        if (content
+                and not _seed_conflicts_with_reality(content)
+                and not _seed_repeats_recent(content)):
             return content[:50]
-    mem_id = get_random_memory_id()
-    if mem_id:
+    for _ in range(8):
+        mem_id = get_random_memory_id()
+        if not mem_id:
+            break
         content = get_memory_content(mem_id)
-        if content:
+        if (content
+                and not _seed_conflicts_with_reality(content)
+                and not _seed_repeats_recent(content)):
             access_memory(mem_id)
             return content[:50]
     return None
@@ -1281,7 +1343,9 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 if _shallow_pool:
                     forced_seed_id = random.choice(list(_shallow_pool))
                     forced_content = get_memory_content(forced_seed_id)
-                    if forced_content:
+                    if (forced_content
+                            and not _seed_conflicts_with_reality(forced_content)
+                            and not _seed_repeats_recent(forced_content)):
                         current_keywords = [forced_content[:50]]
                         append_log(f"[反刍抑制] 强制转向：从浅层池抽取新种子 {forced_seed_id[:8]}...")
                     else:

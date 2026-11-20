@@ -302,6 +302,19 @@ def _parse(raw: str) -> dict:
                 return data
         except json.JSONDecodeError:
             pass
+    # 模型常在 summary 里直接写英文双引号（如视频标题），JSON 因此失效；
+    # done/fail 是终止动作，不能因为一个引号就继续空转到 12 步。
+    fallback = re.search(r'"action"\s*:\s*"(done|fail)"', text)
+    if fallback:
+        summary = ""
+        summary_match = re.search(r'"summary"\s*:\s*"(.*)', text, re.S)
+        if summary_match:
+            summary = summary_match.group(1).strip()
+            if summary.endswith("}"):
+                summary = summary[:-1].rstrip()
+            if summary.endswith('"'):
+                summary = summary[:-1].rstrip()
+        return {"action": fallback.group(1), "summary": summary}
     return {}
 
 
@@ -929,6 +942,16 @@ def _task_window(task: str, context: str = "") -> int:
     return best if best_score > 0 else 0
 
 
+def _is_arrange_task(task: str) -> bool:
+    blob = str(task or "")
+    if "窗口" not in blob:
+        return False
+    if not any(key in blob for key in ("整理", "归置", "排整齐", "排列", "摆整齐", "理一理")):
+        return False
+    # “看看窗口怎么排列/有哪些窗口”是只读问题，不能真的去挪。
+    return not any(key in blob for key in ("哪些", "列出", "看看", "内容", "标题"))
+
+
 def run_task(plugin, task: str, context: str = "") -> dict:
     """执行一个电脑任务；返回 {"ok", "summary", "lines"}。"""
     backend = uia.backend()
@@ -950,6 +973,24 @@ def run_task(plugin, task: str, context: str = "") -> dict:
                 titles.append(title)
         summary = "当前打开的窗口：" + ("、".join(titles) if titles else "没有可见窗口")
         return {"ok": True, "summary": summary, "lines": []}
+
+    # 窗口整理是确定性的平铺动作，不该让操作手用 win+tab/snapshot 瞎试。
+    if _is_arrange_task(task):
+        arranged = uia.arrange_windows()
+        if arranged.get("ok"):
+            names = "、".join(
+                str(item.get("title") or "") for item in arranged.get("moved") or []
+            )
+            return {
+                "ok": True,
+                "summary": f"已把 {arranged.get('count', 0)} 个窗口平铺整齐：{names}",
+                "lines": [],
+            }
+        return {
+            "ok": False,
+            "summary": str(arranged.get("detail") or "没有可整理的可见窗口"),
+            "lines": [],
+        }
 
     worker = plugin.worker_state()
     window: Optional[int] = int(worker.get("last_hwnd") or 0) if worker else None

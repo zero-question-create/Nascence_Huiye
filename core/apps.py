@@ -11,6 +11,7 @@
 # ========================================================================
 
 import threading
+import time
 from collections import deque
 from typing import List, Tuple
 
@@ -34,6 +35,9 @@ class AppContext:
         self._entries: deque = deque(maxlen=self._max_lines)
         self._notifications: dict = {}
         self._states: dict = {}
+        # 未读提醒只在数量变化时进上下文，避免每轮都把“90条未读”
+        # 重新摆在辉夜眼前，把她带进反复念叨同一个数字的循环。
+        self._unread_notified: dict = {}
         self._current_app = ""
         self._current_conversation = ""
 
@@ -127,6 +131,7 @@ class AppContext:
             self._entries.clear()
             self._notifications.clear()
             self._states.clear()
+            self._unread_notified.clear()
             self._current_app = ""
             self._current_conversation = ""
 
@@ -176,25 +181,41 @@ class AppContext:
         return result
 
     def refresh(self):
-        """按插件当前状态重建未读/打开提醒；每轮认知循环调用一次。"""
+        """按插件当前状态重建打开提醒与“变化过的”未读提醒。
+
+        未读数量不变时不再每轮重复塞进提示词：只报一次（或隔 15 分钟
+        再提醒一次），否则辉夜会盯着同一个数字反复念叨。
+        """
         notifications = {}
         current_app = ""
         current_conversation = ""
+        now = time.time()
+        seen = set()
         for app in self.prompt_state():
             app_id = app["id"]
+            seen.add(app_id)
             if app["open"]:
                 current_app = app_id
                 current_conversation = app["current_conversation"]
                 state = f"{app['label']}打开着"
                 if current_conversation:
                     state += f"，正在看{self._conversation_label(app, current_conversation)}"
-                if app["unread"] > 0:
-                    state += f"；另外还有 {self._unread_text(app['unread'])} 条未读"
                 notifications[f"__open__{app_id}"] = state
-            elif app["unread"] > 0:
-                notifications[app_id] = (
-                    f"{app['label']}有 {self._unread_text(app['unread'])} 条未读消息"
-                )
+            # 未读数量单独按“变化”提醒；即使软件开着，也不每轮把数字
+            # 塞回打开状态里，否则她会一直盯着同一个未读数。
+            if app["unread"] > 0:
+                last = self._unread_notified.get(app_id)
+                if not last or last[0] != app["unread"] or now - last[1] >= 900:
+                    notifications[app_id] = (
+                        f"{app['label']}有 {self._unread_text(app['unread'])} 条未读消息"
+                        "（只报数量，不自己逐个翻）"
+                    )
+                    self._unread_notified[app_id] = (app["unread"], now)
+            else:
+                self._unread_notified.pop(app_id, None)
+        for app_id in list(self._unread_notified):
+            if app_id not in seen:
+                self._unread_notified.pop(app_id, None)
         with self._lock:
             self._notifications = notifications
             self._current_app = current_app
@@ -305,6 +326,10 @@ class AppContext:
         if not isinstance(res, dict):
             return ""
         detail = str(res.get("detail") or "").strip()
+        # 冷却/去重/硬拒绝这类“没有真正执行”的结果只回给动作层，
+        # 不再写进 pinned 记忆；否则同一句“电脑刚失败过”会每轮出现。
+        if res.get("silent"):
+            return detail or "没有新内容"
         content = res.get("content_lines") or []
         if isinstance(content, str):
             content = [content]
@@ -425,6 +450,21 @@ class AppContext:
                 if plugin is None:
                     return self._fail("还没有打开软件")
                 res = await plugin.read_earlier(self.current_conversation)
+                return self._remember_result(res)
+
+            if action == "send_clipboard":
+                # 剪贴板发送走聊天插件自己的输入/发送链路，不让电脑插件
+                # 去点聊天窗口：后者会 snapshot 十几步也找不到输入框。
+                plugin = self._plugin_for(self.current_app)
+                if plugin is None or not hasattr(plugin, "send_clipboard_to_current"):
+                    plugin = None
+                    for candidate in self._plugins():
+                        if hasattr(candidate, "send_clipboard_to_current"):
+                            plugin = candidate
+                            break
+                if plugin is None:
+                    return self._fail("当前软件不支持发送剪贴板内容")
+                res = await plugin.send_clipboard_to_current()
                 return self._remember_result(res)
 
             if action == "app_do":

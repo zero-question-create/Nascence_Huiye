@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -196,6 +197,68 @@ _user32.SetWindowPos.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.c_uint,
 ]
 _user32.SetWindowPos.restype = wintypes.BOOL
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.IsIconic.restype = wintypes.BOOL
+_user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
+]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+
+def arrange_windows() -> dict:
+    """把当前可见、未最小化的普通窗口按网格平铺。
+
+    只移动/缩放，不关闭、不抢焦点，也不动最小化窗口。
+    返回 {"ok", "count", "moved": [{title, ok, rect}]}。
+    """
+    skip_titles = {"Program Manager", "Windows 输入体验"}
+    windows = []
+    for item in list_windows(only_titled=True):
+        title = str(item.get("title") or "").strip()
+        if not title or title in skip_titles:
+            continue
+        hwnd = int(item.get("hwnd") or 0)
+        if not hwnd or _user32.IsIconic(wintypes.HWND(hwnd)):
+            continue
+        left, top, right, bottom = item.get("rect") or (0, 0, 0, 0)
+        if right - left < 320 or bottom - top < 200:
+            continue
+        windows.append((hwnd, title))
+    if not windows:
+        return {"ok": False, "count": 0, "moved": [], "detail": "没有可整理的可见窗口"}
+
+    rect = wintypes.RECT()
+    if not _user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+        rect.left, rect.top = 0, 0
+        rect.right = int(user32.GetSystemMetrics(0))
+        rect.bottom = int(user32.GetSystemMetrics(1))
+    work_w = max(320, int(rect.right - rect.left))
+    work_h = max(200, int(rect.bottom - rect.top))
+    cols = max(1, int(math.ceil(math.sqrt(len(windows)))))
+    rows = max(1, int(math.ceil(len(windows) / cols)))
+    cell_w = max(320, work_w // cols)
+    cell_h = max(200, work_h // rows)
+
+    moved = []
+    for index, (hwnd, title) in enumerate(windows):
+        x = int(rect.left) + (index % cols) * cell_w
+        y = int(rect.top) + (index // cols) * cell_h
+        ok = _user32.SetWindowPos(
+            wintypes.HWND(hwnd), wintypes.HWND(0), x, y, cell_w, cell_h,
+            0x0004 | 0x0010 | 0x0040,  # NOZORDER | NOACTIVATE | SHOWWINDOW
+        )
+        moved.append({
+            "title": title,
+            "ok": bool(ok),
+            "rect": [x, y, cell_w, cell_h],
+        })
+    return {
+        "ok": all(item["ok"] for item in moved),
+        "count": len(moved),
+        "moved": moved,
+    }
+
+
 _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 _gdi32.CreateCompatibleDC.restype = wintypes.HDC
 _gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]

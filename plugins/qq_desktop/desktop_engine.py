@@ -19,6 +19,9 @@ from plugins.desktop import uia
 
 _UNREAD_RE = re.compile(r"(\d+)\s*条未读")
 _UNREAD_BADGE_RE = re.compile(r"^\d{1,4}\+?$")
+# QQ 切到资料卡/空间等页面时，会话列表不在树里，但左侧导航仍带着
+# “消息 90条未读”这个全局角标。没有它就会误报“没有未读消息”。
+_GLOBAL_UNREAD_RE = re.compile(r'Button\s+"消息\s*(\d+)\+?\s*条未读"')
 _ITEM_RE = re.compile(r"^(\S+)\s+Group\s+\"\"\s+actions=invoke")
 _TEXT_RE = re.compile(r'^(\S+)\s+Text\s+"([^"]*)"')
 _TIME_RE = re.compile(r"^(\d{1,2}:\d{2}|昨天|前天|星期[一二三四五六日天]|\d{1,2}/\d{1,2}|[A-Za-z]{3}\s+\d{1,2})$")
@@ -175,6 +178,27 @@ def parse_conversations(text: str) -> List[dict]:
 
 def total_unread(conversations: List[dict]) -> int:
     return sum(int(item.get("unread") or 0) for item in conversations)
+
+
+def parse_global_unread(text: str) -> int:
+    """读取左侧“消息”导航上的全局未读角标。
+
+    会话列表只有在消息页才存在；QQ 停在资料卡、空间或频道页时，
+    parse_conversations() 会返回空列表，但全局角标仍然可读。
+    """
+    best = 0
+    for line in str(text or "").splitlines():
+        match = _GLOBAL_UNREAD_RE.search(line)
+        if match:
+            best = max(best, int(match.group(1)))
+    return best
+
+
+def effective_unread(text: str, conversations: List[dict] = None) -> int:
+    """会话项未读之和与全局角标取较大值，避免页面切换时误报 0。"""
+    if conversations is None:
+        conversations = parse_conversations(text)
+    return max(total_unread(conversations), parse_global_unread(text))
 
 
 def extract_message_lines(text: str) -> List[str]:

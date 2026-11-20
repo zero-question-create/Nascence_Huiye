@@ -163,6 +163,50 @@ class QQDesktopPlugin(Plugin):
             pass
         return True
 
+    async def send_clipboard_to_current(self) -> dict:
+        """把当前剪贴板文本原样发到已打开的 QQ 对话。
+
+        这是“剪贴板 → 当前聊天”的正规入口：复用 QQ 插件自己的输入/发送
+        链路，不需要电脑插件去猜输入框位置，也不会在聊天页反复 snapshot。
+        """
+        with self._lock:
+            hwnd = int(self._hwnd or 0)
+            current = str(self._current_label or "").strip()
+        if not hwnd or not current:
+            return {
+                "ok": False,
+                "detail": "QQ 还没有打开具体对话；先点开要发送的会话，再用 send_clipboard。",
+            }
+        loop = asyncio.get_running_loop()
+
+        def _read_clipboard():
+            return engine.uia.backend().clipboard_get()
+
+        try:
+            clip = await loop.run_in_executor(None, _read_clipboard)
+        except Exception as exc:
+            return {"ok": False, "detail": f"读剪贴板失败：{exc}"}
+        if not isinstance(clip, dict) or not clip.get("ok"):
+            return {
+                "ok": False,
+                "detail": f"读剪贴板失败：{(clip or {}).get('error') or '未知原因'}",
+            }
+        text = str(clip.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "detail": "剪贴板是空的，没有可发送的内容。"}
+        preview = " ".join(text.split())[:100]
+        sent = await self.send_text_to_current(current, text)
+        if not sent:
+            return {
+                "ok": False,
+                "detail": f"剪贴板内容没能发到{current}，QQ 输入框可能没有聚焦。",
+            }
+        return {
+            "ok": True,
+            "detail": f"我把剪贴板内容发给了{current}：{preview}",
+            "content_lines": [],
+        }
+
     # ---------- 监控 ----------
     @staticmethod
     def _poll_seconds() -> float:
@@ -184,7 +228,7 @@ class QQDesktopPlugin(Plugin):
                     continue
                 text = engine.snapshot_text(hwnd)
                 conversations = engine.parse_conversations(text)
-                unread = engine.total_unread(conversations)
+                unread = engine.effective_unread(text, conversations)
                 self_name = engine.parse_self_name(text)
                 with self._lock:
                     self._hwnd = hwnd
@@ -454,11 +498,11 @@ class QQDesktopPlugin(Plugin):
             pass
 
     def _push_unread_preview(self, conversations: list, active: bool = False) -> None:
-        """只报“有未读”，不列群名/预览。
+        """进入某个会话后清掉未读提醒；其余交给 AppContext 的“变化提醒”。
 
-        群里 999+ 未读一旦列出会话名，她就会一个群一个群地翻，别人的
-        闲聊会不断变成她的任务。这里只保留数量这个事实；要看哪个会话
-        由用户明确指定，插件再读。
+        数量的首次通知由 AppContext.refresh() 负责，且只在数量变化时
+        重新进入提示词。这里不能每 5 秒覆盖一次状态，否则同一句
+        “90 条未读”会一直摆在辉夜眼前，把她带进反复念叨的循环。
         """
         try:
             from core.apps import APP_CONTEXT
@@ -466,16 +510,6 @@ class QQDesktopPlugin(Plugin):
             with self._lock:
                 if active or (self._open and self._current_label):
                     APP_CONTEXT.remember_state("qq_desktop_unread", "")
-                    return
-            total = sum(int(item.get("unread") or 0) for item in conversations)
-            if total <= 0:
-                APP_CONTEXT.remember_state("qq_desktop_unread", "")
-                return
-            APP_CONTEXT.remember_state(
-                "qq_desktop_unread",
-                f"QQ 有 {engine.format_unread(total)} 条未读（只报数量；"
-                "不要自己逐个群翻，等用户明确指定要看哪个会话）。",
-            )
         except Exception:
             pass
 
@@ -515,7 +549,7 @@ class QQDesktopPlugin(Plugin):
             return {"ok": False, "detail": "QQ 窗口没有打开"}
         text = engine.snapshot_text(hwnd)
         conversations = engine.parse_conversations(text)
-        unread = engine.total_unread(conversations)
+        unread = engine.effective_unread(text, conversations)
         with self._lock:
             self._open = True
             self._hwnd = hwnd
@@ -582,7 +616,7 @@ class QQDesktopPlugin(Plugin):
             self._current_is_group = bool(is_group)
             self._self_name = self_name
             self._conversations = conversations
-            self._unread = engine.total_unread(conversations)
+            self._unread = engine.effective_unread(text, conversations)
         if stored != name or existing < 5 or not self._history_complete:
             transcript = self._load_history(hwnd, name)
         else:

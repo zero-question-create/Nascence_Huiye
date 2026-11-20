@@ -29,7 +29,7 @@ DEFAULT_MAX_PAGES = 4    # 单个动作类型的翻页上限，超过强制结�
 DEFAULT_PAGE_SIZE = 8    # 每页候选数量
 APP_ACTIONS = {
     "open_conversation", "read_earlier", "scroll_to_bottom",
-    "close_conversation", "close_app", "app_do",
+    "close_conversation", "close_app", "app_do", "send_clipboard",
 }
 VALID_ACTIONS = {
     "none", "image", "sticker",
@@ -147,6 +147,7 @@ def _system_prompt(has_apps: bool = False, extra_actions: dict = None) -> str:
             "- {\"action\":\"scroll_to_bottom\"}\n"
             "- {\"action\":\"close_conversation\"}\n"
             "- {\"action\":\"close_app\"}\n"
+            "- {\"action\":\"send_clipboard\"}\n"
             "- {\"action\":\"app_do\",\"task\":\"要它替我做的一件事\"}\n"
         )
     if extra_actions:
@@ -179,7 +180,8 @@ def _system_prompt(has_apps: bool = False, extra_actions: dict = None) -> str:
             "10. 如果你刚说“点开/打开/看看某个对话”，并且【我的软件】里能看到这个对话，"
             "就直接输出 open_conversation，id 用列表里的对话 id；不要只说不动、也不要输出 none。\n"
             "11. 看聊天软件（QQ/微信）的未读和聊天内容，用 open_conversation / read_earlier；"
-            "不要用 app_do 让电脑插件去点聊天窗口。\n"
+            "要发剪贴板里的文字/链接给当前对话，用 send_clipboard（剪贴板内容会原样发出）；"
+            "要发你自己想说的话，用 say=true 的回复。不要用 app_do 让电脑插件去点输入框、粘贴或按发送。\n"
             "12. 【我的软件】里电脑标着“正在操作”或刚失败时，不要连续 app_do 同一件事；"
             "先等它结束，或者做别的。\n"
         )
