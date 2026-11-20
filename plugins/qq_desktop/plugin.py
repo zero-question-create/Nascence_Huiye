@@ -82,6 +82,7 @@ class QQDesktopPlugin(Plugin):
         self._current_is_group = False
         self._self_name = ""
         self._last_image_sig = None
+        self._last_clipboard_sent = None
         self._channel = QQDesktopChannel(self)
 
     # ---------- 服务 ----------
@@ -194,6 +195,15 @@ class QQDesktopPlugin(Plugin):
         text = str(clip.get("text") or "").strip()
         if not text:
             return {"ok": False, "detail": "剪贴板是空的，没有可发送的内容。"}
+        with self._lock:
+            last = self._last_clipboard_sent
+        if (last and last[0] == text and last[1] == current
+                and time.time() - last[2] < 300):
+            return {
+                "ok": True,
+                "silent": True,
+                "detail": f"这段剪贴板内容刚发给过{current}，先不重复发送。",
+            }
         preview = " ".join(text.split())[:100]
         sent = await self.send_text_to_current(current, text)
         if not sent:
@@ -201,6 +211,8 @@ class QQDesktopPlugin(Plugin):
                 "ok": False,
                 "detail": f"剪贴板内容没能发到{current}，QQ 输入框可能没有聚焦。",
             }
+        with self._lock:
+            self._last_clipboard_sent = (text, current, time.time())
         return {
             "ok": True,
             "detail": f"我把剪贴板内容发给了{current}：{preview}",
