@@ -67,6 +67,11 @@ def _parse_action(raw: str) -> dict:
     if not raw:
         return {}
     text = raw.strip()
+    # 模型偶尔会输出全角括号/方括号，JSON 解析会直接失败。
+    text = (
+        text.replace("｛", "{").replace("｝", "}")
+        .replace("［", "[").replace("］", "]")
+    )
     if text.startswith("```"):
         text = text.removeprefix("```").removeprefix("json").removesuffix("```").strip()
     try:
@@ -171,6 +176,12 @@ def _system_prompt(has_apps: bool = False, extra_actions: dict = None) -> str:
             "只有对方明确让你退出/换对话，或确实长时间不用时才 close_conversation / close_app。\n"
             "9. app_do 只用来让标着“可动手”的软件替你完成一件事：task 写清楚要做什么，"
             "不要写平台细节，也不要一次交代多件事。\n"
+            "10. 如果你刚说“点开/打开/看看某个对话”，并且【我的软件】里能看到这个对话，"
+            "就直接输出 open_conversation，id 用列表里的对话 id；不要只说不动、也不要输出 none。\n"
+            "11. 看聊天软件（QQ/微信）的未读和聊天内容，用 open_conversation / read_earlier；"
+            "不要用 app_do 让电脑插件去点聊天窗口。\n"
+            "12. 【我的软件】里电脑标着“正在操作”或刚失败时，不要连续 app_do 同一件事；"
+            "先等它结束，或者做别的。\n"
         )
     return "".join(parts)
 

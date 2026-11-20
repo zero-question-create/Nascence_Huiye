@@ -18,9 +18,23 @@ from typing import List, Optional
 from plugins.desktop import uia
 
 _UNREAD_RE = re.compile(r"(\d+)\s*条未读")
+_UNREAD_BADGE_RE = re.compile(r"^\d{1,4}\+?$")
 _ITEM_RE = re.compile(r"^(\S+)\s+Group\s+\"\"\s+actions=invoke")
 _TEXT_RE = re.compile(r'^(\S+)\s+Text\s+"([^"]*)"')
 _TIME_RE = re.compile(r"^(\d{1,2}:\d{2}|昨天|前天|星期[一二三四五六日天]|\d{1,2}/\d{1,2}|[A-Za-z]{3}\s+\d{1,2})$")
+
+
+def format_unread(count: int) -> str:
+    """未读显示上限：不把 53754 这种原始计数直接灌给语言层。"""
+    try:
+        value = max(0, int(count))
+    except (TypeError, ValueError):
+        value = 0
+    if value >= 1000:
+        return "999+"
+    if value >= 100:
+        return "99+"
+    return str(value)
 
 
 _cached_main_hwnd = 0
@@ -128,9 +142,9 @@ def parse_conversations(text: str) -> List[dict]:
                 current["name"] = value
             elif not current["time"] and _TIME_RE.match(value):
                 current["time"] = value
-            elif value.isdigit() and len(value) <= 4:
-                # 会话项里的纯数字通常是未读角标/数量，不是消息预览。
-                # 之前把“3”拼进预览，会变成“快加入这个群 3”。
+            elif _UNREAD_BADGE_RE.match(value):
+                # 会话项里的纯数字/“99+”通常是未读角标，不是消息预览。
+                # 之前把“3”“99+”拼进预览，会变成“快加入这个群 3”。
                 continue
             elif value in ("以下为新消息", "新消息", "查看更多消息"):
                 continue
@@ -252,11 +266,7 @@ def _button_names(lines, start: int, stop: int):
 
 
 def parse_current_conversation(text: str, self_name: str = "") -> str:
-    """从聊天区上方的标题按钮取当前对话名；聊天区没开时返回空。
-
-    聊天标题一般紧挨着“在线状态”按钮，往上找第一个非工具栏按钮最稳；
-    直接取第一个 Button 会拿到最小化/迷你窗。
-    """
+    """从聊天区上方的标题按钮取当前对话名；聊天区没开时返回空。"""
     lines = str(text or "").splitlines()
     message_index = None
     for index, line in enumerate(lines):
@@ -276,8 +286,28 @@ def parse_current_conversation(text: str, self_name: str = "") -> str:
                 continue
             if any(key in name for key in ("个性签名", "天气", "迷你窗", "经典模式")):
                 continue
+            if "条未读" in name or "object Object" in name or name.startswith("顶部"):
+                continue
             return name
         break
+
+    # 群聊没有“在线状态 在线”：群名 Button 后面通常紧跟 Text "(人数)"。
+    for index, line in enumerate(lines[:message_index]):
+        match = re.search(r'\bButton "([^"]{1,60})"', line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if not name or name == self_name:
+            continue
+        if name in _HEADER_BUTTON_SKIP or "头像" in name or "在线状态" in name:
+            continue
+        if any(key in name for key in (
+            "个性签名", "天气", "迷你窗", "经典模式", "最小化", "最大化",
+            "条未读", "object Object",
+        )) or name.startswith("顶部"):
+            continue
+        if any(re.search(r'Text "\(\d+\)"', row) for row in lines[index + 1:index + 6]):
+            return name
 
     for line in lines[:message_index]:
         match = re.search(r'\bButton "([^"]{1,60})"', line)
@@ -288,10 +318,38 @@ def parse_current_conversation(text: str, self_name: str = "") -> str:
             continue
         if name in _HEADER_BUTTON_SKIP or "头像" in name or "在线状态" in name:
             continue
-        if any(key in name for key in ("个性签名", "天气", "迷你窗", "经典模式", "最小化", "最大化")):
+        if any(key in name for key in (
+            "个性签名", "天气", "迷你窗", "经典模式", "最小化", "最大化",
+            "条未读", "object Object",
+        )) or name.startswith("顶部"):
             continue
         return name
     return ""
+
+
+def conversation_is_group(text: str, self_name: str = "") -> bool:
+    """群聊标题通常带成员数 Text "(N)"；一对一标题带“在线状态 在线”。"""
+    lines = str(text or "").splitlines()
+    message_index = None
+    for index, line in enumerate(lines):
+        if 'Pane "消息列表"' in line:
+            message_index = index
+            break
+    if message_index is None:
+        return False
+    header = parse_current_conversation(text, self_name)
+    if not header:
+        return False
+    for index, line in enumerate(lines[:message_index]):
+        if f'Button "{header}"' not in line:
+            continue
+        window = lines[index + 1:index + 8]
+        if any(re.search(r'Text "\(\d+\)"', row) for row in window):
+            return True
+        if any('Button "在线状态 在线"' in row for row in window):
+            return False
+        break
+    return False
 
 
 def _find_message_list(root):

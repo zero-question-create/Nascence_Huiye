@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 
@@ -76,6 +77,10 @@ class QQDesktopPlugin(Plugin):
         self._last_messages = []
         self._transcript = []
         self._transcript_conversation = ""
+        self._history_complete = False
+        self._current_explicit = False
+        self._current_is_group = False
+        self._self_name = ""
         self._last_image_sig = None
         self._channel = QQDesktopChannel(self)
 
@@ -186,16 +191,40 @@ class QQDesktopPlugin(Plugin):
                     self._conversations = conversations
                     self._unread = unread
                     current = self._current
-                self._push_unread_preview(conversations)
                 # QQ 在前台/窗口开着时，新消息会被客户端直接标成已读，
                 # unread 可能是 0；这时要靠聊天区标题识别当前对话并主动轮询。
                 header = engine.parse_current_conversation(text, self_name)
-                if header and header != current:
+                is_group = engine.conversation_is_group(text, self_name) if header else False
+                with self._lock:
+                    explicit = bool(self._current_explicit)
+                allow_group = bool(is_group and explicit and header == current)
+                if header and bool(is_group) and not allow_group:
+                    # 群聊不自动接管：群里每句话都触发动作会把她拖进别人的话题。
+                    if current:
+                        current = ""
+                        with self._lock:
+                            self._current = ""
+                            self._current_label = ""
+                            self._current_is_group = False
+                            self._current_explicit = False
+                elif header and header != current:
                     current = header
                     with self._lock:
                         self._open = True
                         self._current = current
                         self._current_label = current
+                        self._current_is_group = bool(is_group)
+                        self._current_explicit = False
+                        self._self_name = self_name
+                elif not header and 'Pane "消息列表"' not in text and current:
+                    # 聊天区被收起/切回会话列表：清掉当前对话，恢复未读摘要。
+                    current = ""
+                    with self._lock:
+                        self._current = ""
+                        self._current_label = ""
+                        self._current_is_group = False
+                        self._current_explicit = False
+                self._push_unread_preview(conversations, active=bool(current))
                 if current:
                     messages = engine.extract_messages(hwnd, current, self_name)
                     with self._lock:
@@ -218,6 +247,7 @@ class QQDesktopPlugin(Plugin):
             self._transcript = transcript
             self._transcript_conversation = current
             self._last_messages = list(messages)
+            self._history_complete = False
         self._publish_transcript(current, transcript)
 
     def _merge_transcript(self, current: str, messages: list) -> list:
@@ -243,8 +273,11 @@ class QQDesktopPlugin(Plugin):
         except (TypeError, ValueError):
             pages = 12
         pages = max(1, min(40, pages))
-        self_name = engine.parse_self_name(engine.snapshot_text(hwnd))
+        initial_text = engine.snapshot_text(hwnd)
+        self_name = engine.parse_self_name(initial_text)
+        is_group = engine.conversation_is_group(initial_text, self_name)
         view = engine.extract_messages(hwnd, name, self_name)
+        initial_count = len(view)
         transcript = list(view)
         stale = 0
         for _ in range(pages):
@@ -271,6 +304,8 @@ class QQDesktopPlugin(Plugin):
             self._transcript = transcript
             self._transcript_conversation = name
             self._last_messages = list(view)
+            # 群聊一开始只有当前窗口、翻页也没加载出更多时，不能声称“完整”。
+            self._history_complete = (len(transcript) > initial_count) or not is_group
         self._publish_transcript(name, transcript)
         return transcript
 
@@ -278,6 +313,9 @@ class QQDesktopPlugin(Plugin):
         """把当前窗口的对话摘录写成独立 state（……表示未显示的消息）。"""
         with self._lock:
             viewport = list(self._last_messages)
+            history_complete = bool(self._history_complete)
+            is_group = bool(self._current_is_group)
+            self_name = str(self._self_name or "")
         transcript = list(messages or [])
         if not transcript and not viewport:
             try:
@@ -305,7 +343,7 @@ class QQDesktopPlugin(Plugin):
             viewport = transcript[start:end]
 
         max_lines = 40
-        clipped_above = start > 0
+        clipped_above = start > 0 or not history_complete
         if len(viewport) > max_lines:
             viewport = viewport[-max_lines:]
             clipped_above = True
@@ -322,9 +360,18 @@ class QQDesktopPlugin(Plugin):
             parts.append("……")
         if not parts:
             return
+        history_note = "；历史未完全加载" if not history_complete else ""
+        group_note = ""
+        if is_group:
+            who = self_name or "我"
+            group_note = (
+                f"；这是群聊：只有明确 @{who} 或点名需要{who}回应时才处理，"
+                "其他人的聊天只当背景，不要主动接任务"
+            )
         header = (
             f"{current} 对话摘录（独立记忆，不是逐条消息；"
-            f"当前窗口 {len(viewport)}/{len(transcript)} 条；……表示未显示）："
+            f"当前窗口 {len(viewport)}/{len(transcript)} 条{history_note}；"
+            f"……表示未显示{group_note}）："
         )
         body = header + "\n" + "\n".join(parts)
         if len(body) > 7000:
@@ -357,6 +404,16 @@ class QQDesktopPlugin(Plugin):
                 and str(message.get("text") or "").strip()
                 and message.get("text") != "【图片】"
             ]
+            with self._lock:
+                is_group = bool(self._current_is_group)
+                self_name = str(self._self_name or "")
+            if is_group:
+                # 群聊里只有明确点名/艾特她时才产生“新消息”冲动；
+                # 其他人的闲聊仍会进摘录做背景，但不触发动作。
+                incoming = [
+                    message for message in incoming
+                    if self_name and self_name in str(message.get("text") or "")
+                ]
             if incoming:
                 senders = []
                 for message in incoming:
@@ -396,36 +453,29 @@ class QQDesktopPlugin(Plugin):
         except Exception:
             pass
 
-    def _push_unread_preview(self, conversations: list) -> None:
-        """把未读会话的名字和最后一条预览写进软件上下文。
+    def _push_unread_preview(self, conversations: list, active: bool = False) -> None:
+        """只报“有未读”，不列群名/预览。
 
-        UIA 的会话列表本身带 preview；这样不用点开会话，辉夜也能知道
-        “谁有未读、最后一条预览是什么”，完整消息再由 open_conversation 读取。
-        preview 不保证来自对方，所以不能当成对方原话注入。
+        群里 999+ 未读一旦列出会话名，她就会一个群一个群地翻，别人的
+        闲聊会不断变成她的任务。这里只保留数量这个事实；要看哪个会话
+        由用户明确指定，插件再读。
         """
         try:
             from core.apps import APP_CONTEXT
 
-            lines = []
-            for item in conversations:
-                unread = int(item.get("unread") or 0)
-                if unread <= 0:
-                    continue
-                label = str(item.get("label") or item.get("id") or "QQ")
-                preview = str(item.get("preview") or "").strip()
-                line = f"{label} 有 {unread} 条未读"
-                if preview:
-                    # 会话列表的 preview 只代表“最后一条”，不保证是对方发的；
-                    # 直接写成“对方：…”会让理解层把自己的最后一句当成新消息。
-                    line += f"；最后一条预览（不一定是对方）：{preview}"
-                lines.append(line)
-            if lines:
-                APP_CONTEXT.remember_state(
-                    "qq_desktop_unread",
-                    "QQ 未读预览：\n" + "\n".join(lines[:10]),
-                )
-            else:
+            with self._lock:
+                if active or (self._open and self._current_label):
+                    APP_CONTEXT.remember_state("qq_desktop_unread", "")
+                    return
+            total = sum(int(item.get("unread") or 0) for item in conversations)
+            if total <= 0:
                 APP_CONTEXT.remember_state("qq_desktop_unread", "")
+                return
+            APP_CONTEXT.remember_state(
+                "qq_desktop_unread",
+                f"QQ 有 {engine.format_unread(total)} 条未读（只报数量；"
+                "不要自己逐个群翻，等用户明确指定要看哪个会话）。",
+            )
         except Exception:
             pass
 
@@ -438,20 +488,28 @@ class QQDesktopPlugin(Plugin):
             current = self._current
             label = self._current_label
         conversations_out = [
-            {"id": item["id"], "label": item["label"], "unread": item["unread"]}
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "unread": min(int(item.get("unread") or 0), 99),
+            }
             for item in conversations
         ]
         return {
             "id": self.plugin_id,
             "label": self.label,
             "open": bool(self._open and hwnd),
-            "unread": unread,
+            # 只把“有未读”作为门控信号，不把数万条原始计数灌给语言层。
+            "unread": min(int(unread or 0), 99),
             "current_conversation": label if current else "",
             "conversations": conversations_out,
             "at_bottom": True,
         }
 
     async def open_app(self) -> dict:
+        with self._lock:
+            if self._open:
+                return {"ok": True, "detail": "QQ 已经打开了"}
         hwnd = engine.find_window()
         if not hwnd:
             return {"ok": False, "detail": "QQ 窗口没有打开"}
@@ -464,17 +522,21 @@ class QQDesktopPlugin(Plugin):
             self._conversations = conversations
             self._unread = unread
         if unread:
-            detail = f"我打开了QQ，有 {unread} 条未读"
+            detail = f"我打开了QQ，有 {engine.format_unread(unread)} 条未读"
         else:
             detail = "我打开了QQ，没有未读消息"
         return {
             "ok": True,
             "detail": detail,
             "conversations": [
-                {"id": item["id"], "label": item["label"], "unread": item["unread"]}
+                {
+                    "id": item["id"],
+                    "label": item["label"],
+                    "unread": min(int(item.get("unread") or 0), 99),
+                }
                 for item in conversations
             ],
-            "unread": unread,
+            "unread": min(int(unread or 0), 99),
         }
 
     async def open_conversation(self, conversation_id: str) -> dict:
@@ -485,22 +547,45 @@ class QQDesktopPlugin(Plugin):
         if not hwnd:
             return {"ok": False, "detail": "QQ 窗口没有打开"}
         use_vision = bool(config.get("qq_desktop_use_vision", True))
-        result = await engine.open_conversation(
-            hwnd, conversation_id, name=conversation_id, use_vision=use_vision
-        )
+        # 动作层有时把“名字（id）”整串传来；拆成候选再匹配。
+        candidates = [conversation_id]
+        match = re.match(r"^(.+?)[（(]([^）)]+)[）)]$", conversation_id)
+        if match:
+            candidates.extend([match.group(1).strip(), match.group(2).strip()])
+        candidates = list(dict.fromkeys(c for c in candidates if c))
+        result = {}
+        used = conversation_id
+        for candidate in candidates:
+            used = candidate
+            result = await engine.open_conversation(
+                hwnd, candidate, name=candidate, use_vision=use_vision
+            )
+            if result.get("ok"):
+                break
         if not result.get("ok"):
             return result
         name = str(result.get("name") or conversation_id)
         content = str(result.get("content") or "")
         text = engine.snapshot_text(hwnd)
         conversations = engine.parse_conversations(text)
+        self_name = engine.parse_self_name(text)
+        is_group = engine.conversation_is_group(text, self_name)
         with self._lock:
             stored = self._transcript_conversation
             existing = len(self._transcript)
-        if stored != name or existing < 5:
+            # 先把当前对话标记写好，_load_history 发布摘录时才能带上群聊提示。
+            self._open = True
+            self._hwnd = hwnd
+            self._current = name
+            self._current_label = name
+            self._current_explicit = True
+            self._current_is_group = bool(is_group)
+            self._self_name = self_name
+            self._conversations = conversations
+            self._unread = engine.total_unread(conversations)
+        if stored != name or existing < 5 or not self._history_complete:
             transcript = self._load_history(hwnd, name)
         else:
-            self_name = engine.parse_self_name(text)
             messages = engine.extract_messages(hwnd, name, self_name)
             self._merge_transcript(name, messages)
             with self._lock:
@@ -508,13 +593,6 @@ class QQDesktopPlugin(Plugin):
         lines = engine.format_messages(transcript, limit=20).splitlines()
         if not lines:
             lines = [ln for ln in content.splitlines() if ln.strip()][:20]
-        with self._lock:
-            self._open = True
-            self._hwnd = hwnd
-            self._current = name
-            self._current_label = name
-            self._conversations = conversations
-            self._unread = engine.total_unread(conversations)
         return {
             "ok": True,
             "detail": f"我点开了{name}的对话，整理了 {len(transcript)} 条对话摘录",
@@ -560,6 +638,8 @@ class QQDesktopPlugin(Plugin):
             self._current = ""
             self._current_label = ""
             self._last_messages = []
+            self._current_explicit = False
+            self._current_is_group = False
         return {"ok": True, "detail": "我退出了这个对话"}
 
     async def close_app(self) -> dict:
@@ -570,6 +650,8 @@ class QQDesktopPlugin(Plugin):
             self._last_messages = []
             self._transcript = []
             self._transcript_conversation = ""
+            self._current_explicit = False
+            self._current_is_group = False
         try:
             from core.apps import APP_CONTEXT
 

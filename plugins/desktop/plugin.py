@@ -51,6 +51,18 @@ def _window_score(title: str, prefer: str) -> int:
     return score
 
 
+def _task_similar(left: str, right: str) -> bool:
+    """粗粒度判断两条电脑任务是不是在追同一件失败的事。"""
+    def grams(text):
+        text = "".join(str(text or "").split()).lower()
+        return {text[i:i + 2] for i in range(max(0, len(text) - 1))}
+
+    a, b = grams(left), grams(right)
+    if not a or not b:
+        return str(left).strip() == str(right).strip()
+    return len(a & b) / max(1, len(a | b)) >= 0.30
+
+
 class DesktopPlugin(Plugin):
     plugin_id = "desktop"
     label = "电脑"
@@ -70,6 +82,10 @@ class DesktopPlugin(Plugin):
         self._observe_stop = threading.Event()
         self._observe_thread = None
         self._active_notepad = 0
+        self._last_task_failure = None
+        self._result_token = 0
+        self._task_cooldown_until = 0.0
+        self._failed_tasks = []
         try:
             width = int(config.get("desktop_worker_width", 1280))
             height = int(config.get("desktop_worker_height", 800))
@@ -833,6 +849,29 @@ class DesktopPlugin(Plugin):
         with self._lock:
             if self._task and self._task.get("status") == "running":
                 return {"ok": False, "detail": f"电脑还在忙：{self._task.get('text')}"}
+            if time.time() < self._task_cooldown_until:
+                return {
+                    "ok": False,
+                    "detail": "电脑刚失败过，先停一会儿，不要马上再交新的电脑任务。",
+                }
+            now = time.time()
+            self._failed_tasks = [
+                (text, at) for text, at in self._failed_tasks if now - at < 1800
+            ]
+            for text, _at in self._failed_tasks:
+                if _task_similar(task, text):
+                    return {
+                        "ok": False,
+                        "detail": "这件电脑任务刚才失败过，先别换个说法继续追；"
+                        "等用户明确要求再重试。",
+                    }
+            if self._last_task_failure:
+                last_text, last_at = self._last_task_failure
+                if last_text == task and time.time() - last_at < 90:
+                    return {
+                        "ok": False,
+                        "detail": "刚才同样的电脑任务失败过，先别重复；换个做法或先确认目标窗口还在。",
+                    }
             self._task = {
                 "text": task,
                 "status": "running",
@@ -850,6 +889,7 @@ class DesktopPlugin(Plugin):
                 "[现在] 电脑还在忙",
             ))
             APP_CONTEXT.remember_state("desktop_progress", "")
+            APP_CONTEXT.remember_state("desktop_last_result", "")
         except Exception:
             pass
         self._running = True
@@ -893,6 +933,15 @@ class DesktopPlugin(Plugin):
                     status="done" if result.get("ok") else "failed",
                     summary=str(result.get("summary") or ""),
                 )
+            if result.get("ok"):
+                self._last_task_failure = None
+                self._task_cooldown_until = 0.0
+            else:
+                self._last_task_failure = (task, time.time())
+                self._task_cooldown_until = time.time() + 60.0
+                if not any(_task_similar(task, text) for text, _at in self._failed_tasks):
+                    self._failed_tasks.append((task, time.time()))
+                    self._failed_tasks = self._failed_tasks[-20:]
         # 任务结束后清掉“进行中”状态，只留一条最终摘要。
         try:
             from core.apps import APP_CONTEXT
@@ -900,7 +949,7 @@ class DesktopPlugin(Plugin):
             APP_CONTEXT.remember_state("desktop_progress", "")
         except Exception:
             pass
-        self._remember(f"电脑那边结束了：{result.get('summary') or '没有留下说明'}")
+        self._remember_result(f"电脑那边结束了：{result.get('summary') or '没有留下说明'}")
         # 任务结束后桌面状态可能变了，刷新概览（覆盖同一个 key）。
         self._push_overview()
 
@@ -930,6 +979,7 @@ class DesktopPlugin(Plugin):
 
             APP_CONTEXT.remember_state("desktop_overview", "")
             APP_CONTEXT.remember_state("desktop_progress", "")
+            APP_CONTEXT.remember_state("desktop_last_result", "")
         except Exception:
             pass
 
@@ -941,6 +991,33 @@ class DesktopPlugin(Plugin):
             APP_CONTEXT.remember(text)
         except Exception:
             pass
+
+    def _remember_result(self, text: str) -> None:
+        """任务结果只展示一小段时间，避免一轮轮重复“电脑那边结束了”。"""
+        try:
+            from core.apps import APP_CONTEXT
+
+            APP_CONTEXT.remember_state("desktop_last_result", text)
+            with self._lock:
+                self._result_token += 1
+                token = self._result_token
+
+            def clear():
+                try:
+                    from core.apps import APP_CONTEXT as ctx
+
+                    with self._lock:
+                        if self._result_token != token:
+                            return
+                        ctx.remember_state("desktop_last_result", "")
+                except Exception:
+                    pass
+
+            timer = threading.Timer(20.0, clear)
+            timer.daemon = True
+            timer.start()
+        except Exception:
+            self._remember(text)
 
     # ---------- 思考窗口接口 ----------
     @staticmethod

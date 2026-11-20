@@ -189,14 +189,29 @@ class AppContext:
                 if current_conversation:
                     state += f"，正在看{self._conversation_label(app, current_conversation)}"
                 if app["unread"] > 0:
-                    state += f"；另外还有 {app['unread']} 条未读"
+                    state += f"；另外还有 {self._unread_text(app['unread'])} 条未读"
                 notifications[f"__open__{app_id}"] = state
             elif app["unread"] > 0:
-                notifications[app_id] = f"{app['label']}有 {app['unread']} 条未读消息"
+                notifications[app_id] = (
+                    f"{app['label']}有 {self._unread_text(app['unread'])} 条未读消息"
+                )
         with self._lock:
             self._notifications = notifications
             self._current_app = current_app
             self._current_conversation = current_conversation
+
+    @staticmethod
+    def _unread_text(value) -> str:
+        """未读数只作为提示，不把几万条原始计数直接灌进提示词。"""
+        try:
+            count = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if count >= 1000:
+            return "999+"
+        if count >= 100:
+            return "99+"
+        return str(count)
 
     @staticmethod
     def _conversation_label(app: dict, conversation_id: str) -> str:
