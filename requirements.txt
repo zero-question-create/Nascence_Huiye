@@ -40,3 +40,7 @@ uiautomation==2.0.29
 urllib3==2.7.0
 websockets==16.1
 yarl==1.24.2
+# B站视频分析技能：下载低清视频/音频；未安装时技能回落到元数据/字幕
+yt-dlp>=2024.12.23
+# 自带 ffmpeg 二进制，避免用户系统未安装 ffmpeg 时无法合并/抽帧
+imageio-ffmpeg>=0.5.1

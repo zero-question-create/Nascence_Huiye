@@ -667,7 +667,7 @@ async def _vision_describe(hwnd: int, name: str = "") -> str:
         )
         try:
             return await describe_image_from_path(
-                str(path), prompt=prompt, max_chars=1200, max_tokens=3000, timeout=120.0
+                str(path), prompt=prompt, max_tokens=3000, timeout=120.0, full=True
             )
         finally:
             try:

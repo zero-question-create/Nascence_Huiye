@@ -33,6 +33,32 @@ if [ $? -ne 0 ]; then
 fi
 echo "[OK] Python dependencies installed"
 
+# ---------- 2b. Git for plugin marketplace ----------
+if command -v git >/dev/null 2>&1; then
+    echo "[OK] git already exists: $(command -v git)"
+else
+    echo "[*] Installing git..."
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y git || true
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y git || true
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -Sy --noconfirm git || true
+    elif command -v brew >/dev/null 2>&1; then
+        brew install git || true
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        echo "[!] git install failed; plugin marketplace updates will be unavailable."
+    fi
+fi
+
+# ---------- 2c. Bootstrap plugins ----------
+if [ -f "config/plugin_bootstrap.json" ]; then
+    echo "[*] Installing default plugins..."
+    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/tools/install_bootstrap.py" --required-only || \
+        echo "[!] Some default plugins were not installed; use the community page to retry."
+fi
+
 # ---------- 3. Download Ollama (Linux/macOS) ----------
 OLLAMA_DIR="$PROJECT_DIR/ollama"
 OLLAMA_BIN="$OLLAMA_DIR/bin/ollama"

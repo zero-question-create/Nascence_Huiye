@@ -67,7 +67,7 @@ if sys.platform == "linux":
     os.environ.setdefault("GTK_IM_MODULE", "fcitx")
     os.environ.setdefault("XMODIFIERS", "@im=fcitx")
 
-from core.llm_interface import describe_image_from_path, describe_audio_from_path, describe_video_from_path, decompose_input
+from core.llm_interface import describe_image_from_path, describe_image_full, describe_audio_from_path, describe_video_from_path, decompose_input
 from utils.event_bus import BUS
 from utils.metrics_probe import PROBE
 from utils.atomic_io import atomic_write_json
@@ -1084,6 +1084,8 @@ def _media_phrase(media_type: str, desc: str) -> str:
         return f"一张图片，内容是“{desc}”"
     if media_type == "record":
         return f"一段录音，内容是“{desc}”"
+    if media_type == "note":
+        return str(desc)
     return f"一个视频，内容是“{desc}”"
 
 
@@ -1136,6 +1138,24 @@ def _sticker_desc_from_summary(summary: str) -> str | None:
     if not text or text.lower() in _GENERIC_STICKER_SUMMARIES:
         return None
     return text[:30]
+
+
+def _clip_media_caption(full: str, is_sticker: bool = False) -> str:
+    """给记忆/动作提示用的短标题；完整内容留在 media_store。"""
+    text = " ".join(str(full or "").split())
+    if not text:
+        return "表情包" if is_sticker else "图片"
+    try:
+        limit = max(20, int(config.get("media_caption_max_chars", 80)))
+    except (TypeError, ValueError):
+        limit = 80
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(p) for p in "。！？；，、,.!?;")
+    if cut >= limit // 2:
+        return head[:cut].rstrip("，、,;；")
+    return head.rstrip()
 
 
 def _is_generic_media_desc(desc: str) -> bool:
@@ -1688,12 +1708,24 @@ async def _handle_group_message_impl(data: dict, from_flush: bool = False):
     media_list = []  # 收集 (type, description)
     media_refs = []  # 与 media_list 对齐的暂存引用（无暂存时为 None）
     media_tasks = [] # [(order, coroutine)]
+    media_skipped = 0
     _media_sem = asyncio.Semaphore(2)
-    _MAX_MEDIA_DESC = 3   # 单条消息最多描述 3 个媒体段，其余只记数量
+    try:
+        _media_max_items = max(1, int(config.get("media_max_items", 12)))
+    except (TypeError, ValueError):
+        _media_max_items = 12
+    try:
+        _media_total_bytes = max(1, int(config.get("media_total_mb", 40))) * 1024 * 1024
+    except (TypeError, ValueError):
+        _media_total_bytes = 40 * 1024 * 1024
+    _media_bytes_used = 0
+    _message_id = str(data.get("message_id") or data.get("msg_id") or "")
 
     async def _describe_one(order, seg_type, seg_data, tmp_path, file_format, owns_tmp_path):
         try:
             async with _media_sem:
+                caption = ""
+                full = ""
                 if seg_type == "image":
                     chk_gif = file_format == "gif"
                     chk_mface = bool(seg_data.get("emoji_id") or seg_data.get("emoji_package_id") or seg_data.get("key"))
@@ -1702,23 +1734,48 @@ async def _handle_group_message_impl(data: dict, from_flush: bool = False):
                     chk_subtype = str(seg_data.get("sub_type")) == "1"
                     is_sticker = chk_gif or chk_mface or chk_summary or chk_subtype
                     media_type = "sticker" if is_sticker else "image"
-                    # 有真正的官方摘要才省掉视觉调用；占位摘要必须走图片解析
-                    desc = _sticker_desc_from_summary(summary) if (is_sticker and not chk_gif) else None
-                    if desc is None:
-                        max_chars = 30 if is_sticker else 60
-                        desc = await describe_image_from_path(tmp_path, max_chars=max_chars)
-                    if is_sticker and (not desc or desc.startswith("[图片识别失败") or desc.startswith("[图片文件不存在")):
-                        desc = _sticker_desc_from_summary(summary) or "表情包"
+                    # 官方摘要只作为 fallback；优先做完整视觉分析，不再截到 30/60 字。
+                    full = await describe_image_full(
+                        tmp_path, timeout=120.0, sticker=is_sticker
+                    )
+                    if (not full or full.startswith("[图片识别失败")
+                            or full.startswith("[图片文件不存在")):
+                        full = _sticker_desc_from_summary(summary) if is_sticker else ""
+                        if not full:
+                            full = await describe_image_from_path(
+                                tmp_path,
+                                max_chars=30 if is_sticker else 60,
+                            )
+                    caption = _clip_media_caption(full, is_sticker)
+                    if full and not full.startswith("[图片识别失败"):
+                        try:
+                            from core import media_store
+                            media_store.save_media(
+                                media_type,
+                                tmp_path,
+                                caption=caption,
+                                full_description=full,
+                                message_id=_message_id,
+                                sender=sender_name,
+                                pack_id=str(seg_data.get("emoji_package_id") or ""),
+                                emoji_id=str(seg_data.get("emoji_id") or ""),
+                                meta={"summary": summary},
+                            )
+                        except Exception as exc:
+                            logger.warning(f"媒体全文入库失败: {exc}")
+                    desc = caption or full
                 elif seg_type == "record":
                     media_type = "record"
                     desc = await describe_audio_from_path(tmp_path)
+                    full = desc
                 else:
                     media_type = "video"
                     desc = await describe_video_from_path(tmp_path)
-                return (order, media_type, desc, tmp_path, owns_tmp_path)
+                    full = desc
+                return (order, media_type, desc, full, tmp_path, owns_tmp_path)
         except Exception as e:
             logger.warning(f"处理媒体失败: {e}")
-            return (order, None, None, tmp_path, owns_tmp_path)
+            return (order, None, None, "", tmp_path, owns_tmp_path)
 
     for seg in message_segments:
         seg_type = seg.get("type")
@@ -1734,8 +1791,9 @@ async def _handle_group_message_impl(data: dict, from_flush: bool = False):
             media_refs.append(None)
             continue
 
-        # 超出描述上限的媒体不再下载：只记录数量，避免一条消息打爆视觉调用
-        if len(media_tasks) + len(media_list) >= _MAX_MEDIA_DESC:
+        # 超出条数上限的媒体不再下载：记录 skipped，最后明确告诉辉夜。
+        if len(media_tasks) + len(media_list) >= _media_max_items:
+            media_skipped += 1
             continue
 
         # NapCat 常直接给出本地文件路径（QQ 缓存目录）。命中时优先复制本地文件，
@@ -1833,11 +1891,24 @@ async def _handle_group_message_impl(data: dict, from_flush: bool = False):
                     pass
             continue
 
+        try:
+            media_size = os.path.getsize(tmp_path) if tmp_path else 0
+        except OSError:
+            media_size = 0
+        if media_size and _media_bytes_used + media_size > _media_total_bytes:
+            media_skipped += 1
+            if tmp_path and owns_tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            continue
+        _media_bytes_used += media_size
         media_tasks.append(_describe_one(len(media_tasks), seg_type, seg_data, tmp_path, file_format, owns_tmp_path))
 
     if media_tasks:
         described = await asyncio.gather(*media_tasks)
-        for _order, media_type, desc, tmp_path, owns_tmp_path in sorted(described, key=lambda x: x[0]):
+        for _order, media_type, desc, full, tmp_path, owns_tmp_path in sorted(described, key=lambda x: x[0]):
             if not media_type or not desc:
                 continue
             media_list.append((media_type, desc))
@@ -1858,6 +1929,10 @@ async def _handle_group_message_impl(data: dict, from_flush: bool = False):
                     os.remove(tmp_path)
                 except OSError:
                     logger.info(f"临时文件删除失败，请及时清理：{tmp_path}")
+
+    if media_skipped:
+        media_list.append(("note", f"另有 {media_skipped} 个媒体因数量/大小限制未解析"))
+        media_refs.append(None)
 
     # 媒体描述异步执行，期间事件循环仍在处理其他消息；这里更新探针便于观测
     PROBE.bump("message.media_count", len(media_list))

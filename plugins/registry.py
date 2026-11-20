@@ -22,6 +22,13 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Type
 
+from core.plugin_manifest import (
+    build_legacy_manifest,
+    manifest_for_panel,
+    normalize_manifest,
+    read_manifest,
+    validate_manifest,
+)
 from utils.atomic_io import atomic_write_json
 
 from .base import Capability, Plugin
@@ -60,6 +67,7 @@ DEFAULT_CONFIG = {
         "web": copy.deepcopy(_DEFAULT_PLUGIN),
         "bilibili": copy.deepcopy(_DEFAULT_PLUGIN),
         "browser": {**copy.deepcopy(_DEFAULT_PLUGIN), "enabled": True},
+        "skills": {**copy.deepcopy(_DEFAULT_PLUGIN), "enabled": True},
     },
 }
 
@@ -68,6 +76,7 @@ _config_cache: Optional[dict] = None
 _plugin_classes: Optional[Dict[str, Type[Plugin]]] = None
 _instances: Dict[str, Plugin] = {}
 _panel_cache: Dict[str, object] = {}
+_manifest_cache: Dict[str, dict] = {}
 
 
 def _logger():
@@ -192,9 +201,11 @@ def reload():
     """
     global _config_cache, _plugin_classes
     with _LOCK:
+        importlib.invalidate_caches()
         _config_cache = None
         _plugin_classes = None
         _panel_cache.clear()
+        _manifest_cache.clear()
         # 重新读盘并把新设置灌回现有实例；不销毁实例本身。
         fresh = _normalize(_read_raw())
         _config_cache = fresh
@@ -212,14 +223,28 @@ def _discover() -> Dict[str, Type[Plugin]]:
     """扫描 plugins/*/plugin.py 中的 PLUGIN 类。"""
     found: Dict[str, Type[Plugin]] = {}
     try:
+        importlib.invalidate_caches()
         import plugins as package
     except Exception as exc:
         _logger().exception("插件包导入失败: %s", exc)
         return found
 
+    plugin_root = Path(package.__path__[0])
     for info in pkgutil.iter_modules(package.__path__):
-        if not info.ispkg or info.name in ("base", "registry"):
+        if not info.ispkg or info.name in ("base", "registry", "panel", "chat_store"):
             continue
+        plugin_dir = plugin_root / info.name
+        manifest = read_manifest(plugin_dir)
+        plugin_id = str(manifest.get("id") or info.name).strip() or info.name
+        if manifest:
+            normalized = normalize_manifest(manifest, fallback_id=info.name)
+            errors = validate_manifest(normalized, expected_id=info.name)
+            if errors:
+                _logger().error(
+                    "插件 %s 清单校验失败，已跳过：%s", info.name, "；".join(errors)
+                )
+                continue
+            manifest = normalized
         module_name = f"plugins.{info.name}.plugin"
         try:
             module = importlib.import_module(module_name)
@@ -236,8 +261,9 @@ def _discover() -> Dict[str, Type[Plugin]]:
         if not isinstance(cls, type) or not issubclass(cls, Plugin):
             _logger().warning("插件 %s 未导出 Plugin 子类 PLUGIN，已跳过", info.name)
             continue
-        plugin_id = getattr(cls, "plugin_id", "") or info.name
-        found[plugin_id] = cls
+        actual_id = getattr(cls, "plugin_id", "") or plugin_id
+        found[actual_id] = cls
+        _manifest_cache[actual_id] = manifest or build_legacy_manifest(actual_id, cls)
     return found
 
 
@@ -254,6 +280,23 @@ def plugin_ids() -> List[str]:
     ordered = [pid for pid in BUILTIN_ORDER if pid in ids]
     ordered.extend(sorted(pid for pid in ids if pid not in ordered))
     return ordered
+
+
+def plugin_manifest(plugin_id: str) -> dict:
+    """返回插件清单（无清单的旧插件返回合成的 legacy 清单）。"""
+    plugin_id = str(plugin_id or "").strip()
+    if not plugin_id:
+        return {}
+    classes = _classes()
+    cls = classes.get(plugin_id)
+    if cls is None:
+        return {}
+    with _LOCK:
+        cached = _manifest_cache.get(plugin_id)
+        if cached is None:
+            cached = build_legacy_manifest(plugin_id, cls)
+            _manifest_cache[plugin_id] = cached
+        return dict(cached)
 
 
 def get_plugin(plugin_id: str) -> Optional[Plugin]:
@@ -399,6 +442,7 @@ def list_plugins() -> List[dict]:
         if instance is None:
             continue
         entry = cfg["plugins"].get(plugin_id, {})
+        manifest = manifest_for_panel(plugin_manifest(plugin_id))
         item = {
             "id": plugin_id,
             "label": instance.label or plugin_id,
@@ -407,12 +451,19 @@ def list_plugins() -> List[dict]:
             "enabled": bool(entry.get("enabled", False)),
             "autostart": bool(entry.get("autostart", False)),
             "is_app": bool(getattr(instance, "is_app", False)),
+            "is_skill": bool(getattr(instance, "is_skill", False)),
             "follow_global_behavior": bool(entry.get("follow_global_behavior", True)),
             "action_include_reasoning": bool(entry.get("action_include_reasoning", False)),
             "active": plugin_id == cfg.get("active"),
             "llm": _safe_llm(entry),
             "action_llm": _safe_llm_value(entry.get("action_llm")),
             "description": instance.description,
+            "version": manifest.get("version") or getattr(instance, "version", "0.0.0"),
+            "author": manifest.get("author") or getattr(instance, "author", ""),
+            "kind": manifest.get("kind") or ("skill" if getattr(instance, "is_skill", False) else "app"),
+            "permissions": manifest.get("permissions") or [],
+            "source": manifest.get("source") or "",
+            "manifest": manifest,
         }
         try:
             item["status"] = instance.status()
@@ -443,7 +494,6 @@ def list_plugins() -> List[dict]:
             item["conflict_note"] = str(instance.conflict_note(others) or "")
         except Exception:
             item["conflict_note"] = ""
-    return result
     return result
 
 

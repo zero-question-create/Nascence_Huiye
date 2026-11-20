@@ -486,9 +486,22 @@ DEFAULT_STICKER_PROMPT = (
     "客观描述这个表情包：画面主体和关键文字，最多30字。"
     "不要猜测人物身份、关系、情绪或意图。"
 )
+DEFAULT_IMAGE_FULL_PROMPT = (
+    "请完整、客观地分析这张图片：\n"
+    "1. 画面主体、场景、人物外观与动作；\n"
+    "2. 所有可见文字逐字转录（保留换行/标点）；\n"
+    "3. 图片类型（照片/截图/表情包/海报等）、构图与明显细节；\n"
+    "4. 不确定的地方明确说“不确定”，不要猜测身份、关系或意图。\n"
+    "输出可以较长，不要省略关键信息。"
+)
+DEFAULT_STICKER_FULL_PROMPT = (
+    "请完整分析这个表情包：画面主体、角色/物体外观、动作、所有可见文字逐字转录、"
+    "是否为动图以及可能的循环动作。不要猜测人物身份、关系、情绪或意图；"
+    "不确定就写“不确定”。输出可以较长，不要只给一句概括。"
+)
 
 _DESC_CACHE_FILE = "data/test/media_desc_cache.json"
-_DESC_CACHE_VERSION = "v2"
+_DESC_CACHE_VERSION = "v3"
 _desc_cache = OrderedDict()
 _desc_cache_lock = __import__("threading").RLock()
 
@@ -552,24 +565,37 @@ def _sniff_image_mime(raw: bytes) -> str:
 
 
 async def describe_image_from_path(image_path: str, prompt: str = None, max_chars: int = None,
-                                   max_tokens: int = 160, timeout: float = 30.0) -> str:
-    """从本地路径读取图片，返回简短客观描述。
+                                   max_tokens: int = None, timeout: float = 30.0,
+                                   full: bool = False, sticker: bool = False) -> str:
+    """从本地路径读取图片，返回描述。
 
-    - 默认使用短描述提示词，max_tokens=160，temperature=0；
-    - 视觉模型若是推理模型，调用方可以传更大的 max_tokens（如 3000）；
-    - 相同文件 + 相同提示词命中内容哈希缓存，不再调用视觉模型；
-    - max_chars 控制最终长度（图片 60、表情包 30），在标点处截断。
+    - 默认短描述：max_tokens=160、图片 60 字/表情包 30 字；
+    - full=True：使用完整分析提示词、默认 3000 tokens、不截断，存完整内容；
+    - 相同文件 + 相同提示词命中内容哈希缓存，不再调用视觉模型。
     """
     if not os.path.exists(image_path):
         return f"[图片文件不存在: {image_path}]"
 
     if prompt is None:
-        prompt = DEFAULT_IMAGE_PROMPT
-    if max_chars is None:
-        try:
-            max_chars = int(config.get("image_desc_max_chars", 60))
-        except (TypeError, ValueError):
-            max_chars = 60
+        if full:
+            prompt = DEFAULT_STICKER_FULL_PROMPT if sticker else DEFAULT_IMAGE_FULL_PROMPT
+        else:
+            prompt = DEFAULT_STICKER_PROMPT if sticker else DEFAULT_IMAGE_PROMPT
+    if full:
+        if max_tokens is None:
+            try:
+                max_tokens = int(config.get("media_full_max_tokens", 3000))
+            except (TypeError, ValueError):
+                max_tokens = 3000
+        max_chars = None
+    else:
+        if max_tokens is None:
+            max_tokens = 160
+        if max_chars is None:
+            try:
+                max_chars = int(config.get("image_desc_max_chars", 60))
+            except (TypeError, ValueError):
+                max_chars = 60
 
     try:
         async def read_and_encode():
@@ -579,7 +605,7 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
 
         raw_bytes, base64_str = await read_and_encode()
         digest = hashlib.sha256(raw_bytes).hexdigest()
-        cache_key = f"{_DESC_CACHE_VERSION}|{digest}|{prompt}|{max_chars}"
+        cache_key = f"{_DESC_CACHE_VERSION}|{digest}|{prompt}|{max_chars}|{max_tokens}|{int(full)}"
 
         _load_desc_cache()
         with _desc_cache_lock:
@@ -597,9 +623,8 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
         }
         mime_type = _sniff_image_mime(raw_bytes) or mime_map.get(ext, 'image/jpeg')
 
-        PROBE.bump("vision.calls")
-        with PROBE.timed("vision.ms"):
-            response = await asyncio.to_thread(
+        async def _vision_call(tokens: int):
+            return await asyncio.to_thread(
                 lambda: client_.chat.completions.create(
                     model=MODEL_,
                     messages=[
@@ -617,13 +642,23 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
                         }
                     ],
                     stream=False,
-                    max_tokens=int(max_tokens),
+                    max_tokens=int(tokens),
                     temperature=0,
                     timeout=float(timeout),
                 )
             )
+
+        PROBE.bump("vision.calls")
+        with PROBE.timed("vision.ms"):
+            response = await _vision_call(int(max_tokens))
         _record_usage("vision", response)
         content = response.choices[0].message.content
+        # 推理型视觉模型可能把 token 全花在 reasoning 上，full 模式空结果时扩容重试一次。
+        if full and len(str(content or "").strip()) < 20 and int(max_tokens) < 6000:
+            with PROBE.timed("vision.ms"):
+                response = await _vision_call(max(4000, int(max_tokens) * 2))
+            _record_usage("vision", response)
+            content = response.choices[0].message.content
         reply = _clip_desc(content or "", max_chars)
         append_log("="*30+"多模态理解"+"="*30)
         append_log(reply)
@@ -646,6 +681,19 @@ async def describe_image_from_path(image_path: str, prompt: str = None, max_char
     except Exception as e:
         PROBE.bump("vision.errors")
         return f"[图片识别失败: {e}]"
+
+async def describe_image_full(image_path: str, prompt: str = None, max_tokens: int = None,
+                              timeout: float = 120.0, sticker: bool = False) -> str:
+    """完整图片/表情包分析（不截断，默认 3000 tokens）。"""
+    return await describe_image_from_path(
+        image_path,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        full=True,
+        sticker=sticker,
+    )
+
 
 async def describe_audio_from_path(audio_path: str, prompt: str = "请描述这段音频内容") -> str:
     return await _describe_media_from_path(audio_path, "audio", prompt)

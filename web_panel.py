@@ -18,11 +18,15 @@
 
 import argparse
 import asyncio
+import hmac
+import ipaddress
 import logging
 import os
 import signal
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -479,6 +483,32 @@ async def handle_plugin_panel_save(request):
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
 
 
+async def handle_plugin_readme(request):
+    """读取已安装插件的 README（只允许插件目录内文件）。"""
+    try:
+        plugin_id = str(request.query.get("id") or "").strip()
+        if not plugin_id or "/" in plugin_id or "\\" in plugin_id or ".." in plugin_id:
+            return web.json_response({"ok": False, "error": "插件 id 非法"}, status=400)
+        from plugins import registry
+        from core.plugin_manifest import read_manifest, normalize_manifest
+
+        plugin_dir = PROJECT_DIR / "plugins" / plugin_id
+        manifest = normalize_manifest(read_manifest(plugin_dir), fallback_id=plugin_id)
+        readme_name = str(manifest.get("readme") or "README.md")
+        readme_path = (plugin_dir / readme_name).resolve()
+        root = plugin_dir.resolve()
+        if root != readme_path and root not in readme_path.parents:
+            return web.json_response({"ok": False, "error": "README 路径越界"}, status=400)
+        text = ""
+        if readme_path.is_file():
+            text = readme_path.read_text(encoding="utf-8", errors="replace")[:200000]
+        return web.json_response({"ok": True, "id": plugin_id, "readme": text})
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
 async def handle_plugin_panel_action(request):
     """执行插件面板上声明的动作（自测、收起工作桌面等）。"""
     try:
@@ -498,6 +528,280 @@ async def handle_plugin_panel_action(request):
         return web.json_response({"ok": True, "detail": result.get("detail") or ""})
     except Exception as e:
         return web.json_response({"ok": False, "error": panel.format_error(str(e))}, status=500)
+
+
+def _is_loopback(request) -> bool:
+    try:
+        peer = request.transport.get_extra_info("peername")
+        host = str((peer or ("", 0))[0])
+        return ipaddress.ip_address(host).is_loopback
+    except Exception:
+        return False
+
+
+def _community_guard(request):
+    """安装/更新/导入/重启的写操作保护。
+
+    本机访问默认放行；远程（Docker/反代）必须配置 panel_token，
+    否则任何人都能通过面板安装并执行插件代码。
+    """
+    from config.api_config import config
+
+    try:
+        enabled = bool(config.get("community_install_enabled", True))
+    except Exception:
+        enabled = True
+    if not enabled:
+        return web.json_response({"ok": False, "error": "插件安装已在配置中关闭"}, status=403)
+    expected = str(config.get("panel_token") or "").strip()
+    provided = (
+        request.headers.get("X-NHY-Token")
+        or request.query.get("token")
+        or ""
+    ).strip()
+    if expected:
+        if not provided or not hmac.compare_digest(provided, expected):
+            return web.json_response({"ok": False, "error": "管理 token 不正确"}, status=403)
+    elif not _is_loopback(request):
+        return web.json_response(
+            {"ok": False, "error": "远程安装插件需要先配置 panel_token"},
+            status=403,
+        )
+    return None
+
+
+async def handle_community_plugins(request):
+    """返回 GitHub/cached catalog + 本机安装摘要。"""
+    try:
+        force = str(request.query.get("refresh") or "") in ("1", "true", "yes")
+        from core import plugin_market
+
+        loop = asyncio.get_running_loop()
+        catalog, installed = await asyncio.gather(
+            loop.run_in_executor(None, plugin_market.get_catalog, force),
+            loop.run_in_executor(None, plugin_market.installed_summary),
+        )
+        return web.json_response({
+            "ok": True,
+            "plugins": catalog.get("plugins") or [],
+            "installed": installed,
+            "stale": bool(catalog.get("stale")),
+            "error": catalog.get("error") or "",
+            "fetched_at": catalog.get("fetched_at"),
+        })
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_config(request):
+    """社区设置：GitHub token/账号/topic/安装开关。"""
+    from config.api_config import load_config
+
+    if request.method == "GET":
+        cfg = load_config()
+        return web.json_response({
+            "ok": True,
+            "github_token_configured": bool(str(cfg.get("community_github_token") or "").strip()),
+            "github_user": str(cfg.get("community_github_user") or ""),
+            "topic": str(cfg.get("community_topic") or "nhy-plugin"),
+            "install_enabled": bool(cfg.get("community_install_enabled", True)),
+            "allow_git": bool(cfg.get("community_allow_git", True)),
+        })
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+        cfg = load_config()
+        token = str(body.get("github_token") or "").strip()
+        if token:
+            cfg["community_github_token"] = token
+        if body.get("clear_token"):
+            cfg["community_github_token"] = ""
+        if "github_user" in body:
+            cfg["community_github_user"] = str(body.get("github_user") or "").strip()
+        if "topic" in body:
+            cfg["community_topic"] = str(body.get("topic") or "nhy-plugin").strip()
+        if "install_enabled" in body:
+            cfg["community_install_enabled"] = bool(body.get("install_enabled"))
+        if "allow_git" in body:
+            cfg["community_allow_git"] = bool(body.get("allow_git"))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, panel.save_panel_config, cfg)
+        await loop.run_in_executor(None, panel.apply_config_hot_reload, cfg)
+        return web.json_response({"ok": True})
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_readme(request):
+    try:
+        plugin_id = str(request.query.get("id") or "").strip()
+        if not plugin_id:
+            return web.json_response({"ok": False, "error": "缺少插件 id"}, status=400)
+        from core import plugin_market
+
+        text = await asyncio.get_running_loop().run_in_executor(
+            None, plugin_market.read_readme, plugin_id
+        )
+        return web.json_response({"ok": True, "id": plugin_id, "readme": text})
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_install(request):
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        if not plugin_id:
+            return web.json_response({"ok": False, "error": "缺少插件 id"}, status=400)
+        from core import plugin_market
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, plugin_market.install_plugin, plugin_id, bool(body.get("force"))
+        )
+        if result.get("ok"):
+            from plugins import registry
+            await asyncio.get_running_loop().run_in_executor(None, registry.reload)
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_update(request):
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        if not plugin_id:
+            return web.json_response({"ok": False, "error": "缺少插件 id"}, status=400)
+        from core import plugin_market
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, plugin_market.update_plugin, plugin_id
+        )
+        if result.get("ok"):
+            from plugins import registry
+            await asyncio.get_running_loop().run_in_executor(None, registry.reload)
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_uninstall(request):
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+        plugin_id = str(body.get("id") or "").strip()
+        if not plugin_id:
+            return web.json_response({"ok": False, "error": "缺少插件 id"}, status=400)
+        from core import plugin_market
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, plugin_market.uninstall, plugin_id, bool(body.get("purge"))
+        )
+        if result.get("ok"):
+            from plugins import registry
+            await asyncio.get_running_loop().run_in_executor(None, registry.reload)
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_community_import(request):
+    """导入本地插件：支持 zip 上传或本机路径。"""
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        from core.plugin_install import install_from_directory, install_from_zip
+
+        content_type = str(request.headers.get("Content-Type") or "")
+        path = ""
+        upload = None
+        if content_type.startswith("multipart/"):
+            reader = await request.multipart()
+            field = await reader.next()
+            while field is not None:
+                if field.name == "path":
+                    path = (await field.text()).strip()
+                elif field.name == "file" and field.filename:
+                    suffix = Path(field.filename).suffix or ".zip"
+                    upload_dir = PROJECT_DIR / "data" / "test" / "plugin_uploads"
+                    upload_dir.mkdir(parents=True, exist_ok=True)
+                    upload = upload_dir / f"upload_{int(time.time())}{suffix}"
+                    with upload.open("wb") as handle:
+                        while True:
+                            chunk = await field.read_chunk()
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                field = await reader.next()
+        else:
+            body = await request.json()
+            path = str(body.get("path") or "").strip()
+
+        if upload is not None:
+            result = install_from_zip(upload, source="local-upload")
+            upload.unlink(missing_ok=True)
+        elif path:
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = PROJECT_DIR / candidate
+            if candidate.is_dir():
+                result = install_from_directory(candidate, source="local-import")
+            elif candidate.is_file():
+                result = install_from_zip(candidate, source="local-import")
+            else:
+                return web.json_response({"ok": False, "error": "路径不存在"}, status=400)
+        else:
+            return web.json_response({"ok": False, "error": "请上传 zip 或填写路径"}, status=400)
+        if result.get("ok"):
+            from plugins import registry
+            await asyncio.get_running_loop().run_in_executor(None, registry.reload)
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
+
+
+async def handle_restart(request):
+    denied = _community_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        request.app["restart_event"] = True
+
+        async def _later():
+            await asyncio.sleep(0.6)
+            request.app["stop_event"].set()
+
+        asyncio.create_task(_later())
+        return web.json_response({"ok": True, "detail": "正在重启面板"})
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": panel.format_error(str(exc))}, status=500
+        )
 
 
 async def handle_cognitive_start(request):
@@ -620,7 +924,17 @@ def _build_app():
     app.router.add_post("/api/plugins/start", handle_plugin_start)
     app.router.add_post("/api/plugins/stop", handle_plugin_stop)
     app.router.add_post("/api/plugins/panel", handle_plugin_panel_save)
+    app.router.add_get("/api/plugins/readme", handle_plugin_readme)
     app.router.add_post("/api/plugins/panel/action", handle_plugin_panel_action)
+    app.router.add_get("/api/community/plugins", handle_community_plugins)
+    app.router.add_get("/api/community/config", handle_community_config)
+    app.router.add_post("/api/community/config", handle_community_config)
+    app.router.add_get("/api/community/readme", handle_community_readme)
+    app.router.add_post("/api/community/install", handle_community_install)
+    app.router.add_post("/api/community/update", handle_community_update)
+    app.router.add_post("/api/community/uninstall", handle_community_uninstall)
+    app.router.add_post("/api/community/import", handle_community_import)
+    app.router.add_post("/api/restart", handle_restart)
     app.router.add_post("/api/cognitive/start", handle_cognitive_start)
     app.router.add_post("/api/cognitive/stop", handle_cognitive_stop)
     app.router.add_post("/api/save", handle_save)
@@ -655,6 +969,8 @@ def run(host=None, port=None, open_browser=False):
     stop_event = threading.Event()
     # 让 /api/shutdown 处理器能触达同一个停止信号
     app["stop_event"] = stop_event
+    app["restart_event"] = False
+    app["panel_lock"] = lock
 
     def _on_signal(*_):
         stop_event.set()
@@ -724,6 +1040,16 @@ def run(host=None, port=None, open_browser=False):
         await asyncio.sleep(0.2)   # 让关闭帧发出
         await asyncio.get_running_loop().run_in_executor(None, panel.RUNTIME.shutdown)
         await runner.cleanup()
+        if app.get("restart_event"):
+            logging.info("Web 控制面板正在重启…")
+            try:
+                panel.release_panel_lock(app.get("panel_lock"))
+            except Exception:
+                pass
+            os.execv(
+                sys.executable,
+                [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+            )
         logging.info("Web 控制面板已退出")
 
     try:

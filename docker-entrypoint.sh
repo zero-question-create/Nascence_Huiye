@@ -37,4 +37,11 @@ if [ ! -f /app/config/bilibili_credentials.json ] && [ -f /app/config/bilibili.e
     cp /app/config/bilibili.example.json /app/config/bilibili_credentials.json
 fi
 
+# 首次启动安装默认插件（独立仓库）；失败不阻塞面板，可到社区页重试
+if [ -f /app/tools/install_bootstrap.py ] && [ -f /app/config/plugin_bootstrap.json ]; then
+    echo "[*] Ensuring default plugins..."
+    python /app/tools/install_bootstrap.py --required-only || \
+        echo "[!] Some default plugins were not installed; use the community page to retry."
+fi
+
 exec "$@"

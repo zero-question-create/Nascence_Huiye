@@ -65,6 +65,19 @@
         "timeout": null
       },
       "action_include_reasoning": false
+    },
+    "skills": {
+      "enabled": true,
+      "follow_global_behavior": true,
+      "action_llm": {
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": null,
+        "max_tokens": null,
+        "timeout": null
+      },
+      "action_include_reasoning": false
     }
   }
 }

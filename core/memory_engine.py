@@ -952,13 +952,22 @@ def validate_vector(vec) -> np.ndarray:
 
 
 def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE,
-                  occurred_at: float = None) -> str:
+                  occurred_at: float = None, dedup: bool = False,
+                  dedup_window: float = 300.0) -> str:
     """写入一条记忆。
 
     occurred_at: 可选的**真实 Unix 时间戳**（消息发生时间）。聊天记录用它作为
     creation_time，记忆的时间前缀才会显示“当时/几天前”，而不是入库时刻。
-    last_accessed / last_strengthen_time 仍用当前时间，避免旧消息一入库就衰减。
+    dedup=True 时，在 dedup_window 秒内与已有记忆高度相似则返回已有 ID，
+    用于辉夜自己的“我想”念头，避免每轮新建一条近重复节点。
     """
+    if dedup:
+        try:
+            existing = semantic_dedup(content, time_tolerance=float(dedup_window))
+            if existing:
+                return existing
+        except Exception:
+            pass
     vec = text_to_vector(content)
     # 先校验（维度/有限值/非零），不合法直接拒绝写入，避免污染数据库与索引
     vec_arr = validate_vector(vec).reshape(1, -1)

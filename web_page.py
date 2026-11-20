@@ -79,6 +79,47 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .kv .k{color:var(--muted)}
   #toast{position:fixed;right:20px;bottom:20px;background:#1b2b45;border:1px solid var(--border);
          padding:10px 16px;border-radius:8px;display:none;max-width:60vw}
+  /* ===== 插件社区：对齐 Nascence_Huiye_Server 的卡片/列表/Markdown 语言 ===== */
+  .community-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .community-toolbar input{flex:1;min-width:220px}
+  .community-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+  .community-card{background:#0f1621;border:1px solid #1f2a3a;border-radius:8px;padding:12px 14px;
+                  cursor:pointer;transition:border-color .18s,background .18s;display:flex;flex-direction:column;gap:6px}
+  .community-card:hover{border-color:var(--accent2);background:#121c2a}
+  .community-card.active{border-color:var(--accent2);background:#17263a}
+  .community-card-head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .community-name{font-weight:800;font-size:14px}
+  .community-meta{font-size:11.5px;color:var(--muted);word-break:break-all}
+  .community-desc{font-size:12.5px;color:var(--text);opacity:.9;line-height:1.55}
+  .community-badges{display:flex;gap:6px;flex-wrap:wrap}
+  .tag{font-size:11px;padding:1px 7px;border:1px solid #35445a;border-radius:999px;color:var(--muted)}
+  .tag.ok{color:var(--ok);border-color:#286653;background:#183a31}
+  .tag.warn{color:var(--warn);border-color:#655a32;background:#3a3320}
+  .tag.err{color:var(--err);border-color:#653232;background:#3a1e1e}
+  .community-detail{display:none;margin-top:14px}
+  .community-detail.open{display:block}
+  .community-detail-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .community-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+  .md-preview{background:#0b1220;border:1px solid #2a3850;border-radius:8px;padding:14px 16px;
+              max-height:60vh;overflow:auto}
+  .markdown-body{font-size:13.5px;line-height:1.75;color:var(--text);word-break:break-word}
+  .markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4{margin:14px 0 8px;font-weight:800;line-height:1.35}
+  .markdown-body h1{font-size:19px}.markdown-body h2{font-size:17px}.markdown-body h3{font-size:15px}
+  .markdown-body p{margin:8px 0}
+  .markdown-body ul,.markdown-body ol{margin:8px 0;padding-left:22px}
+  .markdown-body blockquote{margin:10px 0;padding:6px 12px;border-left:3px solid var(--accent);background:#101722;color:var(--muted)}
+  .markdown-body code{padding:1px 5px;font-size:12.5px;background:#101722;border:1px solid #2a3850;border-radius:4px;font-family:Consolas,Monaco,monospace}
+  .markdown-body pre{margin:10px 0;padding:10px 12px;overflow-x:auto;background:#101722;border:1px solid #2a3850;border-radius:8px}
+  .markdown-body pre code{border:0;padding:0;background:transparent}
+  .markdown-body a{color:var(--accent2)}
+  .markdown-body table{border-collapse:collapse;margin:10px 0;width:100%}
+  .markdown-body th,.markdown-body td{border:1px solid #2a3850;padding:6px 10px;text-align:left}
+  .markdown-body th{background:#101722;font-weight:700}
+  .markdown-body img{max-width:100%;height:auto;border-radius:6px}
+  .import-box{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
+  .plugin-meta{display:grid;grid-template-columns:100px 1fr;gap:5px 10px;font-size:12.5px;margin:8px 0}
+  .plugin-meta .k{color:var(--muted)}
+  @media(max-width:760px){.import-box{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -86,12 +127,14 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <h1>Nascence · {{BOT_NAME}}</h1>
   <span id="cognitiveBadge" class="badge off">认知循环：已停止</span>
   <span id="stateBadge" class="badge wait">加载中</span>
+  <button id="restartBtn" style="margin-left:auto;background:#1b2b45;color:#dce8ff;border:1px solid #35445a;border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:700">重启面板</button>
   <button id="shutdownBtn" title="停止认知循环与全部插件服务、保存全部数据并退出面板">关闭面板</button>
 </header>
 
 <nav>
   <button class="active" data-page="overview">总览</button>
   <button data-page="plugins">插件</button>
+  <button data-page="community">插件社区</button>
   <button data-page="logs">日志</button>
   <button data-page="config">配置</button>
   <button data-page="maint">维护</button>
@@ -142,6 +185,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <h3 id="pluginDetailTitle" style="margin:0"></h3>
       </div>
       <div class="hint" id="pluginDetailDesc"></div>
+      <div class="plugin-meta" id="pluginManifestMeta"></div>
+      <div class="row"><button class="act sec" id="btnPluginReadme">查看插件 README</button></div>
+      <div id="pluginReadmeBox" class="md-preview markdown-body" style="display:none;margin-bottom:12px"></div>
       <div id="pluginCommonConfig" style="margin-top:12px">
         <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="pd-follow" style="width:auto" onchange="toggleDetailFollow()"> 跟随全局行为模型</label>
         <div class="grid3" style="margin-top:8px">
@@ -160,6 +206,68 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div class="row" style="margin-top:12px"><button class="act" id="btnSavePluginPanel" style="display:none">保存插件配置</button></div>
         <div class="row" id="pluginPanelActions" style="margin-top:10px"></div>
         <div class="hint" id="pluginPanelHint" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 插件社区 -->
+  <section class="page" id="page-community">
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">插件社区</h3>
+        <div class="row" style="margin:0">
+          <button class="act sec" id="btnCommunityRefresh">刷新目录</button>
+          <button class="act sec" id="btnCommunityRestart">一键重启</button>
+        </div>
+      </div>
+      <div class="hint">从 GitHub 检索带 <code>nhy-plugin</code> topic 的插件仓库；只安装 Release ZIP，并校验清单、API 版本和 SHA256。安装/更新后需要重启面板。</div>
+      <div class="community-toolbar">
+        <input id="communitySearch" placeholder="搜索插件名称、作者或描述…">
+        <select id="communityFilter" style="max-width:160px">
+          <option value="all">全部插件</option>
+          <option value="installed">已安装</option>
+          <option value="update">可更新</option>
+        </select>
+      </div>
+      <div id="communityGrid" class="community-grid"></div>
+      <div id="communityEmpty" class="hint" style="display:none">目录为空。检查网络或刷新目录。</div>
+    </div>
+
+    <div class="panel community-detail" id="communityDetail">
+      <div class="community-detail-head">
+        <button class="act sec" id="btnCommunityBack">← 返回列表</button>
+        <h3 id="communityDetailTitle" style="margin:0"></h3>
+        <span id="communityDetailBadge" class="tag"></span>
+      </div>
+      <div class="community-meta" id="communityDetailMeta"></div>
+      <div class="community-actions" id="communityDetailActions"></div>
+      <div class="md-preview markdown-body" id="communityReadme">加载 README…</div>
+    </div>
+
+    <div class="panel">
+      <h3>社区设置</h3>
+      <div class="hint">GitHub token 只用于提高检索限额/访问私有仓库；留空表示不修改。默认只检索 <code>nhy-plugin</code> topic。</div>
+      <div class="grid3" style="margin-top:10px">
+        <div><label>GitHub Token（留空不修改）</label><input id="communityGithubToken" type="password" placeholder="已配置则留空"></div>
+        <div><label>限定 GitHub 账号（可选）</label><input id="communityGithubUser" placeholder="例如 zero-question-create"></div>
+        <div><label>Topic</label><input id="communityTopic" placeholder="nhy-plugin"></div>
+      </div>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="communityInstallEnabled" style="width:auto"> 允许从社区安装/更新</label>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:6px"><input type="checkbox" id="communityAllowGit" style="width:auto"> 没有 Release ZIP 时允许内部 git clone</label>
+      <div class="row" style="margin-top:10px"><button class="act" id="btnCommunitySaveConfig">保存社区设置</button></div>
+    </div>
+
+    <div class="panel">
+      <h3>导入本地插件</h3>
+      <div class="hint">用于辉夜自建插件或离线安装。支持 ZIP，或本机插件目录（必须包含 plugin.json）。导入后需重启面板生效。</div>
+      <div class="import-box" style="margin-top:10px">
+        <div>
+          <label>本地 ZIP 文件</label>
+          <input type="file" id="communityImportFile" accept=".zip">
+          <label style="margin-top:8px">或本机目录/文件路径</label>
+          <input id="communityImportPath" placeholder="例如 data/plugin_staging/my_skill 或 C:\path\plugin.zip">
+        </div>
+        <button class="act" id="btnCommunityImport">导入插件</button>
       </div>
     </div>
   </section>
@@ -350,6 +458,224 @@ async function post(url, body){
 }
 async function getJSON(url){
   const r = await fetch(url); return await r.json();
+}
+
+// ===== 插件社区 / README 渲染（对齐 Nascence_Huiye_Server 的 Markdown 语言）=====
+function safeUrl(url){
+  const value = String(url || '').trim();
+  return /^https?:\/\//i.test(value) ? value : '#';
+}
+function renderMarkdown(src){
+  const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  let text = String(src == null ? '' : src).replace(/\r\n?/g,'\n');
+  const blocks = [];
+  text = text.replace(/```([\s\S]*?)```/g, (m, code) => {
+    blocks.push(`<pre><code>${esc(code.replace(/^\n/,''))}</code></pre>`);
+    return `\u0000BLOCK${blocks.length - 1}\u0000`;
+  });
+  const inline = (s) => {
+    let out = esc(s);
+    out = out.replace(/`([^`]+)`/g, (m,c)=>`<code>${c}</code>`);
+    out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,
+      (m,alt,url)=>`<img src="${safeUrl(url)}" alt="${alt}">`);
+    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+      (m,label,url)=>`<a href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    out = out.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+    out = out.replace(/__([^_]+)__/g,'<strong>$1</strong>');
+    out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g,'$1<em>$2</em>');
+    out = out.replace(/~~([^~]+)~~/g,'<del>$1</del>');
+    return out;
+  };
+  const lines = text.split('\n');
+  const html = [];
+  let listType = null, para = [];
+  const flushPara = () => { if(para.length){ html.push(`<p>${inline(para.join('<br>'))}</p>`); para=[]; } };
+  const closeList = () => { if(listType){ html.push(`</${listType}>`); listType=null; } };
+  for(let i=0;i<lines.length;i++){
+    const raw = lines[i]; const line = raw.trimEnd();
+    const ph = line.match(/^\u0000BLOCK(\d+)\u0000$/);
+    if(ph){ flushPara(); closeList(); html.push(blocks[Number(ph[1])]); continue; }
+    if(!line.trim()){ flushPara(); closeList(); continue; }
+    if(/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)){ flushPara(); closeList(); html.push('<hr>'); continue; }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if(h){ flushPara(); closeList(); const lv=Math.min(h[1].length,4); html.push(`<h${lv}>${inline(h[2])}</h${lv}>`); continue; }
+    const q = line.match(/^>\s?(.*)$/);
+    if(q){ flushPara(); closeList(); html.push(`<blockquote>${inline(q[1])}</blockquote>`); continue; }
+    // 简单表格：表头 | 分隔行 | 数据行
+    if(line.includes('|') && i+1<lines.length && /^\s*\|?[\s:|-]+\|[\s:|-]*\|?\s*$/.test(lines[i+1])){
+      flushPara(); closeList();
+      const cells = line.replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(x=>x.trim());
+      i += 1;
+      const rows = [];
+      while(i+1<lines.length && lines[i+1].includes('|') && lines[i+1].trim()){
+        i += 1;
+        rows.push(lines[i].replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(x=>x.trim()));
+      }
+      html.push('<table><thead><tr>'+cells.map(c=>`<th>${inline(c)}</th>`).join('')+'</tr></thead><tbody>'+
+        rows.map(r=>'<tr>'+r.map(c=>`<td>${inline(c)}</td>`).join('')+'</tr>').join('')+'</tbody></table>');
+      continue;
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if(ul){ flushPara(); if(listType!=='ul'){ closeList(); html.push('<ul>'); listType='ul'; } html.push(`<li>${inline(ul[1])}</li>`); continue; }
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if(ol){ flushPara(); if(listType!=='ol'){ closeList(); html.push('<ol>'); listType='ol'; } html.push(`<li>${inline(ol[1])}</li>`); continue; }
+    closeList(); para.push(line);
+  }
+  flushPara(); closeList();
+  return html.join('\n');
+}
+
+let communityCache = [];
+let communityInstalled = {};
+let currentCommunityId = '';
+function versionTuple(v){ return String(v||'0').split(/[.+-]/).slice(0,3).map(x=>parseInt(x||'0',10)||0); }
+function versionNewer(a,b){
+  const x=versionTuple(a), y=versionTuple(b);
+  for(let i=0;i<3;i++){ if(x[i]!==y[i]) return x[i]>y[i]; }
+  return false;
+}
+async function loadCommunity(force=false){
+  try{
+    const d = await getJSON('/api/community/plugins' + (force?'?refresh=1':''));
+    if(!d.ok) throw new Error(d.error || '目录读取失败');
+    communityCache = d.plugins || [];
+    communityInstalled = d.installed || {};
+    $('communityEmpty').style.display = communityCache.length ? 'none' : 'block';
+    if(d.error) toast('社区目录：' + d.error);
+    renderCommunityGrid();
+    if(currentCommunityId) openCommunity(currentCommunityId);
+  }catch(e){ toast('社区目录读取失败：' + e.message); }
+}
+function communityMatches(p){
+  const q = String($('communitySearch').value || '').trim().toLowerCase();
+  if(!q) return true;
+  return [p.name,p.id,p.description,p.author].some(x=>String(x||'').toLowerCase().includes(q));
+}
+function renderCommunityGrid(){
+  const grid = $('communityGrid'); grid.innerHTML='';
+  const filter = $('communityFilter').value;
+  let count = 0;
+  for(const p of communityCache){
+    const inst = communityInstalled[p.id] || {};
+    const installed = !!inst.installed;
+    const update = installed && versionNewer(p.version, inst.version);
+    if(filter==='installed' && !installed) continue;
+    if(filter==='update' && !update) continue;
+    if(!communityMatches(p)) continue;
+    count++;
+    const card = document.createElement('div');
+    card.className = 'community-card' + (p.id===currentCommunityId?' active':'');
+    card.onclick = () => openCommunity(p.id);
+    card.innerHTML =
+      `<div class="community-card-head"><span class="community-name">${escHtml(p.name || p.id)}</span>`+
+      `<span class="tag ${p.verified?'ok':'warn'}">${p.verified?'已校验':'未校验'}</span></div>`+
+      `<div class="community-desc">${escHtml(p.description || '')}</div>`+
+      `<div class="community-meta">${escHtml(p.author || p.full_name || '')} · v${escHtml(p.version || '')}</div>`+
+      `<div class="community-badges">${installed?`<span class="tag ok">已安装 ${escHtml(inst.version||'')}</span>`:''}`+
+      `${update?'<span class="tag warn">可更新</span>':''}`+
+      `${(p.kind==='skill')?'<span class="tag">技能</span>':''}</div>`;
+    grid.appendChild(card);
+  }
+  if(!count) grid.innerHTML = '<div class="hint">没有匹配的插件。</div>';
+}
+function openCommunity(id){
+  const p = communityCache.find(x => x.id === id);
+  if(!p) return;
+  currentCommunityId = id;
+  renderCommunityGrid();
+  $('communityDetail').classList.add('open');
+  $('communityDetailTitle').textContent = p.name || p.id;
+  $('communityDetailBadge').textContent = p.verified ? '已验证发布包' : '未验证发布包';
+  $('communityDetailBadge').className = 'tag ' + (p.verified?'ok':'warn');
+  const inst = communityInstalled[id] || {};
+  $('communityDetailMeta').innerHTML =
+    `<span class="k">描述</span><span>${escHtml(p.description || '')}</span>`+
+    `<span class="k">版本</span><span>${escHtml(p.version || '')}${inst.installed?'（已安装 '+escHtml(inst.version||'')+'）':''}</span>`+
+    `<span class="k">作者</span><span>${escHtml(p.author || '')}</span>`+
+    `<span class="k">仓库</span><span><a href="${safeUrl(p.repo)}" target="_blank" rel="noopener noreferrer">${escHtml(p.full_name || p.repo || '')}</a></span>`+
+    `<span class="k">平台</span><span>${escHtml((p.platforms||[]).join(' / '))}</span>`+
+    `<span class="k">权限</span><span>${escHtml((p.permissions||[]).join('、') || '无声明')}</span>`+
+    `<span class="k">校验</span><span>${p.sha256?escHtml(p.sha256.slice(0,16)+'…'):'缺少 SHA256（不能安装）'}</span>`;
+  const actions = $('communityDetailActions'); actions.innerHTML='';
+  const mk = (label, cls, fn, disabled=false) => {
+    const b = document.createElement('button'); b.className='act '+cls; b.textContent=label;
+    b.disabled=disabled; b.onclick=fn; actions.appendChild(b);
+  };
+  if(!inst.installed) mk('安装','',()=>communityAction('install',id), !p.verified);
+  else {
+    mk('更新','sec',()=>communityAction('update',id), !p.verified);
+    mk('卸载','sec',()=>communityAction('uninstall',id));
+  }
+  mk('重启面板','sec',restartPanel);
+  $('communityReadme').innerHTML = '加载 README…';
+  loadCommunityReadme(id);
+}
+async function loadCommunityReadme(id){
+  try{
+    const d = await getJSON('/api/community/readme?id=' + encodeURIComponent(id));
+    $('communityReadme').innerHTML = d.ok && d.readme ? renderMarkdown(d.readme) : '<p class="hint">没有 README。</p>';
+  }catch(e){ $('communityReadme').innerHTML = '<p class="hint">README 读取失败：'+escHtml(e.message)+'</p>'; }
+}
+async function communityAction(kind,id){
+  if(kind==='uninstall' && !confirm('确定卸载这个插件？')) return;
+  try{
+    const d = await post('/api/community/' + kind, {id});
+    toast(d.detail || (kind==='install'?'安装完成':'操作完成'));
+    await loadCommunity(true);
+    if(d.restart_required && confirm('插件文件已更新，需要重启面板生效。现在重启吗？')) restartPanel();
+  }catch(e){ toast('操作失败：' + e.message); }
+}
+async function communityImport(){
+  const file = $('communityImportFile').files[0];
+  const path = $('communityImportPath').value.trim();
+  if(!file && !path){ toast('请选择 ZIP 或填写路径'); return; }
+  try{
+    let d;
+    if(file){
+      const fd = new FormData(); fd.append('file', file);
+      const r = await fetch('/api/community/import', {method:'POST', body:fd});
+      d = await r.json();
+    }else{
+      d = await post('/api/community/import', {path});
+    }
+    if(!d.ok) throw new Error(d.error || '导入失败');
+    toast('插件已导入：' + (d.id || ''));
+    $('communityImportFile').value=''; $('communityImportPath').value='';
+    await loadCommunity(true);
+    if(confirm('插件已导入，需要重启面板生效。现在重启吗？')) restartPanel();
+  }catch(e){ toast('导入失败：' + e.message); }
+}
+async function restartPanel(){
+  if(!confirm('重启会短暂停止认知循环与插件服务，保存数据后重新启动。继续吗？')) return;
+  try{ await post('/api/restart', {}); toast('面板正在重启…'); }
+  catch(e){ toast('重启失败：' + e.message); }
+}
+async function loadCommunityConfig(){
+  try{
+    const d = await getJSON('/api/community/config');
+    if(!d.ok) return;
+    $('communityGithubUser').value = d.github_user || '';
+    $('communityTopic').value = d.topic || 'nhy-plugin';
+    $('communityInstallEnabled').checked = !!d.install_enabled;
+    $('communityAllowGit').checked = !!d.allow_git;
+    $('communityGithubToken').placeholder = d.github_token_configured ? '已配置，留空不修改' : '未配置';
+  }catch(e){ /* 设置读取失败不阻塞目录 */ }
+}
+async function saveCommunityConfig(){
+  try{
+    const d = await post('/api/community/config', {
+      github_token: $('communityGithubToken').value.trim(),
+      github_user: $('communityGithubUser').value.trim(),
+      topic: $('communityTopic').value.trim() || 'nhy-plugin',
+      install_enabled: $('communityInstallEnabled').checked,
+      allow_git: $('communityAllowGit').checked,
+    });
+    $('communityGithubToken').value = '';
+    toast('社区设置已保存');
+    await loadCommunity(true);
+  }catch(e){ toast('保存失败：' + e.message); }
 }
 
 // 页签切换
@@ -682,6 +1008,16 @@ function openPluginDetail(id){
   $('pluginDetailPanel').style.display = '';
   $('pluginDetailTitle').textContent = p.label;
   $('pluginDetailDesc').textContent = (p.description || '') + (p.implemented ? '' : '（未实现）');
+  const meta = p.manifest || {};
+  $('pluginManifestMeta').innerHTML =
+    `<span class="k">版本</span><span>${escHtml(meta.version || p.version || '0.0.0')}（API ${escHtml(String(meta.api_version || ''))}）</span>`+
+    `<span class="k">类型</span><span>${escHtml(meta.kind || p.kind || 'app')}</span>`+
+    `<span class="k">作者</span><span>${escHtml(meta.author || p.author || '未声明')}</span>`+
+    `<span class="k">来源</span><span>${escHtml(meta.source || p.source || '内置/本地')}</span>`+
+    `<span class="k">权限</span><span>${escHtml((meta.permissions || p.permissions || []).join('、') || '无声明')}</span>`+
+    `<span class="k">平台</span><span>${escHtml((meta.platforms || []).join(' / ') || 'any')}</span>`;
+  $('pluginReadmeBox').style.display = 'none';
+  $('pluginReadmeBox').innerHTML = '';
   const al = p.action_llm || {};
   currentPluginHasKey = !!al._has_api_key;
   $('pd-follow').checked = p.follow_global_behavior !== false;
@@ -1161,10 +1497,36 @@ $('btnInject').onclick = async () => {
   catch(e){ toast('失败：'+e.message); }
 };
 
+// 社区页事件
+$('restartBtn').onclick = restartPanel;
+$('btnCommunityRefresh').onclick = () => loadCommunity(true);
+$('btnCommunityRestart').onclick = restartPanel;
+$('communitySearch').oninput = renderCommunityGrid;
+$('communityFilter').onchange = renderCommunityGrid;
+$('btnCommunityBack').onclick = () => {
+  $('communityDetail').classList.remove('open');
+  currentCommunityId = '';
+  renderCommunityGrid();
+};
+$('btnCommunityImport').onclick = communityImport;
+$('btnCommunitySaveConfig').onclick = saveCommunityConfig;
+$('btnPluginReadme').onclick = async () => {
+  if(!currentPluginDetailId) return;
+  const box = $('pluginReadmeBox');
+  if(box.style.display !== 'none'){ box.style.display='none'; return; }
+  box.style.display='block'; box.textContent='加载 README…';
+  try{
+    const d = await getJSON('/api/plugins/readme?id=' + encodeURIComponent(currentPluginDetailId));
+    box.innerHTML = d.ok && d.readme ? renderMarkdown(d.readme) : '<p class="hint">没有 README。</p>';
+  }catch(e){ box.innerHTML = '<p class="hint">README 读取失败。</p>'; }
+};
+
 connectWS();
 refreshStats();
 loadConfig();
 loadPlugins();
+loadCommunityConfig();
+loadCommunity(false);
 setInterval(refreshStats, 500);
 // 插件页显示时轮询运行状态：自动启动/初始化完成后按钮会自动变成“停止”。
 setInterval(() => {

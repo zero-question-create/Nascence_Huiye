@@ -126,6 +126,18 @@ def _prepare_memories(memories: list, keywords: list = None, pinned: list = None
             continue
         seen_content.add(key)
         deduped.append(m)
+
+    # 近重复再过滤一次：pinned 与普通检索可能带来换皮的同一条念头。
+    try:
+        from .repetition import similarity
+        unique = []
+        for item in deduped:
+            if len(item) >= 8 and any(similarity(item, kept) >= 0.90 for kept in unique):
+                continue
+            unique.append(item)
+        deduped = unique
+    except Exception:
+        pass
     return deduped
 
 

@@ -41,6 +41,12 @@ if not exist "%PROJECT_DIR%\venv\Scripts\python.exe" (
     )
 )
 
+rem --- ensure internal git for plugin marketplace ---
+if not exist "%PROJECT_DIR%\run\lib\git\cmd\git.exe" (
+    powershell -Command "Write-Host 'Internal Git not found, installing...' -ForegroundColor Yellow"
+    powershell -ExecutionPolicy Bypass -File "%PROJECT_DIR%\run\install_git.ps1"
+)
+
 rem --- ensure ollama ---
 if not exist "%PROJECT_DIR%\ollama\bin\ollama.exe" (
     powershell -Command "Write-Host 'Ollama not found, downloading...' -ForegroundColor Yellow"

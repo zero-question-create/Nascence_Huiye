@@ -490,7 +490,11 @@ class QQDesktopPlugin(Plugin):
         if not bool(config.get("qq_desktop_use_vision", True)):
             return
         try:
-            if not any(m.get("text") == "【图片】" for m in messages):
+            # 混合消息（文字+图片）的 text 不是“【图片】”，必须看 has_image。
+            if not any(
+                m.get("text") == "【图片】" or m.get("has_image")
+                for m in messages
+            ):
                 return
             signature = (current, tuple(engine.message_key(m) for m in messages[-5:]))
             if signature == self._last_image_sig:
@@ -505,7 +509,9 @@ class QQDesktopPlugin(Plugin):
             # 否则每次轮询都会把同一段视觉描述再灌进上下文。
             from core.apps import APP_CONTEXT
 
-            APP_CONTEXT.remember_state("qq_desktop_image", content[:1800])
+            # 视觉描述已经按 full 模式生成，不在这里压回 1800 字；
+            # 只保留一个上限，避免异常模型输出无限膨胀。
+            APP_CONTEXT.remember_state("qq_desktop_image", content[:6000])
         except Exception:
             pass
 

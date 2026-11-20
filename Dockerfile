@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     curl \
+    git \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 

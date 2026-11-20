@@ -142,9 +142,14 @@ class Plugin(ABC):
 
     plugin_id: str = ""
     label: str = ""
+    version: str = "0.0.0"
+    author: str = ""
+    homepage: str = ""
+    license: str = "MIT"
     capabilities: tuple = ()
     implemented: bool = True
     is_app: bool = False          # 是否是“她可以打开/关闭的软件”
+    is_skill: bool = False        # 插件清单里 kind=skill
     description: str = ""
 
     def __init__(self, settings: dict = None):

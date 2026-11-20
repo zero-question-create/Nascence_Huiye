@@ -81,14 +81,17 @@ def _note_lock(base: str) -> threading.RLock:
 
 # ---------- 索引读写 ----------
 def _empty_index() -> dict:
-    return {kind: {} for kind in _KINDS} | {
+    return {
+        "version": 2,
+        **{kind: {} for kind in _KINDS},
         "last_sent": {kind: "" for kind in _KINDS},
         "recent_sent": {kind: [] for kind in _KINDS},
+        "recent_sent_ids": {kind: [] for kind in _KINDS},
     }
 
 
 def _load() -> dict:
-    """惰性加载索引；文件损坏时重建为空表，不抛异常中断主流程。"""
+    """惰性加载索引；v1（描述→文件）自动迁移为 v2（hash 记录）。"""
     global _index
     if _index is not None:
         return _index
@@ -97,21 +100,61 @@ def _load() -> dict:
         try:
             with open(INDEX_FILE, "r", encoding="utf-8-sig") as f:
                 loaded = json.load(f)
-            for kind in _KINDS:
-                items = loaded.get(kind) or {}
-                if isinstance(items, dict):
-                    data[kind] = {str(k): str(v) for k, v in items.items()}
+            if int(loaded.get("version") or 1) >= 2:
+                for kind in _KINDS:
+                    items = loaded.get(kind) or {}
+                    if not isinstance(items, dict):
+                        continue
+                    for record_id, record in items.items():
+                        if isinstance(record, dict):
+                            record = dict(record)
+                            record.setdefault("id", str(record_id))
+                            record.setdefault("desc", "")
+                            record.setdefault("file", "")
+                            record.setdefault("hash", "")
+                            data[kind][str(record_id)] = record
+            else:
+                # v1 迁移：描述作为旧键，补 hash 记录；保留原文件。
+                for kind in _KINDS:
+                    items = loaded.get(kind) or {}
+                    if not isinstance(items, dict):
+                        continue
+                    for desc, filename in items.items():
+                        filename = str(filename or "")
+                        if not filename:
+                            continue
+                        path = asset_path(kind, filename)
+                        try:
+                            with open(path, "rb") as handle:
+                                digest = hashlib.sha256(handle.read()).hexdigest()
+                        except OSError:
+                            digest = hashlib.sha1(f"{kind}|{desc}".encode("utf-8")).hexdigest()
+                        record_id = f"{kind[0].upper()}{digest[:10]}"
+                        data[kind][record_id] = {
+                            "id": record_id,
+                            "file": filename,
+                            "desc": str(desc),
+                            "hash": digest,
+                            "created_at": time.time(),
+                            "last_sent_at": 0,
+                            "send_count": 1 if str(desc) in (loaded.get("recent_sent") or {}).get(kind, []) else 0,
+                        }
+                if data[kind]:
+                    data["version"] = 2
             last = loaded.get("last_sent") or {}
             for kind in _KINDS:
                 data["last_sent"][kind] = str(last.get(kind) or "")
-            # 兼容旧索引：没有 recent_sent 时用 last_sent 单条初始化
             recent = loaded.get("recent_sent") or {}
+            recent_ids = loaded.get("recent_sent_ids") or {}
             for kind in _KINDS:
                 items = recent.get(kind)
                 if isinstance(items, list):
                     data["recent_sent"][kind] = [str(x) for x in items if x][-RECENT_SENT_MEMORY:]
                 elif data["last_sent"][kind]:
                     data["recent_sent"][kind] = [data["last_sent"][kind]]
+                ids = recent_ids.get(kind)
+                if isinstance(ids, list):
+                    data["recent_sent_ids"][kind] = [str(x) for x in ids if x][-RECENT_SENT_MEMORY:]
         except Exception:
             pass
     _index = data
@@ -213,8 +256,8 @@ def _convert_to_gif(src_path: str, dst_path: str) -> bool:
         return False
 
 
-def add_asset(kind: str, src_path: str, desc: str) -> dict | None:
-    """把源文件收进素材库；描述相同视为同一素材，返回已存在条目。
+def add_asset(kind: str, src_path: str, desc: str, full_description: str = "") -> dict | None:
+    """把源文件收进素材库；按内容 hash 去重，描述相同但文件不同不再合并。
 
     kind=sticker 时统一转存为 GIF，让 QQ 自动按表情包识别。
     """
@@ -223,84 +266,123 @@ def add_asset(kind: str, src_path: str, desc: str) -> dict | None:
     desc = str(desc).strip()
     if not desc:
         return None
+    src_path = str(src_path)
+    if not os.path.isfile(src_path):
+        return None
+    try:
+        if os.path.getsize(src_path) > MAX_FILE_BYTES:
+            return None
+        with open(src_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
     with _lock:
         index = _load()
-        existing = index[kind].get(desc)
-        if existing:
-            return {"kind": kind, "desc": desc, "file": existing, "path": asset_path(kind, existing), "added": False}
-
-        src_path = str(src_path)
-        if not os.path.isfile(src_path):
-            return None
-        try:
-            if os.path.getsize(src_path) > MAX_FILE_BYTES:
-                return None
-        except OSError:
-            return None
+        # 同内容已收藏：直接返回原记录。
+        for record_id, record in index[kind].items():
+            if record.get("hash") == digest:
+                return {
+                    "kind": kind,
+                    "id": record_id,
+                    "desc": record.get("desc") or desc,
+                    "file": record.get("file"),
+                    "path": asset_path(kind, record.get("file") or ""),
+                    "added": False,
+                }
 
         os.makedirs(os.path.join(ASSET_ROOT, kind), exist_ok=True)
+        record_id = f"{kind[0].upper()}{digest[:10]}"
 
         # 表情包：先尝试转 GIF（QQ 据此识别为表情），失败再按原格式存
+        filename = ""
         if kind == STICKER:
             filename = f"{uuid.uuid4().hex[:12]}.gif"
-            if _convert_to_gif(src_path, asset_path(kind, filename)):
-                index[kind][desc] = filename
-                _evict_if_needed(kind)
-                _save()
-                return {"kind": kind, "desc": desc, "file": filename,
-                        "path": asset_path(kind, filename), "added": True}
-            # 转换失败：退回原格式，至少保证素材不丢
+            if not _convert_to_gif(src_path, asset_path(kind, filename)):
+                try:
+                    os.remove(asset_path(kind, filename))
+                except OSError:
+                    pass
+                filename = ""
+
+        if not filename:
+            ext = os.path.splitext(src_path)[1].lstrip(".").lower()
+            if ext not in _ALLOWED_EXT:
+                ext = _FALLBACK_EXT.get(kind, "jpg")
+            filename = f"{uuid.uuid4().hex[:12]}.{ext}"
+            try:
+                shutil.copy2(src_path, asset_path(kind, filename))
+            except OSError:
+                return None
+
+        index[kind][record_id] = {
+            "id": record_id,
+            "file": filename,
+            "desc": desc,
+            "hash": digest,
+            "full_description": str(full_description or ""),
+            "created_at": time.time(),
+            "last_sent_at": 0,
+            "send_count": 0,
+        }
+        _evict_if_needed(kind)
+        _save()
+        return {
+            "kind": kind,
+            "id": record_id,
+            "desc": desc,
+            "file": filename,
+            "path": asset_path(kind, filename),
+            "added": True,
+        }
+
+
+def _evict_if_needed(kind: str):
+    """超出上限时按最后使用/入库时间淘汰，保持素材库有界。"""
+    items = _index[kind]
+    if len(items) <= MAX_ASSETS_PER_KIND:
+        return
+    overflow = len(items) - MAX_ASSETS_PER_KIND
+    ordered = sorted(
+        items.items(),
+        key=lambda pair: float(
+            (pair[1] or {}).get("last_sent_at")
+            or (pair[1] or {}).get("created_at")
+            or 0
+        ),
+    )
+    for record_id, record in ordered[:overflow]:
+        items.pop(record_id, None)
+        filename = str((record or {}).get("file") or "")
+        if filename:
             try:
                 os.remove(asset_path(kind, filename))
             except OSError:
                 pass
 
-        ext = os.path.splitext(src_path)[1].lstrip(".").lower()
-        if ext not in _ALLOWED_EXT:
-            ext = _FALLBACK_EXT.get(kind, "jpg")
-        filename = f"{uuid.uuid4().hex[:12]}.{ext}"
-        try:
-            shutil.copy2(src_path, asset_path(kind, filename))
-        except OSError:
-            return None
-
-        index[kind][desc] = filename
-        _evict_if_needed(kind)
-        _save()
-        return {"kind": kind, "desc": desc, "file": filename, "path": asset_path(kind, filename), "added": True}
-
-
-def _evict_if_needed(kind: str):
-    """超出上限时按「最早入库」淘汰，保持素材库有界。"""
-    items = _index[kind]
-    if len(items) <= MAX_ASSETS_PER_KIND:
-        return
-    overflow = len(items) - MAX_ASSETS_PER_KIND
-    # 依赖 dict 的插入顺序：先入库的先淘汰
-    for desc in list(items.keys())[:overflow]:
-        filename = items.pop(desc)
-        try:
-            os.remove(asset_path(kind, filename))
-        except OSError:
-            pass
-
 
 # ---------- 候选检索 ----------
 def ordered_pool(kind: str, keywords: list = None) -> list:
-    """返回该类的候选全集，按相关性排序。
-
-    不做发送去重：是否重复发同一条由模型结合"最近发过什么"自行判断，
-    硬性排除会挡掉"同一张图在新语境下确实想再发"这类真实需求。
-    排序在单次调用内保持稳定，保证翻页时不会看到重复或跳过的条目。
-    """
+    """返回该类的候选全集，按相关性排序；id 是稳定的内容 hash 记录号。"""
     if kind not in _KINDS:
         return []
     with _lock:
         index = _load()
-        entries = [
-            {"id": _asset_id(kind, desc), "desc": desc, "file": fn, "path": asset_path(kind, fn)}
-            for desc, fn in index[kind].items()
-        ]
+        entries = []
+        for record_id, record in index[kind].items():
+            record = record or {}
+            filename = str(record.get("file") or "")
+            if not filename:
+                continue
+            entries.append({
+                "id": record_id,
+                "desc": str(record.get("desc") or ""),
+                "file": filename,
+                "path": asset_path(kind, filename),
+                "last_sent_at": float(record.get("last_sent_at") or 0),
+                "send_count": int(record.get("send_count") or 0),
+                "full_description": str(record.get("full_description") or ""),
+            })
 
     kws = [str(k) for k in (keywords or []) if k]
     rnd = random.random()
@@ -315,15 +397,33 @@ def ordered_pool(kind: str, keywords: list = None) -> list:
 
 
 def resolve_token(kind: str, token: str) -> dict | None:
-    """把 LLM 给出的编号（或原样描述）解析回素材条目。"""
+    """把 LLM 给出的记录号（或原样描述）解析回素材条目。"""
     if kind not in _KINDS or not token:
         return None
     token = str(token).strip()
     with _lock:
         index = _load()
-        for desc, fn in index[kind].items():
-            if desc == token or _asset_id(kind, desc) == token:
-                return {"kind": kind, "desc": desc, "file": fn, "path": asset_path(kind, fn)}
+        if token in index[kind]:
+            record = index[kind][token] or {}
+            return {
+                "kind": kind,
+                "id": token,
+                "desc": str(record.get("desc") or ""),
+                "file": str(record.get("file") or ""),
+                "path": asset_path(kind, str(record.get("file") or "")),
+                "last_sent_at": float(record.get("last_sent_at") or 0),
+            }
+        for record_id, record in index[kind].items():
+            record = record or {}
+            if str(record.get("desc") or "") == token or _asset_id(kind, str(record.get("desc") or "")) == token:
+                return {
+                    "kind": kind,
+                    "id": record_id,
+                    "desc": str(record.get("desc") or ""),
+                    "file": str(record.get("file") or ""),
+                    "path": asset_path(kind, str(record.get("file") or "")),
+                    "last_sent_at": float(record.get("last_sent_at") or 0),
+                }
     return None
 
 
@@ -347,24 +447,37 @@ def recent_sent(kind: str) -> list:
         return _recent_sent_list(_load(), kind)
 
 
-def mark_sent(kind: str, desc: str):
-    """记录发送内容，供去重（不做时间冷却）。
-
-    保留最近若干条而不只是最后一条：只在两条之间去重时，
-    交替发送 A、B、A、B 也能绕过限制，看起来同样是"反复发同一批"。
-    """
+def mark_sent(kind: str, desc: str, record_id: str = ""):
+    """记录发送内容与时间，供软/硬去重使用。"""
     if kind not in _KINDS:
         return
     desc = str(desc or "")
-    if not desc:
+    record_id = str(record_id or "")
+    if not desc and not record_id:
         return
     with _lock:
         index = _load()
+        target_id = record_id if record_id in index[kind] else ""
+        if not target_id and desc:
+            for rid, record in index[kind].items():
+                if str((record or {}).get("desc") or "") == desc:
+                    target_id = rid
+                    break
+        if target_id:
+            record = index[kind].setdefault(target_id, {})
+            record["last_sent_at"] = time.time()
+            record["send_count"] = int(record.get("send_count") or 0) + 1
+            desc = str(record.get("desc") or desc)
         index["last_sent"][kind] = desc
         items = _recent_sent_list(index, kind)
         items = [d for d in items if d != desc]     # 去重后置顶
         items.insert(0, desc)
         index["recent_sent"][kind] = items[:RECENT_SENT_MEMORY]
+        if target_id:
+            ids = list(index.get("recent_sent_ids", {}).get(kind) or [])
+            ids = [item for item in ids if item != target_id]
+            ids.insert(0, target_id)
+            index.setdefault("recent_sent_ids", {})[kind] = ids[:RECENT_SENT_MEMORY]
         _save()
 
 

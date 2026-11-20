@@ -53,6 +53,22 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "[OK] Python dependencies installed"
 
+# ---------- 2b. Internal Git (for plugin marketplace/updates) ----------
+Write-Host "[*] Ensuring internal Git..."
+& powershell -ExecutionPolicy Bypass -File "$ProjectDir\run\install_git.ps1"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[!] Internal Git install failed; plugin marketplace updates will fall back to system git."
+}
+
+# ---------- 2c. Bootstrap plugins (split repos) ----------
+if (Test-Path "$ProjectDir\config\plugin_bootstrap.json") {
+    Write-Host "[*] Installing default plugins..."
+    & "$ProjectDir\venv\Scripts\python.exe" "$ProjectDir\tools\install_bootstrap.py" --required-only
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[!] Some default plugins were not installed; open the control panel community page to retry."
+    }
+}
+
 # ---------- 3. Download Ollama (Windows) ----------
 $ollamaComplete = $false
 if (Test-Path "ollama\bin\ollama.exe") {

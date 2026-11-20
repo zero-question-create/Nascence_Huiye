@@ -105,8 +105,18 @@ class ShortTermMemory:
         real_ts = clock.to_real_time(virtual_ts)
         phrase = get_relative_time_phrase(real_ts)
         prefix = "我说" if said else "我想"
+        line = f"[{phrase}] {prefix}：{text}"
         with self._lock:
-            self._items.append((real_ts, f"[{phrase}] {prefix}：{text}"))
+            # 近重复念头不再反复占窗口；否则模型会把同一句当作“最近想法”回灌。
+            if self._items:
+                try:
+                    from core.repetition import similarity
+                    last_ts, last_line = self._items[-1]
+                    if real_ts - float(last_ts) < 180 and similarity(line, last_line) >= 0.90:
+                        return
+                except Exception:
+                    pass
+            self._items.append((real_ts, line))
 
     def recent(self) -> List[Tuple[float, str]]:
         """返回 (真实时间戳, 带时间标签的想法)，按时间升序。"""

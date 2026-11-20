@@ -110,12 +110,17 @@ Nascence_Huiye/
 │
 ├── plugins/
 │   ├── base.py             # 插件契约（Plugin / BehaviorChannel / Perception）
-│   ├── registry.py         # 插件发现与配置
-│   ├── qq_napcat/          # QQ 插件（NapCat 反向 WebSocket）
-│   ├── wechat/             # 微信插件（本地桥接 WebSocket，见 BRIDGE.md）
-│   ├── web/                # 网页 / 小程序插件（预留）
-│   ├── bilibili/           # Bilibili 只读浏览插件（推荐/搜索/字幕/弹幕/评论）
-│   └── browser/            # 浏览器插件（静态/动态网页解析 + 摘要，供其他插件调用）
+│   ├── registry.py         # 插件发现、manifest、配置与安装锁
+│   ├── panel.py            # 插件自述面板协议
+│   ├── chat_store.py       # QQ/微信共享聊天持久化
+│   ├── qq_napcat/          # 独立仓库 nhy-plugin-qq-napcat
+│   ├── wechat/             # 独立仓库 nhy-plugin-wechat
+│   ├── web/                # 独立仓库 nhy-plugin-web（预留）
+│   ├── bilibili/           # 独立仓库 nhy-plugin-bilibili
+│   ├── browser/            # 独立仓库 nhy-plugin-browser
+│   ├── desktop/            # 独立仓库 nhy-plugin-desktop
+│   ├── qq_desktop/         # 独立仓库 nhy-plugin-qq-desktop
+│   └── skills/             # 独立仓库 nhy-plugin-skills（技能桥）
 │
 ├── utils/
 │   ├── message_history.py  # 统一消息历史
@@ -175,6 +180,17 @@ Nascence_Huiye/
 - **后续电脑控制**：`is_app=True` 的插件共用打开/状态/动作接口，未来“智能体直接控制电脑”可以作为同一套软件模型接入。
 
 详细契约与新增插件步骤见 [docs/插件架构.md](docs/插件架构.md)。
+
+## 插件社区、技能与自建插件
+
+- **插件清单**：每个插件目录有 `plugin.json`（id/version/api_version/min_host_version/entry/panel/platforms/permissions/dependencies/readme）。`plugins/registry.py` 校验清单并兼容旧插件类属性。
+- **独立仓库**：`tools/split_plugins.py` 会把现有 8 个插件复制成 `dist/plugin_repos/nhy-plugin-*` 独立 git 仓库（含 README、requirements、tests、Release workflow）。`tools/push_plugin_repos.ps1` 用于创建/推送公开仓库（需 `gh auth login` 或 `GH_TOKEN`）。
+- **插件社区**：控制面板“插件社区”通过 GitHub `nhy-plugin` topic 检索，只安装 Release ZIP；校验 manifest、API 版本、平台、SHA256，安全解压后在子进程做 import 冒烟测试。支持 README 预览、本地 ZIP/目录导入、更新/卸载和一键重启。
+- **内部 Git**：`run/install_git.ps1` 下载固定版本 MinGit 到 `run/lib/git`，校验 SHA256；没有 Release ZIP 时，插件社区用内部 git clone 作为后备。`setup.ps1` / `run/启动控制面板.bat` 会自动检查。
+- **技能分级授权**：`core/skill_registry.py` 管理技能开关与权限。只读技能（截屏、B站读取、媒体全文）启用后自动授权；写入/执行/安装（自建插件）必须在插件面板逐项确认。技能设置只存在面板，禁用技能不会进入日常动作提示词。
+- **B站视频**：`bilibili_video` 默认 360p，下载后合并 DASH、抽取关键帧交给视觉模型；面板可调画质、最大 MB、最大时长、帧数；超过大小/时长直接返回明确错误，不下载/不上传。依赖 `yt-dlp` 与自带 `imageio-ffmpeg`。
+- **自建插件**：`plugin_forge` 调用可配置的 ZCode/DeepSeek harness，在 `data/plugin_staging` 生成完整插件包并做清单/语法校验；辉夜通过控制面板“导入本地插件”导入，插件页展示详情，一键重启生效。`forge_command` 支持 `{prompt_file}`、`{out_dir}` 占位符。
+- **媒体完整性**：照片/表情包完整描述、OCR 与 pack 元数据存 `core/media_store.py`；短 caption 只进记忆/动作提示，`read_media` 可按 media_id 返回全文，不再用 30/60 字摘要覆盖完整内容。
 
 ## 运行要求
 

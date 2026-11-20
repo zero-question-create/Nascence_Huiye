@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "note": "NHY 首次安装/迁移时用内部 git 拉取的默认插件。桌面/QQ 桌面仅 Windows 安装。",
+  "plugins": [
+    {"id": "qq_napcat", "repo": "nhy-plugin-qq-napcat", "required": true},
+    {"id": "browser", "repo": "nhy-plugin-browser", "required": true},
+    {"id": "skills", "repo": "nhy-plugin-skills", "required": true},
+    {"id": "desktop", "repo": "nhy-plugin-desktop", "platform": "windows", "required": true},
+    {"id": "qq_desktop", "repo": "nhy-plugin-qq-desktop", "platform": "windows", "required": false},
+    {"id": "bilibili", "repo": "nhy-plugin-bilibili", "required": false},
+    {"id": "wechat", "repo": "nhy-plugin-wechat", "required": false},
+    {"id": "web", "repo": "nhy-plugin-web", "required": false}
+  ]
+}

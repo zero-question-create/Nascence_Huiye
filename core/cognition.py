@@ -30,6 +30,7 @@ from .apps import APP_CONTEXT
 from .app_router import APP_ROUTER
 from .virtual_clock import clock
 from .biorhythm import BIORHYTHM
+from .repetition import ACTION_GUARD, OUTPUT_GUARD
 from config.constants import BOT_NAME
 from utils.dialogue_state import set_state, reset_state, get_state
 from utils.persistence import save_state
@@ -662,13 +663,16 @@ def generate_response(user_input: str, current_speaker: str = None,
 
         # 理解层的回复统一记为“我想”；say 只作为插件是否发送的参考。
         reply_memory = f"我想：{reply}"
-
-        bot_mem_id = create_memory(reply_memory)
-        user_mem_ids.append(bot_mem_id)
-        if len(user_mem_ids) > 1:
-            add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
-        # 与全局认知循环一致：自己的近期想法进入 4~6 条短期窗口。
-        SHORT_TERM.add_thought(reply, False)
+        if OUTPUT_GUARD.is_repeat(reply):
+            append_log(f"[重复抑制] CLI 回复近重复，未写入记忆：{reply[:40]}")
+        else:
+            OUTPUT_GUARD.add(reply)
+            bot_mem_id = create_memory(reply_memory, dedup=True, dedup_window=300.0)
+            user_mem_ids.append(bot_mem_id)
+            if len(user_mem_ids) > 1:
+                add_link(user_mem_ids[0], bot_mem_id, 0.8, "causal")
+            # 与全局认知循环一致：自己的近期想法进入 4~6 条短期窗口。
+            SHORT_TERM.add_thought(reply, False)
     return reply, user_input, user_mem_ids, should_speak
 
 def reset_dialogue():
@@ -858,6 +862,11 @@ def _seed_repeats_recent(text: str) -> bool:
     if not current:
         return False
     try:
+        if OUTPUT_GUARD.is_repeat(text):
+            return True
+    except Exception:
+        pass
+    try:
         recent = SHORT_TERM.texts()
     except Exception:
         return False
@@ -956,20 +965,29 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     action_apps = open_apps + [
         app for app in apps if app.get("actionable") and not app.get("open")
     ]
-    if not action_apps:
-        return None
-    has_app_action = True
-    if not (ASSETS.available_kinds() or ASSETS.list_pending() or note_enabled() or has_app_action):
-        return None
+    # 之前 has_app_action 恒为 True，导致只要有任何软件打开就每轮必问动作层，
+    # 同一动作因此容易被反复触发。现在只有“本轮确有新信息”才算主动作。
+    pending = ASSETS.list_pending()
+    spoke_now = bool(talk_sent)
+    note_changed = bool(_pending_note_memory)
     extra_actions = {}
     try:
         from plugins import registry as _plugin_registry
-        for app in action_apps:
-            plugin = _plugin_registry.get_plugin(str(app.get("id") or ""))
-            if plugin is not None:
-                extra_actions.update(plugin.extra_actions() or {})
+        # 额外动作可能来自“技能”这类工具插件（不在软件清单里），
+        # 所以遍历所有已启用插件，而不只是当前打开/可动手的软件。
+        for plugin_id in _plugin_registry.plugin_ids():
+            plugin = _plugin_registry.get_plugin(plugin_id)
+            if plugin is None or not getattr(plugin, "enabled", False):
+                continue
+            if not (getattr(plugin, "is_app", False) or plugin.available_for_actions()):
+                continue
+            extra_actions.update(plugin.extra_actions() or {})
     except Exception:
         extra_actions = {}
+    if not action_apps and not extra_actions:
+        return None
+    if not (ASSETS.available_kinds() or pending or note_enabled() or action_apps or extra_actions):
+        return None
 
     # 调用门槛：不再因为“有 keywords”就每轮都问一次动作层。
     # 旧条件是 `talk_sent or keywords`，而关键词几乎每轮都有，等价于每轮必调。
@@ -977,10 +995,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
     #   1) 本轮收到新媒体（可能想收藏）；
     #   2) 记事本刚被读写过（可能想继续整理）；
     #   3) 刚说过话；没说上话的轮次只按 action_spontaneous_prob 小概率触发。
-    pending = ASSETS.list_pending()
-    spoke_now = bool(talk_sent)
-    note_changed = bool(_pending_note_memory)
-    if not pending and not note_changed and not spoke_now and not has_app_action:
+    if not pending and not note_changed and not spoke_now:
         try:
             from config.api_config import config as _cfg
             prob = float(_cfg.get("action_spontaneous_prob", 0.25))
@@ -1022,6 +1037,31 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         return None
     detail = result.get("detail") or ""
 
+    # 动作级硬去重：语言层可能连续几轮选中同一个 app_do/图片/对话。
+    if action in (
+        "app_do", "open_conversation", "image", "sticker", "send_clipboard",
+        "screenshot", "bilibili_video", "read_media", "plugin_forge",
+    ):
+        if action == "app_do":
+            signature = "app_do:" + "".join(str(result.get("task") or "").split()).lower()
+        elif action == "open_conversation":
+            signature = "open:" + str(result.get("conversation") or result.get("id") or "")
+        elif action in ("image", "sticker"):
+            entry = result.get("entry") or {}
+            signature = f"{action}:{entry.get('id') or result.get('detail') or ''}"
+        elif action == "send_clipboard":
+            signature = "send_clipboard"
+        else:
+            target = (
+                result.get("url") or result.get("media_id")
+                or result.get("bvid") or result.get("request") or ""
+            )
+            signature = f"{action}:{str(target)[:120]}"
+        if ACTION_GUARD.is_duplicate(signature, ttl=90.0):
+            append_log(f"[重复抑制] 动作刚做过，跳过：{signature[:60]}")
+            return None
+        ACTION_GUARD.add(signature)
+
     # -------- 软件动作：打开/关闭软件、点开对话、翻看更早 --------
     if action in APP_ACTIONS:
         outcome = await APP_CONTEXT.execute(action, result)
@@ -1057,7 +1097,7 @@ async def _run_action_decision(loop, thought_text, should_speak, talk_sent,
         if not ok:
             append_log("[动作抉择] 媒体发送失败，未记入历史")
             return None
-        ASSETS.mark_sent(kind, detail)
+        ASSETS.mark_sent(kind, detail, record_id=str(entry.get("id") or ""))
         measure = "张" if kind == ASSETS.IMAGE else "个"
         create_memory(f"我发了{measure}{tag}，内容是：{detail}")
         add_to_history(None, None, f"（我发了{measure}{tag}，内容是：{detail}）")
@@ -1197,6 +1237,8 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             KEYWORDS.clear()
             _keyword_queue.clear()
             SHORT_TERM.clear()
+            OUTPUT_GUARD.clear()
+            ACTION_GUARD.clear()
             APP_CONTEXT.clear()
             APP_ROUTER.reset()
             current_keywords = []
@@ -1489,6 +1531,17 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
                 #await asyncio.sleep(3)
                 continue
 
+            # 输出级重复保护：同一句话/近重复不能再写记忆、再发言。
+            # 这里只跳过本轮并清空关键词，下一轮换种子；最多连续跳过几轮后
+            # 由关键词清空自然恢复，不会形成新的无限循环。
+            if OUTPUT_GUARD.is_repeat(thought_text):
+                append_log(f"[重复抑制] 跳过近重复念头：{thought_text[:40]}")
+                current_keywords = []
+                KEYWORDS.retain([])
+                await asyncio.sleep(3)
+                continue
+            OUTPUT_GUARD.add(thought_text)
+
             # 她自己的近期想法进入短期记忆窗口（4~6 条）；
             # 理解层回复统一按“想”记录，是否真的发送由插件结果单独记录。
             target_group, can_send = _resolve_send_target(
@@ -1506,7 +1559,7 @@ async def cognitive_loop(send_func=None, target_group_id: str = None, media_send
             # F08：写记忆含同步嵌入请求，放线程池避免阻塞事件循环；
             # 同一次写入里把她的回复追加到刚刚归入的概念，让"你上次说什么"也能召回。
             def _write_reply_memory():
-                mid = create_memory(memory_text)
+                mid = create_memory(memory_text, dedup=True, dedup_window=300.0)
                 try:
                     from .concept_store import append_member, get_last_concept_id
                     last_cid = get_last_concept_id()

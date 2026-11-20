@@ -27,6 +27,8 @@ services:
       - ./data:/app/data
       - ./config:/app/config
       - ./run/logs:/app/run/logs
+      # 插件安装目录：社区下载/更新后的插件持久化到宿主机
+      - ./plugins:/app/plugins
     extra_hosts:
       # 允许容器直接访问宿主机上的服务（如宿主机本地运行的 Ollama 11434 端口）
       - "host.docker.internal:host-gateway"

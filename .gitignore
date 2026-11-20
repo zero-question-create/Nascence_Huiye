@@ -17,6 +17,8 @@ config/qq_manifest.json
 config/bilibili_credentials.json
 config/wechat_manifest.json
 config/desktop_apps.json
+config/skills.json
+config/plugins.lock.json
 config/__pycache__/
 
 # 运行数据（记忆、向量索引、日志等）
@@ -24,9 +26,12 @@ data/__pycache__
 data/test
 data/notes
 
-# 测试脚本（仅本地运行，不入库）
+# 测试脚本（根目录临时脚本不入库；tests/ 下的正式测试入库）
 test_*.py
 *_test.py
+!tests/
+!tests/**
+tests/__pycache__/
 
 # 本地 Ollama 部署（大模型二进制）
 ollama/

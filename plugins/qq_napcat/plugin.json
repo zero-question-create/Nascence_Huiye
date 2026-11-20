@@ -1,0 +1,20 @@
+{
+  "id": "qq_napcat",
+  "name": "QQ（NapCat）",
+  "version": "1.0.0",
+  "api_version": 1,
+  "min_host_version": "0.9.0",
+  "kind": "app",
+  "entry": "plugin.py:PLUGIN",
+  "panel": "panel.py:PANEL",
+  "capabilities": ["chat", "group_chat", "media", "mini_program", "proactive"],
+  "platforms": ["any"],
+  "permissions": ["network.qq", "network.websocket"],
+  "dependencies": [],
+  "description": "NapCat 反向 WebSocket 接入；QQ 昵称在连接后自动获取。",
+  "readme": "README.md",
+  "author": "Nascence",
+  "homepage": "https://github.com/zero-question-create/nhy-plugin-qq-napcat",
+  "license": "MIT",
+  "source": "https://github.com/zero-question-create/nhy-plugin-qq-napcat"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "bilibili",
+  "name": "B站",
+  "version": "1.0.0",
+  "api_version": 1,
+  "min_host_version": "0.9.0",
+  "kind": "app",
+  "entry": "plugin.py:PLUGIN",
+  "panel": "panel.py:PANEL",
+  "capabilities": ["feed", "search", "page_read"],
+  "platforms": ["any"],
+  "permissions": ["network.bilibili"],
+  "dependencies": [],
+  "description": "只读 B 站推荐/搜索/视频信息/字幕/弹幕/评论。",
+  "readme": "README.md",
+  "author": "Nascence",
+  "homepage": "https://github.com/zero-question-create/nhy-plugin-bilibili",
+  "license": "MIT",
+  "source": "https://github.com/zero-question-create/nhy-plugin-bilibili"
+}

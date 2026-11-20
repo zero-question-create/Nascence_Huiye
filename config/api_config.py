@@ -52,6 +52,34 @@ DEFAULT_CONFIG = {
     "napcat_token": "Nascence",
     "napcat_http_url": "http://127.0.0.1:5700",  # NapCat 正向 HTTP 服务地址（用于语音等文件下载）
     "panel_port": 32123,                    # 控制面板 Web 端口（修改后下次启动生效）
+    "panel_token": "",                      # 可选：远程访问/安装插件时必须提供的管理 token
+    # ===== 插件社区 =====
+    "community_github_token": "",           # 可选：提高 GitHub API 限额
+    "community_github_user": "",            # 可选：只检索某个账号下的 nhy-plugin 仓库
+    "community_topic": "nhy-plugin",
+    "community_cache_seconds": 600,
+    "community_install_enabled": True,
+    "community_allow_git": True,            # 没有 Release ZIP 时用内部 git clone
+    "community_max_zip_mb": 200,
+    # ===== 媒体完整解析 =====
+    "media_full_max_tokens": 3000,          # 图片/表情包完整描述的视觉模型输出预算
+    "media_max_items": 12,                  # 单条消息最多解析多少个媒体
+    "media_total_mb": 40,                   # 单条消息媒体下载总大小上限
+    "media_caption_max_chars": 80,          # 只给记忆/动作提示的短标题
+    # ===== 内置技能 =====
+    "skills_enabled": True,
+    "skill_screenshot_enabled": False,
+    "skill_screenshot_max_chars": 1200,
+    "skill_bilibili_enabled": False,
+    "skill_bilibili_quality": "360p",       # 默认最低画质
+    "skill_bilibili_max_mb": 80,
+    "skill_bilibili_max_seconds": 600,
+    "skill_bilibili_frames": 8,
+    "skill_bilibili_allow_higher_quality": True,
+    "skill_forge_enabled": False,
+    "skill_forge_backend": "dsh",           # dsh | zcode
+    "skill_forge_command": "",              # argv 模板，支持 {prompt_file} {out_dir}
+    "skill_forge_timeout": 300,
     # ===== 生物钟参数（动力学速率，非钟点；不预设节律周期）=====
     "biorhythm_wake_seconds": 18.40 * 3600, # 清醒时睡眠压力上升的指数时间常数（秒）
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）
@@ -69,6 +97,7 @@ DEFAULT_CONFIG = {
     "action_page_size": 8,                  # 每页候选数量
     "action_note_enabled": True,            # 是否允许写 txt 笔记
     "action_spontaneous_prob": 0.25,        # 没有新媒体时，每轮仍去问动作层的概率
+    "asset_resend_cooldown_seconds": 180,   # 同一张图片/表情包硬去重窗口
     # ===== 笔记限额（满了拒绝写入，不做 FIFO 淘汰）=====
     "note_entry_max_chars": 200,            # 单条笔记字符上限
     "note_file_max_chars": 8000,            # 单个笔记文件字符上限
@@ -186,6 +215,13 @@ def load_config():
             cfg["panel_port"] = int(str(env_port).strip())
         except ValueError:
             pass
+    for env_key, cfg_key in (
+        ("NHY_PANEL_TOKEN", "panel_token"),
+        ("COMMUNITY_GITHUB_TOKEN", "community_github_token"),
+    ):
+        value = os.environ.get(env_key)
+        if value is not None and str(value).strip():
+            cfg[cfg_key] = str(value).strip()
 
     # 高级覆盖开关（可选，仅当显式设置 HUIYE_ENV_OVERRIDE=1 时生效）
     if os.environ.get("HUIYE_ENV_OVERRIDE") == "1":

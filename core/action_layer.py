@@ -18,6 +18,7 @@
 import json
 import os
 import re
+import time
 
 from . import asset_library as ASSETS
 from .llm_interface import call_api_thinking
@@ -30,6 +31,8 @@ DEFAULT_PAGE_SIZE = 8    # 每页候选数量
 APP_ACTIONS = {
     "open_conversation", "read_earlier", "scroll_to_bottom",
     "close_conversation", "close_app", "app_do", "send_clipboard",
+    # 插件自述动作（技能）也走 AppContext.execute 的统一分发。
+    "screenshot", "bilibili_video", "read_media", "plugin_forge",
 }
 VALID_ACTIONS = {
     "none", "image", "sticker",
@@ -433,6 +436,10 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
             if not task:
                 return {"action": "none", "detail": ""}
             result["task"] = task
+        # 技能动作需要 url/media_id/request 等参数；统一保留到结果里，
+        # 由 AppContext -> Plugin.perform_action -> skill_registry 消费。
+        for key, value in data.items():
+            result.setdefault(key, value)
         return result
 
     if action in ("image", "sticker"):
@@ -442,7 +449,21 @@ def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
         if not entry:
             append_log(f"[动作抉择] 编号无法对应到收藏（{kind}: {token!r}），放弃发送")
             return {"action": "none", "detail": ""}
-        # 不做硬性拦截：把"最近发过什么"告诉模型，由它自己判断是否重复。
+        # 同一张图/表情包短时间硬去重：提示词约束会被模型忽略，
+        # 这里直接挡掉“隔一轮又发同一张”的循环。
+        try:
+            last_sent_at = float(entry.get("last_sent_at") or 0)
+            from config.api_config import config as _cfg
+            cooldown = float(_cfg.get("asset_resend_cooldown_seconds", 180))
+        except (TypeError, ValueError):
+            last_sent_at, cooldown = 0.0, 180.0
+        if last_sent_at and time.time() - last_sent_at < cooldown:
+            append_log(f"[动作抉择] 素材刚发过（{kind}: {entry.get('id')}），冷却中")
+            return {
+                "action": "none",
+                "detail": "这张素材刚发过，先换一张或等一会儿。",
+                "suppressed": True,
+            }
         return {"action": action, "detail": entry["desc"], "entry": entry}
 
     if action in ("save_image", "save_sticker"):

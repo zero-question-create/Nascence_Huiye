@@ -154,6 +154,21 @@ class AppContext:
         except Exception:
             return []
 
+    @staticmethod
+    def _all_plugins():
+        """所有已发现插件（含技能等工具型插件）。"""
+        try:
+            from plugins import registry
+            return [
+                plugin for plugin in (
+                    registry.get_plugin(plugin_id)
+                    for plugin_id in registry.plugin_ids()
+                )
+                if plugin is not None
+            ]
+        except Exception:
+            return []
+
     def prompt_state(self) -> List[dict]:
         """给动作 LLM 的软件清单：只含状态，不含消息正文。"""
         result = []
@@ -492,16 +507,29 @@ class AppContext:
                 return self._remember_result(res)
 
             # 插件自述动作：动作名由 extra_actions() 声明，执行走 perform_action()。
+            # 动作可能来自“技能”这类工具插件，而当前打开的软件是 QQ；
+            # 因此不能只看 current_app，要遍历所有插件找到声明者。
             app_id = str(data.get("app_id") or self.current_app or "").strip()
             plugin = self._plugin_for(app_id)
+            declared = {}
             if plugin is not None:
                 try:
                     declared = plugin.extra_actions() or {}
                 except Exception:
                     declared = {}
-                if action in declared:
-                    res = await plugin.perform_action(action, data)
-                    return self._remember_result(res)
+            if action not in declared:
+                for candidate in self._all_plugins():
+                    try:
+                        candidate_actions = candidate.extra_actions() or {}
+                    except Exception:
+                        candidate_actions = {}
+                    if action in candidate_actions:
+                        plugin = candidate
+                        declared = candidate_actions
+                        break
+            if plugin is not None and action in declared:
+                res = await plugin.perform_action(action, data)
+                return self._remember_result(res)
 
             if action == "scroll_to_bottom":
                 plugin = self._plugin_for(self.current_app)
