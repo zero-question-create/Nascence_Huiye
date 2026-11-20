@@ -19,6 +19,8 @@ if (-not $Git) {
     Write-Host "[ERROR] git executable not found."
     exit 1
 }
+# gh invokes `git` by name when creating repos; make the resolved git visible.
+$env:PATH = (Split-Path -Parent $Git) + ";" + $env:PATH
 
 $ErrorActionPreference = "Continue"
 & $Gh auth status *> $null
@@ -44,9 +46,12 @@ Get-ChildItem $ReposRoot -Directory | ForEach-Object {
     Write-Host "[*] Publishing $RepoName ..."
     Push-Location $RepoDir
     try {
-        $Manifest = Get-Content (Join-Path $RepoDir "plugin.json") -Raw | ConvertFrom-Json
-        & $Gh repo view "$Owner/$RepoName" 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+        $Manifest = Get-Content (Join-Path $RepoDir "plugin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        $ErrorActionPreference = "Continue"
+        & $Gh repo view "$Owner/$RepoName" *> $null
+        $RepoExists = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = "Stop"
+        if (-not $RepoExists) {
             & $Gh repo create "$Owner/$RepoName" --public --source . --remote origin --push `
                 --description "$($Manifest.description)"
         } else {

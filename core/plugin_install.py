@@ -233,7 +233,10 @@ def install_from_zip(
         target = installed_plugin_dir(plugin_id)
         backup = None
         if target.exists():
-            backup = work / f"__backup_{plugin_id}"
+            # 备份必须放在 work 之外：work 本身可能就是 package_root，
+            # 随后会被整体移动到 target；备份放在里面会被一起搬进新插件。
+            backup = STAGING_ROOT / "replaced" / f"{plugin_id}_{int(time.time() * 1000)}"
+            backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(target), str(backup))
         try:
             shutil.move(str(package_root), str(target))
