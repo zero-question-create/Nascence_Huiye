@@ -120,25 +120,103 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .plugin-meta{display:grid;grid-template-columns:100px 1fr;gap:5px 10px;font-size:12.5px;margin:8px 0}
   .plugin-meta .k{color:var(--muted)}
   @media(max-width:760px){.import-box{grid-template-columns:1fr}}
+
+  /* ===== 视觉基准：仿 Nascence_Huiye_Server 控制面板（顶栏 + 标签导航 + 卡片）===== */
+  :root{--surface:#141d2a;--surface-2:#0f1621;--menu-bg:#141d2a;--accent-text:#fff;}
+  body.light-mode{
+    --bg:#f2f2f3;--panel:#ffffff;--border:#e6e6e6;--text:#1a1a1a;--muted:#8a8a8a;
+    --accent:#2d6cdf;--accent2:#2d6cdf;--ok:#17a673;--warn:#c07f00;--err:#d64545;
+    --surface:#ffffff;--surface-2:#f5f5f6;--menu-bg:#ffffff;--accent-text:#ffffff;
+    background:var(--bg);color:var(--text);
+  }
+  #topbar{position:sticky;top:0;z-index:60;height:56px;padding:0 18px;display:flex;
+           align-items:center;gap:12px;background:var(--menu-bg);
+           border-bottom:1px solid var(--border);flex-wrap:nowrap}
+  .topbar-left{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+  .topbar-center{display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .topbar-right{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:1;min-width:0}
+  .brand-logo{width:28px;height:28px;flex:none;display:flex;align-items:center;justify-content:center;
+              background:linear-gradient(135deg,#1c1c1c 0%,#8a8a8a 55%,#ffffff 100%);
+              color:#fff;font-size:16px;text-shadow:0 0 3px rgba(0,0,0,.5)}
+  .brand-text{min-width:0}
+  .brand-title{font-size:15px;font-weight:800;letter-spacing:.04em;white-space:nowrap;
+               color:var(--text);line-height:1.2}
+  .brand-sub{font-size:10px;color:var(--muted);letter-spacing:.1em;line-height:1.2}
+  #nav{display:flex;align-items:center;gap:4px;padding:0;background:transparent}
+  #nav button{position:relative;border:1px solid transparent;background:transparent;color:var(--muted);
+              padding:7px 16px;font-size:14px;cursor:pointer;border-radius:0;font-family:inherit;
+              transition:color .18s,background .18s,border-color .18s;white-space:nowrap}
+  #nav button:hover{color:var(--text);background:var(--surface-2)}
+  #nav button.active{color:var(--text);font-weight:700;background:var(--surface-2);
+                     border-color:var(--border)}
+  #nav button.active::after{content:"";position:absolute;left:12px;right:12px;bottom:2px;height:2px;
+                            background:var(--accent)}
+  #topbar .badge{border-radius:0;padding:3px 9px;font-size:11.5px;background:transparent;
+                 white-space:nowrap;flex:none}
+  #topbar .badge.off{background:var(--surface-2);color:var(--muted);border-color:var(--border)}
+  #topbar .badge.wait{background:transparent;color:var(--warn);border-color:var(--warn)}
+  #topbar .theme-toggle,#topbar #restartBtn,#topbar #shutdownBtn{
+    border:1px solid var(--border);background:transparent;color:var(--muted);padding:6px 12px;
+    font-size:12px;cursor:pointer;border-radius:0;font-family:inherit;white-space:nowrap;margin:0}
+  #topbar .theme-toggle:hover,#topbar #restartBtn:hover{color:var(--accent);border-color:var(--accent)}
+  #topbar #shutdownBtn{color:var(--danger,#d64545);border-color:var(--border)}
+  #topbar #shutdownBtn:hover{color:#fff;background:#d64545;border-color:#d64545}
+  main{padding:18px 24px 40px}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:0;
+         padding:16px 18px;position:relative}
+  .panel::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;
+                 background:linear-gradient(90deg,#1c1c1c 0%,#8a8a8a 55%,#fff 100%)}
+  body.light-mode .panel::before{background:linear-gradient(90deg,#2d6cdf 0%,#9bbcf5 55%,#ffffff 100%)}
+  .panel h3{font-size:15px;font-weight:800;letter-spacing:.02em}
+  .cards{gap:12px}
+  .card,.sub-box,.community-card,.md-preview,#logs,.msg,.help-pop,#toast{
+    background:var(--surface-2);border-color:var(--border);border-radius:0;color:var(--text)}
+  .card{padding:12px 14px}
+  .card .k,.hint,.muted,.card .c,.community-meta,.plugin-meta .k{color:var(--muted)}
+  .card .v{color:var(--accent2)}
+  button.act{border-radius:0;background:var(--accent);color:var(--accent-text);font-weight:700}
+  button.act.sec{background:var(--surface-2);color:var(--text);border:1px solid var(--border)}
+  input,textarea,select{border-radius:0;background:var(--surface-2);border-color:var(--border);color:var(--text)}
+  body.light-mode input,body.light-mode textarea,body.light-mode select{background:#fff}
+  .badge{border-radius:0}
+  .community-card{border-radius:0}
+  .community-detail-badge,.tag{border-radius:0}
+  @media(max-width:760px){
+    #topbar{height:auto;min-height:56px;padding:8px 12px;flex-wrap:wrap}
+    .topbar-left{flex:1 1 100%}.topbar-center{order:3;width:100%;justify-content:flex-start;overflow:auto}
+    .topbar-right{flex:1 1 100%;justify-content:flex-start}
+    #nav button{padding:7px 10px;font-size:13px}
+    main{padding:14px 12px 30px}
+  }
 </style>
 </head>
-<body>
-<header>
-  <h1>Nascence · {{BOT_NAME}}</h1>
-  <span id="cognitiveBadge" class="badge off">认知循环：已停止</span>
-  <span id="stateBadge" class="badge wait">加载中</span>
-  <button id="restartBtn" style="margin-left:auto;background:#1b2b45;color:#dce8ff;border:1px solid #35445a;border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:700">重启面板</button>
-  <button id="shutdownBtn" title="停止认知循环与全部插件服务、保存全部数据并退出面板">关闭面板</button>
+<body class="light-mode">
+<header id="topbar">
+  <div class="topbar-left">
+    <div class="brand-logo">☾</div>
+    <div class="brand-text">
+      <div class="brand-title">NASCENCE · {{BOT_NAME}}</div>
+      <div class="brand-sub">控制面板</div>
+    </div>
+  </div>
+  <div class="topbar-center">
+    <nav id="nav">
+      <button class="active" data-page="overview">总览</button>
+      <button data-page="plugins">插件</button>
+      <button data-page="community">插件社区</button>
+      <button data-page="logs">日志</button>
+      <button data-page="config">配置</button>
+      <button data-page="maint">维护</button>
+    </nav>
+  </div>
+  <div class="topbar-right">
+    <span id="cognitiveBadge" class="badge off">认知循环：已停止</span>
+    <span id="stateBadge" class="badge wait">加载中</span>
+    <button id="btnTheme" class="theme-toggle" title="切换日间/夜间主题">跟随系统</button>
+    <button id="restartBtn" class="theme-toggle" title="保存数据并重启面板">重启面板</button>
+    <button id="shutdownBtn" title="停止认知循环与全部插件服务、保存全部数据并退出面板">关闭面板</button>
+  </div>
 </header>
-
-<nav>
-  <button class="active" data-page="overview">总览</button>
-  <button data-page="plugins">插件</button>
-  <button data-page="community">插件社区</button>
-  <button data-page="logs">日志</button>
-  <button data-page="config">配置</button>
-  <button data-page="maint">维护</button>
-</nav>
 
 <main>
   <!-- 总览 -->
@@ -445,6 +523,23 @@ const BOT = "{{BOT_NAME}}";
 const $ = (id) => document.getElementById(id);
 const MAX_LOG_LINES = 500;
 
+// ===== 日间/夜间主题（参考 Nascence_Huiye_Server 面板）=====
+const THEME_KEY = 'nhy-panel-theme';
+let themeMode = localStorage.getItem(THEME_KEY) || 'follow';
+const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
+function applyTheme(mode){
+  themeMode = mode || 'follow';
+  const light = themeMode === 'light' || (themeMode === 'follow' && (!themeMedia || themeMedia.matches));
+  document.body.classList.toggle('light-mode', light);
+  const btn = $('btnTheme');
+  if(btn) btn.textContent = themeMode === 'follow' ? '跟随系统' : (themeMode === 'light' ? '日间' : '夜间');
+  localStorage.setItem(THEME_KEY, themeMode);
+}
+applyTheme(themeMode);
+if(themeMedia && themeMedia.addEventListener){
+  themeMedia.addEventListener('change', () => { if(themeMode === 'follow') applyTheme('follow'); });
+}
+
 function toast(text){
   const el = $('toast'); el.textContent = text; el.style.display = 'block';
   setTimeout(()=> el.style.display = 'none', 2500);
@@ -537,6 +632,8 @@ function versionNewer(a,b){
   return false;
 }
 async function loadCommunity(force=false){
+  const grid = $('communityGrid');
+  if(grid && !grid.children.length) grid.innerHTML = '<div class="hint">正在加载插件目录…</div>';
   try{
     const d = await getJSON('/api/community/plugins' + (force?'?refresh=1':''));
     if(!d.ok) throw new Error(d.error || '目录读取失败');
@@ -546,7 +643,10 @@ async function loadCommunity(force=false){
     if(d.error) toast('社区目录：' + d.error);
     renderCommunityGrid();
     if(currentCommunityId) openCommunity(currentCommunityId);
-  }catch(e){ toast('社区目录读取失败：' + e.message); }
+  }catch(e){
+    toast('社区目录读取失败：' + e.message);
+    if(grid) grid.innerHTML = '<div class="hint">社区目录读取失败：' + escHtml(e.message) + '</div>';
+  }
 }
 function communityMatches(p){
   const q = String($('communitySearch').value || '').trim().toLowerCase();
@@ -1497,6 +1597,9 @@ $('btnInject').onclick = async () => {
   catch(e){ toast('失败：'+e.message); }
 };
 
+$('btnTheme').onclick = () => {
+  applyTheme(themeMode === 'follow' ? 'light' : (themeMode === 'light' ? 'dark' : 'follow'));
+};
 // 社区页事件
 $('restartBtn').onclick = restartPanel;
 $('btnCommunityRefresh').onclick = () => loadCommunity(true);

@@ -246,8 +246,14 @@ def get_catalog(force: bool = False) -> dict:
     cache = _load_cache()
     max_age = int(_cfg("community_cache_seconds", 600) or 600)
     cache_fresh = bool(cache.get("plugins")) and time.time() - float(cache.get("fetched_at") or 0) < max_age
-    if cache_fresh and not force:
-        return {"plugins": cache["plugins"], "fetched_at": cache.get("fetched_at"), "stale": False}
+    # 面板首屏优先返回本地缓存：GitHub 慢时不能让社区页空白等待。
+    # 只有用户点“刷新目录”或缓存不存在时才联网。
+    if cache.get("plugins") and not force:
+        return {
+            "plugins": cache["plugins"],
+            "fetched_at": cache.get("fetched_at"),
+            "stale": not cache_fresh,
+        }
     try:
         plugins = search_github()
         if plugins:

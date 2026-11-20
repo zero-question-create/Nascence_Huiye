@@ -23,6 +23,7 @@ import ipaddress
 import logging
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -577,9 +578,12 @@ async def handle_community_plugins(request):
         from core import plugin_market
 
         loop = asyncio.get_running_loop()
-        catalog, installed = await asyncio.gather(
-            loop.run_in_executor(None, plugin_market.get_catalog, force),
-            loop.run_in_executor(None, plugin_market.installed_summary),
+        catalog, installed = await asyncio.wait_for(
+            asyncio.gather(
+                loop.run_in_executor(None, plugin_market.get_catalog, force),
+                loop.run_in_executor(None, plugin_market.installed_summary),
+            ),
+            timeout=30,
         )
         return web.json_response({
             "ok": True,
@@ -588,6 +592,18 @@ async def handle_community_plugins(request):
             "stale": bool(catalog.get("stale")),
             "error": catalog.get("error") or "",
             "fetched_at": catalog.get("fetched_at"),
+        })
+    except asyncio.TimeoutError:
+        from core import plugin_market
+
+        cached = plugin_market.get_catalog(force=False)
+        return web.json_response({
+            "ok": True,
+            "plugins": cached.get("plugins") or [],
+            "installed": plugin_market.installed_summary(),
+            "stale": True,
+            "error": "GitHub 目录刷新超时，当前显示本地缓存",
+            "fetched_at": cached.get("fetched_at"),
         })
     except Exception as exc:
         return web.json_response(
@@ -1046,10 +1062,20 @@ def run(host=None, port=None, open_browser=False):
                 panel.release_panel_lock(app.get("panel_lock"))
             except Exception:
                 pass
-            os.execv(
-                sys.executable,
-                [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
-            )
+            args = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+            kwargs = {
+                "cwd": str(PROJECT_DIR),
+                "close_fds": True,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = (
+                    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(args, **kwargs)
+            # 旧进程必须彻底退出，避免 venv launcher + 新面板留下双进程。
+            os._exit(0)
         logging.info("Web 控制面板已退出")
 
     try:

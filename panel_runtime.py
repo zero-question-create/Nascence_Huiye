@@ -912,6 +912,18 @@ class Runtime:
                         os.killpg(os.getpgid(self.ollama_process.pid), signal.SIGKILL)
                 except Exception:
                     pass
+        # 停止 multiprocessing 写者/子进程；否则面板重启后旧子进程会变成孤儿。
+        try:
+            import multiprocessing
+
+            for child in multiprocessing.active_children():
+                try:
+                    child.terminate()
+                    child.join(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         logging.info("全部服务已停止")
 
 
