@@ -1,3 +1,6 @@
+# 独立插件仓库安装目录：源码在 GitHub nhy-plugin-*，核心只保留框架
+plugins/*/
+
 # Python
 __pycache__/
 *.pyc

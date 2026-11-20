@@ -6,7 +6,7 @@
     {"id": "browser", "repo": "nhy-plugin-browser", "required": true},
     {"id": "skills", "repo": "nhy-plugin-skills", "required": true},
     {"id": "desktop", "repo": "nhy-plugin-desktop", "platform": "windows", "required": true},
-    {"id": "qq_desktop", "repo": "nhy-plugin-qq-desktop", "platform": "windows", "required": false},
+    {"id": "qq_desktop", "repo": "nhy-plugin-qq-desktop", "platform": "windows", "required": true},
     {"id": "bilibili", "repo": "nhy-plugin-bilibili", "required": false},
     {"id": "wechat", "repo": "nhy-plugin-wechat", "required": false},
     {"id": "web", "repo": "nhy-plugin-web", "required": false}

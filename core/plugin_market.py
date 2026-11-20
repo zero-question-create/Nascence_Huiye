@@ -303,7 +303,15 @@ def _download(url: str, target: Path, timeout: float = 60.0) -> None:
 
 
 def install_plugin(plugin_id: str, force: bool = False) -> dict:
-    item = find_plugin(plugin_id, force=True)
+    # 优先使用已缓存的 catalog（即使过期也先信它）；安装按钮不应该每次
+    # 重新扫全部仓库，否则 GitHub API 一慢就会把安装请求拖到超时。
+    item = next(
+        (entry for entry in (_load_cache().get("plugins") or [])
+         if entry.get("id") == plugin_id),
+        None,
+    )
+    if not item:
+        item = find_plugin(plugin_id, force=True)
     if not item:
         return {"ok": False, "error": "社区里找不到这个插件"}
     download_url = str(item.get("download_url") or "")

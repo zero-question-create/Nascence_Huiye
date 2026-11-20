@@ -24,6 +24,12 @@ if [ ! -x "$PROJECT_DIR/venv/bin/python" ]; then
     bash "$PROJECT_DIR/setup.sh"
 fi
 
+if [ ! -f "$PROJECT_DIR/plugins/qq_napcat/plugin.py" ]; then
+    echo "[*] 未找到默认插件，正在从插件社区安装..."
+    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/tools/install_bootstrap.py" --required-only || \
+        echo "[!] 默认插件安装失败，请打开控制面板插件社区重试。"
+fi
+
 echo "[*] 正在启动 Web 控制面板..."
 OPEN_ARG=""
 if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then

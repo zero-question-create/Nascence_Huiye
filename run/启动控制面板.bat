@@ -41,6 +41,12 @@ if not exist "%PROJECT_DIR%\venv\Scripts\python.exe" (
     )
 )
 
+rem --- ensure default plugins (split repositories) ---
+if not exist "%PROJECT_DIR%\plugins\qq_napcat\plugin.py" (
+    powershell -Command "Write-Host 'Default plugins not found, installing...' -ForegroundColor Yellow"
+    "%PROJECT_DIR%\venv\Scripts\python.exe" "%PROJECT_DIR%\tools\install_bootstrap.py" --required-only
+)
+
 rem --- ensure internal git for plugin marketplace ---
 if not exist "%PROJECT_DIR%\run\lib\git\cmd\git.exe" (
     powershell -Command "Write-Host 'Internal Git not found, installing...' -ForegroundColor Yellow"
