@@ -1,6 +1,6 @@
 # install_git.ps1
-# NHY 内部使用的便携 Git（MinGit）。只解压到 run/lib/git，不改系统 PATH。
-# 插件市场的 clone/fetch/update 会优先使用它。
+# NHY bundled portable Git (MinGit). Extracts to run/lib/git only.
+# The plugin marketplace prefers this git for clone/fetch/update.
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -8,7 +8,22 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $GitRoot = Join-Path $ProjectDir "run\lib\git"
 $GitExe = Join-Path $GitRoot "cmd\git.exe"
+$SystemGitMarker = Join-Path $GitRoot "using_system_git.txt"
 $PinnedTag = "v2.47.1.windows.1"
+
+function Find-SystemGit {
+    $cmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    foreach ($candidate in @("F:\Program Files\Git\cmd\git.exe", "C:\Program Files\Git\cmd\git.exe")) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return ""
+}
+
+function Mark-SystemGit($path) {
+    New-Item -ItemType Directory -Force -Path $GitRoot | Out-Null
+    Set-Content -Path $SystemGitMarker -Value ("path=" + $path + "`nupdated=" + (Get-Date -Format "s")) -Encoding UTF8
+}
 
 function Test-GitReady {
     if (-not (Test-Path $GitExe)) { return $false }
@@ -21,7 +36,17 @@ function Test-GitReady {
 }
 
 if (Test-GitReady) {
+    Remove-Item $SystemGitMarker -Force -ErrorAction SilentlyContinue
     Write-Host "[OK] Internal git already exists: $GitExe"
+    exit 0
+}
+
+# If system git is available, do not retry the 45MB MinGit download every launch.
+# Set NHY_FORCE_INTERNAL_GIT=1 to force the bundled MinGit install.
+$SystemGit = Find-SystemGit
+if ($SystemGit -and $env:NHY_FORCE_INTERNAL_GIT -ne "1") {
+    Mark-SystemGit $SystemGit
+    Write-Host "[OK] Using system Git: $SystemGit (set NHY_FORCE_INTERNAL_GIT=1 to install bundled MinGit)"
     exit 0
 }
 
@@ -77,6 +102,7 @@ try {
             }
         }
         if ($SystemGit) {
+            Mark-SystemGit $SystemGit.Source
             Write-Host "[WARN] Internal Git download failed; falling back to system git: $($SystemGit.Source)"
             exit 0
         }
@@ -112,6 +138,7 @@ try {
         Write-Host "[ERROR] Internal git install failed."
         exit 1
     }
+    Remove-Item $SystemGitMarker -Force -ErrorAction SilentlyContinue
     Write-Host "[OK] Internal Git installed: $GitExe"
 } finally {
     Remove-Item $TempRoot -Recurse -Force -ErrorAction SilentlyContinue

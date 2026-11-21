@@ -202,6 +202,17 @@ async def handle_index(request):
                         content_type="text/html", charset="utf-8")
 
 
+async def handle_favicon(request):
+    """NHY 图标：浏览器标签页与服务图标。"""
+    path = PROJECT_DIR / "assets" / "logo.ico"
+    if not path.is_file():
+        return web.Response(status=404)
+    return web.FileResponse(
+        path,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 def _collect_stats() -> dict:
     """在工作线程里收集统计信息。
 
@@ -319,6 +330,7 @@ _CONFIG_KEY_KEYS = (
 _CONFIG_BOOL_KEYS = (
     "app_router_follow_global_behavior",
     "biorhythm_never_sleep",
+    "panel_animations",
 )
 _CONFIG_FLOAT_KEYS = (
     "biorhythm_wake_seconds", "biorhythm_sleep_seconds",
@@ -930,6 +942,7 @@ async def handle_ws(request):
 def _build_app():
     app = web.Application()
     app.router.add_get("/", handle_index)
+    app.router.add_get("/favicon.ico", handle_favicon)
     app.router.add_get("/api/stats", handle_stats)
     app.router.add_get("/api/config", handle_config_get)
     app.router.add_post("/api/config", handle_config_post)

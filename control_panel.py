@@ -39,7 +39,7 @@ if sys.platform == "linux":
     os.environ.setdefault("XMODIFIERS", "@im=fcitx")
 
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QTextCursor
+from PyQt5.QtGui import QFont, QIcon, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QFormLayout,
@@ -129,6 +129,9 @@ class ControlPanel(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self.active_workers = set()
         self.setWindowTitle(f"Nascence {BOT_NAME} · 控制面板")
+        icon_path = PROJECT_DIR / "assets" / "logo.ico"
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1280, 860)
         self.setMinimumSize(1000, 700)
         self.log_views = {}
@@ -831,6 +834,9 @@ def main():
     logging.info("控制面板启动，项目目录=%s", PROJECT_DIR)
     app = QApplication(sys.argv)
     app.setApplicationName("Nascence Huiye Control Panel")
+    icon_path = PROJECT_DIR / "assets" / "logo.ico"
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     window = ControlPanel()
     window.show()
 

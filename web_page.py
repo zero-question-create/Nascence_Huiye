@@ -17,6 +17,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Nascence {{BOT_NAME}} · 控制面板</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
+<link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
 <style>
   :root{--bg:#0d1118;--panel:#141d2a;--border:#263247;--text:#e7edf6;--muted:#8493aa;
         --accent:#2d6cdf;--accent2:#7eb0ff;--ok:#77e2bd;--warn:#e2b877;--err:#e27777;}
@@ -181,12 +183,58 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .badge{border-radius:0}
   .community-card{border-radius:0}
   .community-detail-badge,.tag{border-radius:0}
+  /* 浅色模式悬停必须保持深色文字，避免“文字=背景”不可读 */
+  body.light-mode .community-card:hover,
+  body.light-mode .community-card.active{background:#eef4ff;color:#1a1a1a;border-color:var(--accent)}
+  body.light-mode .community-card:hover .community-desc,
+  body.light-mode .community-card:hover .community-meta{color:#1a1a1a}
+  body.light-mode .help-dot:hover,body.light-mode .help-dot:focus{color:var(--accent);background:#eef4ff}
+  body.light-mode .tag.ok{color:#0b6b49;background:#e6f7ef;border-color:#8fd3b8}
+  body.light-mode .tag.warn{color:#8a5a00;background:#fff4dc;border-color:#e2b877}
+  /* Markdown 的 code/pre 使用深色底，浅色模式必须同步改文字色，否则黑底黑字 */
+  body.light-mode .markdown-body code{background:#eef1f5;color:#1a1a1a;border-color:#d9dee7}
+  body.light-mode .markdown-body pre{background:#f5f5f6;color:#1a1a1a;border-color:#e6e6e6}
+  body.light-mode .markdown-body pre code{background:transparent;color:inherit;border:0}
+  body.light-mode .markdown-body blockquote{background:#f5f5f6;color:#555;border-left-color:var(--accent)}
+  body.light-mode .markdown-body a{color:#2d6cdf}
+  body.light-mode .markdown-body th{background:#f5f5f6;color:#1a1a1a}
+  body.light-mode .markdown-body td{color:#1a1a1a}
+
+  /* NHYS（Nascence_Huiye_Server）风格动效：由控制面板设置开关控制 */
+  @keyframes nhys-page-in{from{opacity:0;transform:translateY(-10px) scale(.98)}to{opacity:1;transform:none}}
+  @keyframes nhys-card-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @keyframes nhys-spin{to{transform:rotate(360deg)}}
+  body.nhys-motion .page.active{animation:nhys-page-in .35s cubic-bezier(.34,1.56,.64,1) both}
+  body.nhys-motion .page.active .panel{animation:nhys-card-in .28s ease both}
+  body.nhys-motion .panel{transition:border-color .18s,box-shadow .18s}
+  body.nhys-motion .panel:hover{box-shadow:0 6px 20px rgba(0,0,0,.08)}
+  body.nhys-motion #nav button,body.nhys-motion button.act,body.nhys-motion .community-card,
+  body.nhys-motion .tag,body.nhys-motion #topbar .theme-toggle{transition:color .18s,background .18s,border-color .18s,transform .18s,box-shadow .18s}
+  body.nhys-motion .community-card:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.12)}
+  body.nhys-motion button.act:hover{filter:brightness(1.06);transform:translateY(-1px)}
+  @media(prefers-reduced-motion:reduce){
+    body.nhys-motion *,body.nhys-motion *::before,body.nhys-motion *::after{
+      animation:none!important;transition:none!important}
+  }
+
+  /* 插件安装/更新进行中：显性遮罩提示 */
+  .update-overlay{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;
+                  background:rgba(0,0,0,.35);backdrop-filter:blur(1px)}
+  .update-overlay.show{display:flex}
+  .update-box{display:flex;align-items:center;gap:14px;min-width:320px;max-width:80vw;
+              background:var(--surface);border:1px solid var(--border);padding:20px 24px;
+              box-shadow:0 12px 40px rgba(0,0,0,.25);color:var(--text)}
+  .update-spinner{width:28px;height:28px;flex:none;border:3px solid var(--border);
+                  border-top-color:var(--accent);border-radius:50%;animation:nhys-spin .8s linear infinite}
+  .update-text{font-size:14px;font-weight:700;line-height:1.5}
+
   @media(max-width:760px){
     #topbar{height:auto;min-height:56px;padding:8px 12px;flex-wrap:wrap}
     .topbar-left{flex:1 1 100%}.topbar-center{order:3;width:100%;justify-content:flex-start;overflow:auto}
     .topbar-right{flex:1 1 100%;justify-content:flex-start}
     #nav button{padding:7px 10px;font-size:13px}
     main{padding:14px 12px 30px}
+    .update-box{min-width:0;width:88vw}
   }
 </style>
 </head>
@@ -382,8 +430,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div class="grid2">
         <div><label>Web 控制面板端口（默认 32123，修改后下次启动生效）</label><input id="f-panel-port" type="number" min="1" max="65535" placeholder="32123"></div>
       </div>
-      <div class="row" style="margin-top:12px"><button class="act" id="btnSavePanel">保存面板端口</button></div>
-      <div class="hint">端口号修改后写入配置文件，将在下次启动控制面板时生效。</div>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="f-panel-animations" style="width:auto"> 启用 NHYS 面板动效（Nascence_Huiye_Server 风格）</label>
+      <div class="row" style="margin-top:12px"><button class="act" id="btnSavePanel">保存面板设置</button></div>
+      <div class="hint">端口号修改后下次启动生效；动效开关即时生效。</div>
     </div>
     <div class="panel">
       <h3>大模型 (LLM) 与向量嵌入配置</h3>
@@ -517,6 +566,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
 </main>
 
 <div id="toast"></div>
+<div id="updateOverlay" class="update-overlay" aria-live="polite" aria-hidden="true">
+  <div class="update-box">
+    <div class="update-spinner"></div>
+    <div class="update-text" id="updateText">正在更新插件…</div>
+  </div>
+</div>
 
 <script>
 const BOT = "{{BOT_NAME}}";
@@ -538,6 +593,22 @@ function applyTheme(mode){
 applyTheme(themeMode);
 if(themeMedia && themeMedia.addEventListener){
   themeMedia.addEventListener('change', () => { if(themeMode === 'follow') applyTheme('follow'); });
+}
+function applyMotion(enabled){
+  document.body.classList.toggle('nhys-motion', !!enabled);
+}
+function showUpdate(text){
+  const overlay = $('updateOverlay');
+  if(!overlay) return;
+  $('updateText').textContent = text;
+  overlay.classList.add('show');
+  overlay.setAttribute('aria-hidden', 'false');
+}
+function hideUpdate(){
+  const overlay = $('updateOverlay');
+  if(!overlay) return;
+  overlay.classList.remove('show');
+  overlay.setAttribute('aria-hidden', 'true');
 }
 
 function toast(text){
@@ -720,17 +791,34 @@ async function loadCommunityReadme(id){
 }
 async function communityAction(kind,id){
   if(kind==='uninstall' && !confirm('确定卸载这个插件？')) return;
+  const p = communityCache.find(x => x.id === id) || {};
+  const name = p.name || id;
+  const buttons = Array.from(document.querySelectorAll('#communityDetailActions button'));
+  const labels = {
+    install: `正在安装 ${name}…`,
+    update: `正在更新 ${name}…`,
+    uninstall: `正在卸载 ${name}…`,
+  };
+  if(kind !== 'uninstall') showUpdate(labels[kind] || '正在处理插件…');
+  buttons.forEach(b => b.disabled = true);
   try{
     const d = await post('/api/community/' + kind, {id});
+    hideUpdate();
     toast(d.detail || (kind==='install'?'安装完成':'操作完成'));
     await loadCommunity(true);
     if(d.restart_required && confirm('插件文件已更新，需要重启面板生效。现在重启吗？')) restartPanel();
-  }catch(e){ toast('操作失败：' + e.message); }
+  }catch(e){
+    hideUpdate();
+    toast('操作失败：' + e.message);
+  }finally{
+    buttons.forEach(b => b.disabled = false);
+  }
 }
 async function communityImport(){
   const file = $('communityImportFile').files[0];
   const path = $('communityImportPath').value.trim();
   if(!file && !path){ toast('请选择 ZIP 或填写路径'); return; }
+  showUpdate('正在导入本地插件…');
   try{
     let d;
     if(file){
@@ -741,11 +829,12 @@ async function communityImport(){
       d = await post('/api/community/import', {path});
     }
     if(!d.ok) throw new Error(d.error || '导入失败');
+    hideUpdate();
     toast('插件已导入：' + (d.id || ''));
     $('communityImportFile').value=''; $('communityImportPath').value='';
     await loadCommunity(true);
     if(confirm('插件已导入，需要重启面板生效。现在重启吗？')) restartPanel();
-  }catch(e){ toast('导入失败：' + e.message); }
+  }catch(e){ hideUpdate(); toast('导入失败：' + e.message); }
 }
 async function restartPanel(){
   if(!confirm('重启会短暂停止认知循环与插件服务，保存数据后重新启动。继续吗？')) return;
@@ -936,6 +1025,8 @@ async function loadConfig(){
     $('f-idle').value = c.biorhythm_idle_to_sleep ?? 300;
     $('f-never-sleep').checked = !!c.biorhythm_never_sleep;
     $('f-panel-port').value = c.panel_port ?? 32123;
+    $('f-panel-animations').checked = !!c.panel_animations;
+    applyMotion(!!c.panel_animations);
     $('f-ar-mode').value = c.app_router_mode || 'rule';
     $('f-ar-follow').checked = !!c.app_router_follow_global_behavior;
     $('f-ar-base').value = c.app_router_base_url || '';
@@ -1511,8 +1602,10 @@ $('btnSavePanel').onclick = async () => {
     return;
   }
   try{
-    await post('/api/config', { panel_port: p });
-    toast('面板端口已保存为 ' + p + '，下次启动生效');
+    const animations = !!$('f-panel-animations').checked;
+    await post('/api/config', { panel_port: p, panel_animations: animations });
+    applyMotion(animations);
+    toast('面板设置已保存（端口下次启动生效，动效已立即应用）');
   }catch(e){ toast('保存失败：'+e.message); }
 };
 $('btnSaveBio').onclick = async () => {

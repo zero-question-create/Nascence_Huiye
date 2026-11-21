@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "napcat_token": "Nascence",
     "napcat_http_url": "http://127.0.0.1:5700",  # NapCat 正向 HTTP 服务地址（用于语音等文件下载）
     "panel_port": 32123,                    # 控制面板 Web 端口（修改后下次启动生效）
+    "panel_animations": False,              # 使用 Nascence_Huiye_Server 风格的页面/卡片动效
     "panel_token": "",                      # 可选：远程访问/安装插件时必须提供的管理 token
     # ===== 插件社区 =====
     "community_github_token": "",           # 可选：提高 GitHub API 限额
